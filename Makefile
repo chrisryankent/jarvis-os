@@ -47,7 +47,12 @@ QEMU      := qemu-system-x86_64
 # The kernel reserves a 256 MB model pool plus ~37 MB of .bss, so QEMU's
 # default 128 MB is not enough.
 QEMU_MEM  := 2G
-QEMU_FLAGS := -cdrom $(ISO_OUT) -m $(QEMU_MEM) -serial stdio -no-reboot
+# -rtc base=localtime: the taskbar clock shows your local time, not UTC.
+QEMU_FLAGS := -cdrom $(ISO_OUT) -m $(QEMU_MEM) -serial stdio -rtc base=localtime
+
+# Keep the ISO small (about 5 MB instead of 25 MB): compress GRUB and leave
+# out its locales, fonts and themes, none of which the boot menu needs.
+GRUB_MKRESCUE_FLAGS := --compress=xz --locales= --fonts= --themes=
 
 .PHONY: all clean check iso iso-models run qemu run-headless FORCE
 
@@ -63,7 +68,11 @@ FORCE:
 # desktop_init.c #includes these sources directly (unity build), so edits to
 # them must rebuild desktop_init.o.
 desktop/desktop_init.o: $(wildcard desktop/*.c desktop/*.h apps/*.c apps/*.h \
-                          input/*.c input/*.h wm/animations.c wm/*.h)
+                          input/*.c input/*.h wm/*.h)
+
+# Shared headers: a change to any of them rebuilds everything that uses them.
+$(DRIVER_OBJS) $(DESKTOP_OBJS) $(WM_OBJS): kernel/kernel.h drivers/gpu.h \
+                                           wm/wm.h desktop/ui.h
 
 # Build the ISO and boot it in a QEMU window; kernel log goes to this terminal.
 run: iso
@@ -101,7 +110,7 @@ iso: kernel.elf
 	cp kernel.elf $(ISO_DIR)/boot/kernel.elf
 	if command -v grub-mkrescue >/dev/null 2>&1; then \
 		rm -f $(ISO_OUT); \
-		grub-mkrescue -o $(ISO_OUT) $(ISO_DIR); \
+		grub-mkrescue $(GRUB_MKRESCUE_FLAGS) -o $(ISO_OUT) $(ISO_DIR); \
 	else \
 		echo "Error: grub-mkrescue is required to build the ISO." >&2; \
 		exit 1; \
@@ -114,7 +123,7 @@ iso-models: kernel.elf
 	cp kernel.elf $(ISO_DIR)/boot/kernel.elf
 	if command -v grub-mkrescue >/dev/null 2>&1; then \
 		rm -f $(ISO_OUT); \
-		grub-mkrescue -o $(ISO_OUT) $(ISO_DIR); \
+		grub-mkrescue $(GRUB_MKRESCUE_FLAGS) -o $(ISO_OUT) $(ISO_DIR); \
 	else \
 		echo "Error: grub-mkrescue is required to build the ISO." >&2; \
 		exit 1; \

@@ -110,3 +110,64 @@ void sys_format_date(char *buf, size_t n);          /* "Thu 12 Nov 2026"     */
 void sys_format_uptime(char *buf, size_t n);        /* "1h 04m 09s"          */
 void sys_poweroff(void);
 void sys_reboot(void);
+
+/* ---- App registry (desktop/desktop_init.c) ------------------------------- */
+struct wm_window;
+typedef struct {
+    const char *name;           /* short name: taskbar tooltip, Start label   */
+    icon_id_t   icon;
+    struct wm_window *window;   /* NULL when not running                      */
+} desktop_app_t;
+
+int            desktop_app_count(void);
+desktop_app_t *desktop_app_get(int index);
+void           desktop_app_launch(int index);      /* open, or focus if open  */
+void           desktop_app_activate(int index);    /* taskbar click behaviour */
+int            desktop_app_find(const char *name); /* -1 if unknown           */
+
+/* Sends text to the assistant as if it had been spoken. */
+void           desktop_ask_jarvis(const char *text);
+void           desktop_lock(void);
+
+/* ---- Notifications (desktop/notifications.c) ----------------------------- */
+typedef enum {
+    NOTIF_INFO = 0,
+    NOTIF_WARNING = 1,
+    NOTIF_CRITICAL = 2,
+} notification_priority_t;
+
+void     notifications_init(void);
+uint32_t notification_show(const char *title, const char *body,
+                           notification_priority_t priority, uint32_t timeout_ms);
+void     notifications_draw(void);
+int      notifications_tick(void);              /* 1 if a toast expired      */
+void     notifications_toggle_center(void);
+void     notifications_close_center(void);
+int      notifications_center_is_visible(void);
+int      notifications_click(int x, int y);     /* 1 if consumed             */
+int      notifications_get_count(void);
+int      notifications_get_unread_count(void);
+
+/* ---- Taskbar + Start menu (desktop/taskbar.c) ---------------------------- */
+#define TASKBAR_H 48
+void taskbar_init(void);
+void taskbar_draw(void);
+int  taskbar_hover(int x, int y);               /* 1 if highlight changed    */
+void start_menu_close(void);
+int  start_menu_click(int x, int y);            /* 1 if consumed             */
+int  start_menu_hover(int x, int y);
+int  start_menu_key(uint32_t key, int mods);    /* 1 if consumed             */
+int  start_menu_text(char ch);
+
+/* ---- Desktop surface (desktop/desktop.c) --------------------------------- */
+void desktop_init(void);
+void desktop_draw(void);
+int  desktop_handle_click(int x, int y);
+const char *desktop_get_icon_target(int index);
+void desktop_wallpaper_invalidate(void);
+int  desktop_context_is_open(void);
+void desktop_context_open(int x, int y);
+void desktop_context_close(void);
+void desktop_context_draw(void);
+int  desktop_context_click(int x, int y);
+int  desktop_context_hover(int x, int y);

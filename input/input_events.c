@@ -123,39 +123,17 @@ void input_text_char(char ch)
     input_post_event(&event);
 }
 
+/* desktop/desktop_init.c: global shortcuts, Start menu typing, lock screen,
+ * then the focused window. */
+void desktop_dispatch_event(wm_input_event_t *event);
+
 void input_process_queue(void)
 {
     while (input_has_event()) {
         wm_input_event_t event = input_get_event();
-        wm_handle_input(&event);
+        desktop_dispatch_event(&event);
     }
 }
 
 int input_get_mouse_x(void) { return g_mouse_x; }
 int input_get_mouse_y(void) { return g_mouse_y; }
-
-/* Translate PS/2 set-1 scancode + modifier flags to an ASCII character.
- * Returns 0 for non-printable keys (Enter, Backspace, arrows, etc.). */
-char input_scancode_to_char(uint32_t sc, int mods)
-{
-    int shift = !!(mods & KMOD_SHIFT);
-    static const struct { uint32_t sc; char lo; char hi; } tbl[] = {
-        {0x02,'1','!'},{0x03,'2','@'},{0x04,'3','#'},{0x05,'4','$'},
-        {0x06,'5','%'},{0x07,'6','^'},{0x08,'7','&'},{0x09,'8','*'},
-        {0x0A,'9','('},{0x0B,'0',')'},{0x0C,'-','_'},{0x0D,'=','+'},
-        {0x10,'q','Q'},{0x11,'w','W'},{0x12,'e','E'},{0x13,'r','R'},
-        {0x14,'t','T'},{0x15,'y','Y'},{0x16,'u','U'},{0x17,'i','I'},
-        {0x18,'o','O'},{0x19,'p','P'},{0x1A,'[','{'},{0x1B,']','}'},
-        {0x1E,'a','A'},{0x1F,'s','S'},{0x20,'d','D'},{0x21,'f','F'},
-        {0x22,'g','G'},{0x23,'h','H'},{0x24,'j','J'},{0x25,'k','K'},
-        {0x26,'l','L'},{0x27,';',':'},{0x28,'\'','"'},{0x29,'`','~'},
-        {0x2B,'\\','|'},
-        {0x2C,'z','Z'},{0x2D,'x','X'},{0x2E,'c','C'},{0x2F,'v','V'},
-        {0x30,'b','B'},{0x31,'n','N'},{0x32,'m','M'},{0x33,',','<'},
-        {0x34,'.','>'},{0x35,'/','?'},{0x39,' ',' '},
-    };
-    for (size_t i = 0; i < sizeof(tbl)/sizeof(tbl[0]); i++)
-        if (tbl[i].sc == sc)
-            return shift ? tbl[i].hi : tbl[i].lo;
-    return 0;
-}

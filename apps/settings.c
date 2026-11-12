@@ -1,264 +1,178 @@
 /*
  * =============================================================================
- * JARVIS OS — Settings Application (apps/settings.c)
+ * JARVIS OS — Settings (apps/settings.c)
  * Language: C17
  *
- * System settings for display, sound, themes, and language.
+ * Personalization (theme), System (device info + power) and About.
+ * Only controls that actually do something are shown.
  * =============================================================================
  */
 
 #include "../kernel/kernel.h"
 #include "../wm/wm.h"
-#include "../drivers/gpu.h"
+#include "../desktop/ui.h"
 #include <string.h>
 #include <stdio.h>
 
+#define SET_SIDEBAR_W 170
+#define SET_ITEM_H    36
+
 typedef enum {
-    SETTINGS_DISPLAY = 0,
-    SETTINGS_SOUND = 1,
-    SETTINGS_SYSTEM = 2,
-    SETTINGS_ABOUT = 3,
-} settings_category_t;
+    SETTINGS_PERSONALIZE = 0,
+    SETTINGS_SYSTEM,
+    SETTINGS_ABOUT,
+    SETTINGS_PAGES
+} settings_page_t;
 
-typedef struct {
+static struct {
     wm_window_t *window;
-    settings_category_t current_category;
-    int selected_item;
-    theme_mode_t selected_theme;
-} settings_context_t;
+    settings_page_t page;
+} g_settings;
 
-static settings_context_t g_settings = {};
+static const struct { const char *label; icon_id_t icon; } g_set_pages[SETTINGS_PAGES] = {
+    { "Personalization", ICON_GEAR },
+    { "System",          ICON_PC },
+    { "About",           ICON_JARVIS },
+};
 
-void settings_draw_sidebar(int x, int y, int w)
+/* Theme swatch geometry, relative to the content area origin */
+#define SW_W 132
+#define SW_H 88
+static void swatch_rect(int i, int *x, int *y)
 {
-    /* Left sidebar with categories */
-    fb_fill_rect(x, y, w, 200, 0x00282828);
-
-    const char *categories[] = {
-        "Display",
-        "Sound",
-        "System",
-        "About"
-    };
-
-    for (int i = 0; i < 4; i++) {
-        int item_y = y + (i * 50);
-        uint32_t bg = (g_settings.current_category == (settings_category_t)i) ? 0x005BA3D6 : 0x00282828;
-        uint32_t fg = (g_settings.current_category == (settings_category_t)i) ? 0x00FFFFFF : 0x00A0A0A0;
-
-        fb_fill_rect(x, item_y, w, 50, bg);
-        fb_put_string(x + 12, item_y + 16, categories[i], fg, bg);
-    }
+    *x = 24 + i * (SW_W + 12);
+    *y = 84;
 }
 
-void settings_draw_display_panel(int x, int y, int w, int h)
+static void info_row(int x, int y, const char *label, const char *value)
 {
-    fb_fill_rect(x, y, w, h, 0x001F1F1F);
+    fb_draw_text(x, y, label, T(TEXT_DIM));
+    fb_draw_text(x + 150, y, value, T(TEXT));
+}
 
-    int content_x = x + 24;
-    int content_y = y + 24;
+static void draw_personalize(int x, int y, int w)
+{
+    static const struct { const char *name; uint32_t bg, bar, win; } previews[3] = {
+        { "Dark",          0x000F4C81, 0x001C1C1C, 0x00202020 },
+        { "Light",         0x009CCBF2, 0x00EEF2F6, 0x00FFFFFF },
+        { "High contrast", 0x00000000, 0x00FFFF00, 0x00FFFFFF },
+    };
+    (void)w;
 
-    /* Brightness control */
-    fb_put_string(content_x, content_y, "Brightness", 0x00E0E0E0, 0x001F1F1F);
-    fb_fill_rect(content_x + 150, content_y + 2, 200, 16, 0x003A3A3A);
-    fb_fill_rect(content_x + 150, content_y + 2, 160, 16, 0x0000D9FF);
-    fb_put_string(content_x + 180, content_y + 24, "80%", 0x00808080, 0x001F1F1F);
-
-    content_y += 60;
-
-    /* Theme selector */
-    fb_put_string(content_x, content_y, "Theme", 0x00E0E0E0, 0x001F1F1F);
-
-    const char *themes[] = {"Dark", "Light", "High Contrast"};
+    fb_draw_text_scaled(x + 24, y + 16, "Personalization", T(TEXT), 2);
+    fb_draw_text(x + 24, y + 60, "Choose a theme", T(TEXT_DIM));
 
     for (int i = 0; i < 3; i++) {
-        int btn_x = content_x + (i * 140);
-        uint32_t bg = (g_settings.selected_theme == (theme_mode_t)i) ? 0x005BA3D6 : 0x003A3A3A;
-        fb_fill_rect(btn_x, content_y + 24, 130, 40, bg);
-        fb_put_string(btn_x + 36, content_y + 32, themes[i],
-                     (g_settings.selected_theme == (theme_mode_t)i) ? 0x00FFFFFF : 0x00A0A0A0, bg);
+        int sx, sy;
+        swatch_rect(i, &sx, &sy);
+        sx += x; sy += y;
+        int selected = (int)theme_get_mode() == i;
+
+        fb_fill_rounded_rect(sx - 3, sy - 3, SW_W + 6, SW_H + 6, 8,
+                             selected ? T(ACCENT) : T(BORDER));
+        fb_fill_rounded_rect(sx, sy, SW_W, SW_H, 6, previews[i].bg);
+        fb_fill_rounded_rect(sx + 14, sy + 12, 70, 44, 3, previews[i].win);
+        fb_fill_rect(sx, sy + SW_H - 14, SW_W, 14, previews[i].bar);
+        ui_text_center(sx, sy + SW_H + 10, SW_W, previews[i].name,
+                       selected ? T(ACCENT) : T(TEXT));
     }
 
-    content_y += 80;
-
-    /* Resolution */
-    fb_put_string(content_x, content_y, "Resolution", 0x00E0E0E0, 0x001F1F1F);
-    char res_str[64];
-    snprintf(res_str, sizeof(res_str), "%ux%u @ 60 Hz",
-            fb_get_width(), fb_get_height());
-    fb_put_string(content_x + 150, content_y, res_str, 0x00A0A0A0, 0x001F1F1F);
+    char res[48];
+    snprintf(res, sizeof(res), "%ux%u, 32-bit colour", fb_get_width(), fb_get_height());
+    info_row(x + 24, y + 222, "Display", res);
+    info_row(x + 24, y + 246, "Current theme", theme_get_name());
 }
 
-void settings_draw_sound_panel(int x, int y, int w, int h)
+static void draw_system(int x, int y, int w)
 {
-    fb_fill_rect(x, y, w, h, 0x001F1F1F);
+    char buf[64];
+    (void)w;
 
-    int content_x = x + 24;
-    int content_y = y + 24;
+    fb_draw_text_scaled(x + 24, y + 16, "System", T(TEXT), 2);
 
-    /* Master volume */
-    fb_put_string(content_x, content_y, "Master Volume", 0x00E0E0E0, 0x001F1F1F);
-    fb_fill_rect(content_x + 150, content_y + 2, 200, 16, 0x003A3A3A);
-    fb_fill_rect(content_x + 150, content_y + 2, 140, 16, 0x0000FF00);
-    fb_put_string(content_x + 180, content_y + 24, "70%", 0x00808080, 0x001F1F1F);
+    info_row(x + 24, y + 64, "Device name", "JARVIS-PC");
+    info_row(x + 24, y + 88, "User", g_kstate.username[0] ? g_kstate.username : "User");
+    sys_format_uptime(buf, sizeof(buf));
+    info_row(x + 24, y + 112, "Uptime", buf);
+    snprintf(buf, sizeof(buf), "%u MB", (unsigned)(g_kstate.model_pool_size >> 20));
+    info_row(x + 24, y + 136, "AI model pool", buf);
+    info_row(x + 24, y + 160, "Audio", g_kstate.audio_ready ? "Ready" : "No device found");
+    info_row(x + 24, y + 184, "Network", g_kstate.network_ready ? "Adapter up (no DHCP yet)" : "Offline");
 
-    content_y += 60;
-
-    /* Microphone volume */
-    fb_put_string(content_x, content_y, "Microphone", 0x00E0E0E0, 0x001F1F1F);
-    fb_fill_rect(content_x + 150, content_y + 2, 200, 16, 0x003A3A3A);
-    fb_fill_rect(content_x + 150, content_y + 2, 120, 16, 0x0000FF00);
-    fb_put_string(content_x + 180, content_y + 24, "60%", 0x00808080, 0x001F1F1F);
-
-    content_y += 60;
-
-    /* Audio output device */
-    fb_put_string(content_x, content_y, "Output Device", 0x00E0E0E0, 0x001F1F1F);
-    fb_fill_rect(content_x + 150, content_y, 200, 32, 0x003A3A3A);
-    fb_put_string(content_x + 160, content_y + 8, "Built-in Speaker", 0x00A0A0A0, 0x003A3A3A);
+    ui_button(x + 24,  y + 224, 110, 32, "Lock",      T(HOVER), T(TEXT));
+    ui_button(x + 144, y + 224, 110, 32, "Restart",   T(HOVER), T(TEXT));
+    ui_button(x + 264, y + 224, 110, 32, "Shut down", T(DANGER), 0x00FFFFFF);
 }
 
-void settings_draw_system_panel(int x, int y, int w, int h)
+static void draw_about(int x, int y, int w)
 {
-    fb_fill_rect(x, y, w, h, 0x001F1F1F);
+    (void)w;
+    icon_draw(ICON_JARVIS, x + 24, y + 20, 48);
+    fb_draw_text_scaled(x + 88, y + 20, "JARVIS OS", T(TEXT), 2);
+    fb_draw_text(x + 88, y + 56, "Version 1.0  -  x86-64", T(TEXT_DIM));
 
-    int content_x = x + 24;
-    int content_y = y + 24;
-
-    /* System info */
-    fb_put_string(content_x, content_y, "Device", 0x00E0E0E0, 0x001F1F1F);
-    fb_put_string(content_x, content_y + 24, "JARVIS AI OS", 0x00A0A0A0, 0x001F1F1F);
-
-    content_y += 60;
-
-    fb_put_string(content_x, content_y, "Uptime", 0x00E0E0E0, 0x001F1F1F);
-    char uptime_str[64];
-    uint64_t seconds = g_kstate.uptime_ticks / 100;
-    uint64_t hours = seconds / 3600;
-    uint64_t mins = (seconds % 3600) / 60;
-    snprintf(uptime_str, sizeof(uptime_str), "%lu h %lu m", hours, mins);
-    fb_put_string(content_x, content_y + 24, uptime_str, 0x00A0A0A0, 0x001F1F1F);
-
-    content_y += 60;
-
-    /* Security status */
-    fb_put_string(content_x, content_y, "Security", 0x00E0E0E0, 0x001F1F1F);
-    fb_put_string(content_x + 150, content_y, "SAFE", 0x0000E676, 0x001F1F1F);
-
-    content_y += 40;
-
-    /* Restart button */
-    fb_fill_rect(content_x, content_y, 140, 36, 0x005BA3D6);
-    fb_put_string(content_x + 32, content_y + 10, "Restart", 0x00FFFFFF, 0x005BA3D6);
-}
-
-void settings_draw_about_panel(int x, int y, int w, int h)
-{
-    fb_fill_rect(x, y, w, h, 0x001F1F1F);
-
-    int content_x = x + 24;
-    int content_y = y + 48;
-
-    /* Logo / Title */
-    fb_put_string(content_x, content_y, "JARVIS AI OS", 0x0000D9FF, 0x001F1F1F);
-    fb_put_string(content_x, content_y + 28, "Windows 11-style Desktop Environment", 0x00A0A0A0, 0x001F1F1F);
-
-    content_y += 80;
-
-    /* Version info */
-    fb_put_string(content_x, content_y, "Version 1.0", 0x00E0E0E0, 0x001F1F1F);
-    fb_put_string(content_x, content_y + 24, "Built on C17 kernel with AI subsystems", 0x00808080, 0x001F1F1F);
-
-    content_y += 60;
-
-    /* Credits */
-    fb_put_string(content_x, content_y, "Architecture:", 0x00E0E0E0, 0x001F1F1F);
-    fb_put_string(content_x, content_y + 20, "• GPU: UEFI GOP framebuffer", 0x00A0A0A0, 0x001F1F1F);
-    fb_put_string(content_x, content_y + 36, "• WM: Window manager with tiling support", 0x00A0A0A0, 0x001F1F1F);
-    fb_put_string(content_x, content_y + 52, "• AI: Integrated LLM + speech pipeline", 0x00A0A0A0, 0x001F1F1F);
+    fb_draw_text(x + 24, y + 100, "A desktop operating system with a built-in assistant.", T(TEXT));
+    info_row(x + 24, y + 136, "Kernel", "C17, higher-half, Multiboot2");
+    info_row(x + 24, y + 160, "Graphics", "Double-buffered framebuffer");
+    info_row(x + 24, y + 184, "Assistant", g_kstate.ai_ready ? "AI core online" : "AI core loading");
+    info_row(x + 24, y + 208, "Voice", g_kstate.speech_ready ? "Speech pipeline online" : "Loading");
 }
 
 void settings_draw_callback(wm_window_t *win, uint32_t *framebuffer)
 {
-    if (!win) return;
+    (void)framebuffer;
+    int x, y, w, h;
+    wm_get_client(win, &x, &y, &w, &h);
 
-    /* Window background */
-    fb_fill_rect(win->x, win->y + 32, win->w, win->h - 32, 0x001F1F1F);
+    /* Sidebar */
+    fb_fill_rect(x, y, SET_SIDEBAR_W, h, T(SURFACE));
+    fb_fill_rect(x + SET_SIDEBAR_W - 1, y, 1, h, T(BORDER));
+    for (int i = 0; i < SETTINGS_PAGES; i++) {
+        int iy = y + 12 + i * (SET_ITEM_H + 4);
+        if ((int)g_settings.page == i) {
+            fb_fill_rounded_rect(x + 8, iy, SET_SIDEBAR_W - 17, SET_ITEM_H, 5, T(HOVER));
+            fb_fill_rounded_rect(x + 8, iy + 10, 3, SET_ITEM_H - 20, 1, T(ACCENT));
+        }
+        icon_draw(g_set_pages[i].icon, x + 20, iy + 10, 16);
+        fb_draw_text(x + 44, iy + 10, g_set_pages[i].label, T(TEXT));
+    }
 
-    int left_x = win->x + 8;
-    int left_y = win->y + 48;
-    int left_w = 140;
-
-    int content_x = left_x + left_w + 16;
-    int content_y = left_y;
-    int content_w = win->w - left_w - 32;
-    int content_h = win->h - 80;
-
-    /* Draw sidebar */
-    settings_draw_sidebar(left_x, left_y, left_w);
-
-    /* Draw content based on category */
-    switch (g_settings.current_category) {
-    case SETTINGS_DISPLAY:
-        settings_draw_display_panel(content_x, content_y, content_w, content_h);
-        break;
-    case SETTINGS_SOUND:
-        settings_draw_sound_panel(content_x, content_y, content_w, content_h);
-        break;
-    case SETTINGS_SYSTEM:
-        settings_draw_system_panel(content_x, content_y, content_w, content_h);
-        break;
-    case SETTINGS_ABOUT:
-        settings_draw_about_panel(content_x, content_y, content_w, content_h);
-        break;
+    int cx = x + SET_SIDEBAR_W, cw = w - SET_SIDEBAR_W;
+    switch (g_settings.page) {
+    case SETTINGS_PERSONALIZE: draw_personalize(cx, y, cw); break;
+    case SETTINGS_SYSTEM:      draw_system(cx, y, cw);      break;
+    default:                   draw_about(cx, y, cw);       break;
     }
 }
 
 void settings_event_callback(wm_window_t *win, wm_input_event_t *event)
 {
-    if (!event || !win) return;
+    (void)win;
+    if (event->type != IE_MOUSE_DOWN || event->data.mouse.button != 1)
+        return;
 
-    switch (event->type) {
-    case IE_MOUSE_DOWN:
-        {
-            int mx = event->data.mouse.x;
-            int my = event->data.mouse.y;
+    int mx = event->data.mouse.x, my = event->data.mouse.y;
 
-            /* Sidebar: x in [win->x+8, win->x+148], y in [win->y+48, win->y+248] */
-            int sidebar_x0 = win->x + 8;
-            int sidebar_x1 = win->x + 148;
-            int sidebar_y0 = win->y + 48;
-            if (mx >= sidebar_x0 && mx < sidebar_x1 && my >= sidebar_y0) {
-                int item = (my - sidebar_y0) / 50;
-                if (item >= 0 && item < 4)
-                    g_settings.current_category = (settings_category_t)item;
-                break;
-            }
+    if (mx < SET_SIDEBAR_W) {
+        int i = (my - 12) / (SET_ITEM_H + 4);
+        if (my >= 12 && i >= 0 && i < SETTINGS_PAGES)
+            g_settings.page = (settings_page_t)i;
+        return;
+    }
 
-            /* Theme buttons in Display panel.
-             * content_x passed to draw panel = win->x + 164 (left_x+left_w+16)
-             * inner content_x inside draw fn = win->x + 164 + 24 = win->x + 188
-             * theme button row y:
-             *   content_y = (win->y+48) + 24 = win->y+72
-             *   after += 60 → win->y+132
-             *   buttons drawn at content_y+24 = win->y+156, height 40 */
-            if (g_settings.current_category == SETTINGS_DISPLAY) {
-                int btn_x0 = win->x + 188;
-                int btn_y0 = win->y + 156;
-                int btn_h  = 40;
-                if (my >= btn_y0 && my < btn_y0 + btn_h && mx >= btn_x0) {
-                    int idx = (mx - btn_x0) / 140;
-                    if (idx >= 0 && idx < 3) {
-                        g_settings.selected_theme = (theme_mode_t)idx;
-                        theme_set_mode((theme_mode_t)idx);
-                    }
-                }
-            }
+    mx -= SET_SIDEBAR_W;        /* content-relative */
+
+    if (g_settings.page == SETTINGS_PERSONALIZE) {
+        for (int i = 0; i < 3; i++) {
+            int sx, sy;
+            swatch_rect(i, &sx, &sy);
+            if (ui_hit(mx, my, sx - 3, sy - 3, SW_W + 6, SW_H + 34))
+                theme_set_mode((theme_mode_t)i);
         }
-        break;
-
-    default:
-        break;
+    } else if (g_settings.page == SETTINGS_SYSTEM) {
+        if (ui_hit(mx, my, 24, 224, 110, 32))       desktop_lock();
+        else if (ui_hit(mx, my, 144, 224, 110, 32)) desktop_system_restart();
+        else if (ui_hit(mx, my, 264, 224, 110, 32)) desktop_system_shutdown();
     }
 }
 
@@ -266,17 +180,14 @@ wm_window_t *settings_app_open(int x, int y, int w, int h)
 {
     memset(&g_settings, 0, sizeof(g_settings));
 
-    wm_window_t *win = wm_create_window(
-        "Settings",
-        x, y, w, h,
-        WS_DEFAULT,
-        settings_draw_callback,
-        settings_event_callback
-    );
+    wm_window_t *win = wm_create_window("Settings", x, y, w, h, WS_DEFAULT,
+                                        settings_draw_callback,
+                                        settings_event_callback);
+    if (!win) return NULL;
 
+    win->icon = ICON_GEAR;
+    win->min_w = 640;
+    win->min_h = 320;
     g_settings.window = win;
-    g_settings.current_category = SETTINGS_DISPLAY;
-    g_settings.selected_theme = THEME_DARK;
-
     return win;
 }

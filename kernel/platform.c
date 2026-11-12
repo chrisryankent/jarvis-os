@@ -711,7 +711,7 @@ void kbd_handle_scancode(uint8_t code)
         /* Also emit a text-input event for plain printable characters so
          * text fields (terminal, settings search box, etc.) don't have to
          * re-derive ASCII from raw key+mods themselves. */
-        if (key < 0x100 && key >= 0x20 && !kbd_ctrl && !kbd_alt)
+        if (key < 0x100 && key >= 0x20 && !kbd_ctrl && !kbd_alt && !kbd_super)
             input_text_char((char)key);
         else if (key == '\b' || key == '\n' || key == '\t')
             input_text_char((char)key);

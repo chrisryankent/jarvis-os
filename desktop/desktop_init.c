@@ -1,253 +1,478 @@
 /*
  * =============================================================================
- * JARVIS OS — Desktop System Initialization (desktop/desktop_init.c)
+ * JARVIS OS — Desktop system (desktop/desktop_init.c)
  * Language: C17
  *
- * Main desktop initialization and main loop integration.
+ * Ties the desktop together: the app registry, the frame compositor, and
+ * mouse / keyboard routing between the shell (taskbar, Start menu,
+ * notifications, context menu), the window manager and the lock screen.
+ *
+ * This file is a unity build: it #includes the rest of the shell and the
+ * apps so they share one translation unit.
  * =============================================================================
  */
 
 #include "../kernel/kernel.h"
 #include "../wm/wm.h"
+#include "ui.h"
+#include <string.h>
+#include <stdio.h>
+
+void ui_shell_lock_input(uint32_t key, char ch);    /* desktop/ui_shell.c */
+
 #include "../input/input_events.c"
-#include "../desktop/theme.c"
-#include "../desktop/taskbar.c"
-#include "../desktop/desktop.c"
-#include "../desktop/notifications.c"
-#include "../wm/animations.c"
+#include "theme.c"
+#include "sysutil.c"
+#include "icons.c"
+#include "notifications.c"
+#include "desktop.c"
+#include "taskbar.c"
 #include "../apps/file_explorer.c"
 #include "../apps/terminal.c"
 #include "../apps/settings.c"
 #include "../apps/calculator.c"
+#include "../apps/assistant.c"
+#include "../apps/security_center.c"
+#include "../apps/sysmon.c"
 
-/* ---- Desktop State ------------------------------------------------------- */
+/* ---- App registry -------------------------------------------------------- */
+typedef wm_window_t *(*app_open_fn)(int x, int y, int w, int h);
+
 typedef struct {
+    desktop_app_t pub;
+    app_open_fn open;
+    int w, h;
+    const char *aliases;        /* space-separated, lower case */
+} app_entry_t;
+
+static app_entry_t g_apps[] = {
+    { { "Files",      ICON_FOLDER,   NULL }, file_explorer_open,  700, 460, "files file explorer" },
+    { { "Terminal",   ICON_TERMINAL, NULL }, terminal_app_open,   640, 400, "terminal term console shell" },
+    { { "JARVIS",     ICON_JARVIS,   NULL }, assistant_app_open,  460, 500, "jarvis ai assistant voice" },
+    { { "Security",   ICON_SHIELD,   NULL }, security_app_open,   470, 440, "security guard" },
+    { { "Settings",   ICON_GEAR,     NULL }, settings_app_open,   680, 400, "settings personalize" },
+    { { "Calculator", ICON_CALC,     NULL }, calculator_app_open, 300, 430, "calculator calc" },
+    { { "System",     ICON_CHART,    NULL }, sysmon_app_open,     520, 420, "system monitor models" },
+};
+#define APP_COUNT ((int)(sizeof(g_apps) / sizeof(g_apps[0])))
+
+/* ---- Desktop state ------------------------------------------------------- */
+static struct {
     int initialized;
+    int dirty;                  /* scene changed: recompose the frame */
+    int cursor_dirty;           /* only the pointer moved             */
+    uint64_t last_draw_tick;
     uint32_t frame_count;
-    wm_window_t *file_explorer;
-    wm_window_t *terminal;
-    wm_window_t *settings;
-    wm_window_t *calculator;
-} desktop_state_t;
+    int launch_count;
+} g_ds;
 
-static desktop_state_t g_desktop_state = {};
-
-/* Registered as each default app's wm_close_callback_t so that clicking the
- * titlebar X actually clears the tracked pointer in g_desktop_state.
- * Without this, wm_close_window() would free the wm_window_t while
- * g_desktop_state.file_explorer/terminal/settings/calculator still held the
- * now-dangling pointer — desktop_system_open_app()'s `if (!g_desktop_state.X)`
- * guard would then think the app was still open forever, and the user could
- * never relaunch it after closing it once. */
-static void desktop_clear_window_ptr(void *ctx)
+void desktop_invalidate(void)
 {
-    wm_window_t **slot = (wm_window_t **)ctx;
-    if (*slot)
-        taskbar_remove_window(*slot);
-    *slot = NULL;
+    g_ds.dirty = 1;
 }
 
-static void desktop_launch_file_explorer(void)
+uint32_t desktop_frame_count(void)
 {
-    if (g_desktop_state.file_explorer) {
-        wm_set_focused(g_desktop_state.file_explorer);
-        return;
-    }
-    uint32_t sw = fb_get_width();
-    uint32_t sh = fb_get_height();
-    int w = sw >= 1200 ? 700 : (int)sw - 420;
-    int h = sh >= 760 ? 500 : (int)sh - 220;
-    if (w < 460) w = 460;
-    if (h < 360) h = 360;
-
-    g_desktop_state.file_explorer = file_explorer_open(28, 58, w, h);
-    wm_set_close_callback(g_desktop_state.file_explorer, desktop_clear_window_ptr,
-                           &g_desktop_state.file_explorer);
-    taskbar_add_window(g_desktop_state.file_explorer, "Files");
+    return g_ds.frame_count;
 }
 
-static void desktop_launch_terminal(void)
+int desktop_system_is_initialized(void)
 {
-    if (g_desktop_state.terminal) {
-        wm_set_focused(g_desktop_state.terminal);
-        return;
-    }
-    uint32_t sw = fb_get_width();
-    uint32_t sh = fb_get_height();
-    int w = sw >= 1200 ? 500 : 380;
-    int h = sh >= 760 ? 400 : 320;
-    int x = (int)sw - w - 28;
-    int y = 76;
-    if (x < 40) x = 40;
-
-    g_desktop_state.terminal = terminal_app_open(x, y, w, h);
-    wm_set_close_callback(g_desktop_state.terminal, desktop_clear_window_ptr,
-                           &g_desktop_state.terminal);
-    taskbar_add_window(g_desktop_state.terminal, "Term");
+    return g_ds.initialized;
 }
 
-static void desktop_launch_settings(void)
+/* ---- Apps ---------------------------------------------------------------- */
+int desktop_app_count(void)
 {
-    if (g_desktop_state.settings) {
-        wm_set_focused(g_desktop_state.settings);
-        return;
-    }
-    uint32_t sw = fb_get_width();
-    uint32_t sh = fb_get_height();
-    int w = sw >= 1200 ? 600 : 520;
-    int h = sh >= 760 ? 380 : 330;
-    int x = 58;
-    int y = (int)sh - h - 92;
-    if (y < 96) y = 96;
-
-    g_desktop_state.settings = settings_app_open(x, y, w, h);
-    wm_set_close_callback(g_desktop_state.settings, desktop_clear_window_ptr,
-                           &g_desktop_state.settings);
-    taskbar_add_window(g_desktop_state.settings, "Settings");
+    return APP_COUNT;
 }
 
-static void desktop_launch_calculator(void)
+desktop_app_t *desktop_app_get(int index)
 {
-    if (g_desktop_state.calculator) {
-        wm_set_focused(g_desktop_state.calculator);
+    if (index < 0 || index >= APP_COUNT) return NULL;
+    return &g_apps[index].pub;
+}
+
+static int word_ieq(const char *a, const char *b, size_t blen)
+{
+    size_t i = 0;
+    for (; i < blen; i++) {
+        if (!a[i] || lower(a[i]) != lower(b[i])) return 0;
+    }
+    return a[i] == 0;
+}
+
+int desktop_app_find(const char *name)
+{
+    if (!name || !*name) return -1;
+
+    for (int i = 0; i < APP_COUNT; i++) {
+        if (word_ieq(name, g_apps[i].pub.name, strlen(g_apps[i].pub.name)))
+            return i;
+        for (const char *p = g_apps[i].aliases; *p;) {
+            const char *end = p;
+            while (*end && *end != ' ') end++;
+            if (word_ieq(name, p, (size_t)(end - p)))
+                return i;
+            p = *end ? end + 1 : end;
+        }
+    }
+    return -1;
+}
+
+static void app_closed(void *ctx)
+{
+    ((app_entry_t *)ctx)->pub.window = NULL;
+}
+
+void desktop_app_launch(int index)
+{
+    if (index < 0 || index >= APP_COUNT || !g_ds.initialized) return;
+    app_entry_t *app = &g_apps[index];
+
+    if (app->pub.window) {
+        wm_set_focused(app->pub.window);
         return;
     }
-    uint32_t sw = fb_get_width();
-    int w = 350;
-    int h = 400;
-    int x = (int)sw - w - 40;
-    if (x < 60) x = 60;
 
-    g_desktop_state.calculator = calculator_app_open(x, 120, w, h);
-    wm_set_close_callback(g_desktop_state.calculator, desktop_clear_window_ptr,
-                           &g_desktop_state.calculator);
-    taskbar_add_window(g_desktop_state.calculator, "Calculator");
+    /* Cascade new windows from the top-left of the work area. */
+    int step = g_ds.launch_count++ % 6;
+    int x = 110 + step * 34;
+    int y = 28 + step * 30;
+
+    app->pub.window = app->open(x, y, app->w, app->h);
+    if (app->pub.window)
+        wm_set_close_callback(app->pub.window, app_closed, app);
+    desktop_invalidate();
+}
+
+/* Taskbar icon behaviour: launch, bring forward, or minimize if already
+ * in front. */
+void desktop_app_activate(int index)
+{
+    if (index < 0 || index >= APP_COUNT) return;
+    wm_window_t *win = g_apps[index].pub.window;
+
+    if (!win)
+        desktop_app_launch(index);
+    else if (win == g_wm_ctx.focused && !win->minimized)
+        wm_set_minimized(win, 1);
+    else
+        wm_set_focused(win);
+}
+
+void desktop_system_open_app(const char *app)
+{
+    if (!g_ds.initialized || !app) return;
+
+    int idx = desktop_app_find(app);
+    if (idx >= 0) {
+        desktop_app_launch(idx);
+    } else if (word_ieq(app, "browser", 7) || word_ieq(app, "web", 3)) {
+        notification_show("Browser", "Not available yet: the network stack has no DHCP/TCP.",
+                          NOTIF_WARNING, 5000);
+    } else {
+        terminal_printf("[DESKTOP] Unknown app: %s\n", app);
+    }
+}
+
+void desktop_system_close_all(void)
+{
+    while (g_wm_ctx.windows_head)
+        wm_close_window(g_wm_ctx.windows_head);
+}
+
+/* Typed questions take the same route as recognised speech. */
+void desktop_ask_jarvis(const char *text)
+{
+    if (!text || !*text) return;
+
+    desktop_app_launch(desktop_app_find("JARVIS"));
+
+    static ipc_message_t msg;       /* 4 KB payload: keep it off the stack */
+    size_t len = strlen(text);
+    if (len >= sizeof(msg.payload)) len = sizeof(msg.payload) - 1;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.type = IPC_VOICE_INPUT;
+    memcpy(msg.payload, text, len);
+    msg.payload_len = len;
+    ipc_send(&msg);
+}
+
+void desktop_lock(void)
+{
+    start_menu_close();
+    notifications_close_center();
+    desktop_context_close();
+    ui_shell_show_lock_screen();
+}
+
+static void power_screen(const char *text)
+{
+    fb_reset_clip();
+    fb_clear(0x00000000);
+    ui_text_center(0, (int)fb_get_height() / 2 - 8, (int)fb_get_width(), text, 0x00FFFFFF);
+    fb_cursor_show(0);
+    fb_present();
+}
+
+void desktop_system_shutdown(void)
+{
+    power_screen("Shutting down...");
+    sys_poweroff();
+}
+
+void desktop_system_restart(void)
+{
+    power_screen("Restarting...");
+    sys_reboot();
 }
 
 /* ---- Initialization ------------------------------------------------------ */
 void desktop_system_init(void)
 {
-    if (g_desktop_state.initialized)
+    if (g_ds.initialized)
         return;
 
-    terminal_puts("[DESKTOP] Initializing desktop system...\n");
+    uint32_t W = fb_get_width(), H = fb_get_height();
+    terminal_printf("[DESKTOP] Initializing desktop at %ux%u\n", W, H);
 
-    uint32_t screen_w = fb_get_width();
-    uint32_t screen_h = fb_get_height();
+    if (W == 0 || H == 0) {
+        terminal_puts("[DESKTOP] No framebuffer; desktop disabled\n");
+        return;
+    }
 
-    terminal_printf("[DESKTOP] Screen resolution: %ux%u\n", screen_w, screen_h);
-
-    /* Initialize subsystems */
-    wm_init(screen_w, screen_h);
+    wm_init(W, H);
+    wm_set_workarea(0, 0, (int)W, (int)H - TASKBAR_H);
     theme_init();
     input_queue_init();
-    animation_init();
+    notifications_init();
     taskbar_init();
     desktop_init();
-    notifications_init();
 
-    terminal_puts("[DESKTOP] All subsystems initialized\n");
+    g_ds.initialized = 1;
+    g_ds.dirty = 1;
 
-    /* Launch default applications */
-    terminal_puts("[DESKTOP] Launching default applications...\n");
-
-    desktop_launch_file_explorer();
-    desktop_launch_terminal();
-
-    terminal_puts("[DESKTOP] Default applications launched\n");
-
-    g_desktop_state.initialized = 1;
-
-    /* Show desktop startup message */
-    notification_show(
-        "JARVIS Desktop Ready",
-        "Window manager, File Explorer, Terminal active",
-        NOTIF_INFO,
-        3000
-    );
-
-    terminal_puts("[DESKTOP] Desktop system ready!\n");
+    notification_show("Welcome to JARVIS OS",
+                      "Click Start, or open JARVIS and type 'help'.",
+                      NOTIF_INFO, 6000);
+    terminal_puts("[DESKTOP] Desktop system ready\n");
 }
 
-/* ---- Main Desktop Render Loop -------------------------------------------- */
+/* ---- Frame compositor ----------------------------------------------------
+ * Called from the kernel main loop on every wake-up. A full frame is only
+ * composed when something changed (or twice a second for the clock and the
+ * terminal caret); plain pointer movement repaints just the pointer.
+ */
 void desktop_system_render(void)
 {
-    if (!g_desktop_state.initialized)
+    if (!g_ds.initialized)
         return;
 
-    /* Update animations */
-    animation_tick();
+    uint64_t now = g_kstate.uptime_ticks;
 
-    /* Clear framebuffer to dark background */
-    fb_clear(0x00050510);
+    if (notifications_tick())
+        g_ds.dirty = 1;
+    if (now - g_ds.last_draw_tick >= 50)
+        g_ds.dirty = 1;
 
-    /* Draw desktop components */
+    if (!g_ds.dirty) {
+        if (g_ds.cursor_dirty) {
+            fb_cursor_refresh();
+            g_ds.cursor_dirty = 0;
+        }
+        return;
+    }
+
+    g_ds.dirty = 0;
+    g_ds.cursor_dirty = 0;
+    g_ds.last_draw_tick = now;
+    g_ds.frame_count++;
+
+    if (!ui_shell_is_desktop()) {
+        ui_shell_render_fullscreen();       /* boot / setup / lock screen */
+        return;
+    }
+
+    fb_reset_clip();
     desktop_draw();
     wm_draw_all(fb_get_base());
+    wm_draw_snap_preview();
     taskbar_draw();
-    if (taskbar_is_start_menu_open())
-        start_menu_draw();
+    start_menu_draw();
     notifications_draw();
-    ui_shell_draw_frame();
-
-    g_desktop_state.frame_count++;
+    desktop_context_draw();
+    fb_present();
 }
 
-/* ---- Input Integration --------------------------------------------------- */
+/* ---- Mouse --------------------------------------------------------------- */
 void desktop_system_handle_mouse_move(int x, int y)
 {
-    input_mouse_move(x, y);
-    input_process_queue();
+    fb_cursor_set_pos(x, y);
+    g_ds.cursor_dirty = 1;
+
+    if (!g_ds.initialized || !ui_shell_is_desktop())
+        return;
+
+    int changed = 0;
+    if (wm_is_dragging()) {
+        changed = wm_handle_mouse_move(x, y);
+    } else {
+        changed |= desktop_context_hover(x, y);
+        changed |= start_menu_hover(x, y);
+        changed |= taskbar_hover(x, y);
+        changed |= wm_handle_mouse_move(x, y);
+    }
+    if (changed)
+        g_ds.dirty = 1;
+}
+
+static void desktop_open_icon(int icon)
+{
+    const char *target = desktop_get_icon_target(icon);
+
+    if (strcmp(target, "trash:") == 0) {
+        notification_show("Recycle Bin", "The Recycle Bin is empty.", NOTIF_INFO, 3000);
+    } else if (target[0] == '/') {
+        desktop_app_launch(desktop_app_find("Files"));
+        file_explorer_navigate_to(target);
+    } else {
+        desktop_system_open_app(target);
+    }
 }
 
 void desktop_system_handle_mouse_click(int x, int y, int button)
 {
-    /* Taskbar gets first refusal — Start, pinned icons, and open-window
-     * buttons must intercept clicks before the WM drag logic sees them. */
-    if (taskbar_handle_click(x, y))
+    if (!g_ds.initialized)
+        return;
+    g_ds.dirty = 1;
+
+    if (ui_shell_is_locked()) {
+        ui_shell_lock_input(0, 0);
+        return;
+    }
+    if (!ui_shell_is_desktop())
         return;
 
-    /* Desktop icons (This PC, Recycle Bin, ...) live "behind" every window
-     * in z-order — a click only reaches them if it didn't land on any
-     * actual window. */
-    if (!wm_window_at_point(x, y)) {
-        int icon = desktop_handle_click(x, y);
-        if (icon >= 0) {
-            const char *path = desktop_get_icon_path(icon);
-            if (strcmp(path, "/jarvis/trash") == 0) {
-                notification_show("Recycle Bin", "Recycle Bin is empty.",
-                                   NOTIF_INFO, 3000);
-            } else {
-                desktop_launch_file_explorer();
-                file_explorer_navigate_to(path);
-            }
-            return;
-        }
-        if (icon == -2)
-            return; /* hit an icon but not (yet) a double-click; consume it */
+    /* Top-most layers first. */
+    if (desktop_context_click(x, y))
+        return;
+    if (taskbar_handle_click(x, y))
+        return;
+    if (taskbar_is_start_menu_open()) {
+        if (!start_menu_click(x, y))
+            start_menu_close();             /* click outside dismisses it */
+        return;
     }
-    input_mouse_click(x, y, button);
-    input_process_queue();
+    if (notifications_center_is_visible()) {
+        if (!notifications_click(x, y))
+            notifications_close_center();
+        return;
+    }
+
+    if (wm_handle_mouse_click(x, y, button))
+        return;
+
+    /* Bare desktop */
+    if (button == 2) {
+        desktop_context_open(x, y);
+    } else if (button == 1) {
+        int icon = desktop_handle_click(x, y);
+        if (icon >= 0)
+            desktop_open_icon(icon);
+    }
 }
 
 void desktop_system_handle_mouse_release(int x, int y, int button)
 {
-    input_mouse_release(x, y, button);
-    input_process_queue();
+    if (!g_ds.initialized || !ui_shell_is_desktop())
+        return;
+    wm_handle_mouse_release(x, y, button);
+    g_ds.dirty = 1;
 }
 
 void desktop_system_handle_mouse_wheel(int x, int y, int delta)
 {
-    wm_input_event_t event;
-    event.type = IE_MOUSE_WHEEL;
-    event.data.mouse.x = x;
-    event.data.mouse.y = y;
-    event.data.mouse.button = delta;
-    event.timestamp = g_kstate.uptime_ticks;
-    input_post_event(&event);
-    input_process_queue();
+    (void)x; (void)y; (void)delta;      /* no wheel-capable mouse driver yet */
 }
 
+/* ---- Keyboard ------------------------------------------------------------ */
+/* Global shortcuts. Returns 1 if the key was consumed. */
+static int desktop_shortcut(uint32_t key, int mods)
+{
+    if (key == WM_KEY_SUPER_TAP || ((mods & KMOD_CTRL) && key == WM_KEY_ESC)) {
+        taskbar_toggle_start_menu();
+        return 1;
+    }
+
+    if (mods & KMOD_SUPER) {
+        switch (lower((char)key)) {
+        case 'd': wm_minimize_all();                                   return 1;
+        case 'e': desktop_app_launch(desktop_app_find("Files"));       return 1;
+        case 'i': desktop_app_launch(desktop_app_find("Settings"));    return 1;
+        case 'j': desktop_app_launch(desktop_app_find("JARVIS"));      return 1;
+        case 'l': desktop_lock();                                      return 1;
+        default: break;
+        }
+    }
+    if ((mods & KMOD_CTRL) && (mods & KMOD_ALT) && lower((char)key) == 't') {
+        desktop_app_launch(desktop_app_find("Terminal"));
+        return 1;
+    }
+    return 0;
+}
+
+void desktop_dispatch_event(wm_input_event_t *event)
+{
+    if (!g_ds.initialized || !event)
+        return;
+
+    if (ui_shell_is_locked()) {
+        if (event->type == IE_KEY_DOWN)
+            ui_shell_lock_input(event->data.keyboard.key, 0);
+        else if (event->type == IE_TEXT_INPUT)
+            ui_shell_lock_input(0, event->data.text.ch);
+        g_ds.dirty = 1;
+        return;
+    }
+    if (!ui_shell_is_desktop())
+        return;
+
+    switch (event->type) {
+    case IE_KEY_DOWN: {
+        uint32_t key = event->data.keyboard.key;
+        int mods = event->data.keyboard.mods;
+        g_ds.dirty = 1;
+
+        if (desktop_shortcut(key, mods))
+            return;
+        if (start_menu_key(key, mods))
+            return;
+        if (key == WM_KEY_ESC && (desktop_context_is_open() ||
+                                  notifications_center_is_visible())) {
+            desktop_context_close();
+            notifications_close_center();
+            return;
+        }
+        wm_handle_input(event);
+        break;
+    }
+    case IE_TEXT_INPUT:
+        g_ds.dirty = 1;
+        if (start_menu_text(event->data.text.ch))
+            return;
+        wm_handle_input(event);
+        break;
+    case IE_KEY_UP:
+        wm_handle_input(event);
+        break;
+    default:
+        break;
+    }
+}
+
+/* Kept for callers that inject input directly (voice commands, tests). */
 void desktop_system_handle_key(uint32_t key, int mods)
 {
     input_key_press(key, mods);
@@ -266,59 +491,16 @@ void desktop_system_handle_text_input(char ch)
     input_process_queue();
 }
 
-/* ---- Statistics & Diagnostics -------------------------------------------- */
+/* ---- Diagnostics --------------------------------------------------------- */
 void desktop_system_status(void)
 {
     terminal_printf("[DESKTOP STATUS]\n");
-    terminal_printf("  Frames rendered: %u\n", g_desktop_state.frame_count);
-    terminal_printf("  Windows created: %u\n", g_wm_ctx.next_wid - 1);
-    terminal_printf("  Active windows: %d\n", wm_count_windows());
-    terminal_printf("  Notifications: %d/%d\n",
-        notifications_get_unread_count(), notifications_get_count());
-    terminal_printf("  Animations: %u\n", g_anim_ctx.animation_count);
+    terminal_printf("  Frames rendered: %u\n", g_ds.frame_count);
+    terminal_printf("  Open windows: %d\n", wm_count_windows());
+    terminal_printf("  Notifications: %d (%d unread)\n",
+        notifications_get_count(), notifications_get_unread_count());
+    terminal_printf("  Theme: %s\n", theme_get_name());
     terminal_printf("  AI Core: %s\n", g_kstate.ai_ready ? "READY" : "LOADING");
     terminal_printf("  Speech: %s\n", g_kstate.speech_ready ? "READY" : "LOADING");
     terminal_printf("  Security: %s\n", g_kstate.security_enabled ? "ENABLED" : "DISABLED");
-}
-
-int desktop_system_is_initialized(void)
-{
-    return g_desktop_state.initialized;
-}
-
-/* Closes every open window (used by the "clear" debug command and
- * available for a future "log off"/"close all windows" desktop action).
- * Declared in kernel.h since the project's first revision but never
- * actually implemented or wired to anything — the "clear" debug command
- * printed "Desktop cleared." without doing anything. */
-void desktop_system_close_all(void)
-{
-    wm_window_t *win = g_wm_ctx.windows_head;
-    while (win) {
-        wm_window_t *next = win->next;
-        wm_close_window(win);
-        win = next;
-    }
-}
-
-void desktop_system_open_app(const char *app)
-{
-    if (!desktop_system_is_initialized())
-        return;
-
-    if (!app) return;
-
-    terminal_printf("[DESKTOP] Voice command: opening %s\n", app);
-
-    if (strcmp(app, "Files") == 0 || strcmp(app, "files") == 0) {
-        desktop_launch_file_explorer();
-    } else if (strcmp(app, "Terminal") == 0 || strcmp(app, "terminal") == 0) {
-        desktop_launch_terminal();
-    } else if (strcmp(app, "Settings") == 0 || strcmp(app, "settings") == 0) {
-        desktop_launch_settings();
-    } else if (strcmp(app, "Calculator") == 0 || strcmp(app, "calculator") == 0) {
-        desktop_launch_calculator();
-    } else if (strcmp(app, "Browser") == 0 || strcmp(app, "browser") == 0) {
-        terminal_printf("[DESKTOP] Browser app not yet implemented\n");
-    }
 }

@@ -1,84 +1,78 @@
 /*
  * =============================================================================
- * JARVIS OS — Terminal Application (apps/terminal.c)
+ * JARVIS OS — Terminal (apps/terminal.c)
  * Language: C17
  *
- * Terminal emulator with full PS/2 keyboard support, command history, and
- * built-in command dispatch (help, ls, clear, echo, status, open, theme,
- * notify, uptime).
+ * Scrollback console with an inline prompt, command history (Up / Down) and
+ * built-in commands for the VFS, the desktop and the assistant.
  * =============================================================================
  */
 
 #include "../kernel/kernel.h"
 #include "../wm/wm.h"
-#include "../drivers/gpu.h"
+#include "../desktop/ui.h"
 #include <string.h>
 #include <stdio.h>
 
-#define TERM_ROWS       32
-#define TERM_COLS       80
-#define CHAR_WIDTH      8
-#define CHAR_HEIGHT     16
+#define TERM_LINES      200
+#define TERM_COLS       100
 #define HISTORY_MAX     16
-
-/* Forward declaration — desktop_system_open_app() is in desktop_init.c which
- * wraps this unity build, but it appears after all #includes so we need this
- * to avoid an implicit-function-declaration warning. */
-void desktop_system_open_app(const char *app);
-
-/* input_scancode_to_char() is defined in input/input_events.c, which is
- * #included before this file in the unity build (desktop_init.c). */
-char input_scancode_to_char(uint32_t sc, int mods);
+#define TERM_BG         0x000C0C0C
+#define TERM_FG         0x00CCCCCC
+#define TERM_PROMPT     "jarvis> "
 
 typedef struct {
     wm_window_t *window;
-    char buffer[TERM_ROWS][TERM_COLS];
-    char input_line[256];
-    int input_pos;
-    int cursor_x, cursor_y;
-    int scroll_offset;
-    uint32_t bg_color;
-    uint32_t fg_color;
+    char lines[TERM_LINES][TERM_COLS + 1];
+    int first;              /* index of the oldest line in the ring */
+    int count;              /* number of lines in use (>= 1)        */
+    int col;                /* write position in the newest line    */
 
-    char history[HISTORY_MAX][256];
+    char input[160];
+    int input_len;
+
+    char history[HISTORY_MAX][160];
     int history_count;
-    int history_pos;        /* -1 = not browsing, 0..N-1 = browsing */
-    char history_draft[256]; /* saved current input while browsing */
+    int history_pos;        /* -1 = editing a new line */
 } terminal_context_t;
 
-static terminal_context_t g_terminal = {};
+static terminal_context_t g_terminal;
 
-/* ---- Output ---------------------------------------------------------------- */
+/* ---- Output -------------------------------------------------------------- */
+static char *term_line(int i)
+{
+    return g_terminal.lines[(g_terminal.first + i) % TERM_LINES];
+}
+
+static void term_newline(void)
+{
+    if (g_terminal.count < TERM_LINES) {
+        g_terminal.count++;
+    } else {
+        g_terminal.first = (g_terminal.first + 1) % TERM_LINES;
+    }
+    term_line(g_terminal.count - 1)[0] = 0;
+    g_terminal.col = 0;
+}
+
 void terminal_app_clear(void)
 {
-    memset(g_terminal.buffer, 0, sizeof(g_terminal.buffer));
-    g_terminal.cursor_y = 0;
-    g_terminal.cursor_x = 0;
+    g_terminal.first = 0;
+    g_terminal.count = 1;
+    g_terminal.col = 0;
+    g_terminal.lines[0][0] = 0;
 }
 
 void terminal_app_put_char(char c)
 {
     if (c == '\n') {
-        g_terminal.cursor_y++;
-        g_terminal.cursor_x = 0;
-        if (g_terminal.cursor_y >= TERM_ROWS) {
-            for (int row = 0; row < TERM_ROWS - 1; row++)
-                memcpy(g_terminal.buffer[row], g_terminal.buffer[row + 1], TERM_COLS);
-            memset(g_terminal.buffer[TERM_ROWS - 1], 0, TERM_COLS);
-            g_terminal.cursor_y = TERM_ROWS - 1;
-        }
-    } else if (c == '\r') {
-        g_terminal.cursor_x = 0;
-    } else if (c == '\b') {
-        if (g_terminal.cursor_x > 0) {
-            g_terminal.cursor_x--;
-            g_terminal.buffer[g_terminal.cursor_y][g_terminal.cursor_x] = ' ';
-        }
-    } else if ((uint8_t)c >= 32 && (uint8_t)c < 127) {
-        if (g_terminal.cursor_x < TERM_COLS - 1) {
-            g_terminal.buffer[g_terminal.cursor_y][g_terminal.cursor_x] = c;
-            g_terminal.cursor_x++;
-        }
+        term_newline();
+    } else if ((unsigned char)c >= 32 && (unsigned char)c < 127) {
+        if (g_terminal.col >= TERM_COLS)
+            term_newline();
+        char *line = term_line(g_terminal.count - 1);
+        line[g_terminal.col++] = c;
+        line[g_terminal.col] = 0;
     }
 }
 
@@ -86,393 +80,325 @@ void terminal_app_write(const char *text)
 {
     while (*text)
         terminal_app_put_char(*text++);
+    desktop_invalidate();
 }
 
-/* ---- Drawing --------------------------------------------------------------- */
+/* ---- Drawing ------------------------------------------------------------- */
 void terminal_app_draw_callback(wm_window_t *win, uint32_t *framebuffer)
 {
-    if (!win) return;
+    (void)framebuffer;
+    int x, y, w, h;
+    wm_get_client(win, &x, &y, &w, &h);
 
-    int x = win->x + 8;
-    int y = win->y + 40;
+    fb_fill_rect(x, y, w, h, TERM_BG);
 
-    fb_fill_rect(win->x, win->y + 32, win->w, win->h - 32, 0x00000000);
+    int rows = (h - 12) / 16;
+    if (rows < 2) rows = 2;
 
-    for (int row = 0; row < TERM_ROWS; row++) {
-        for (int col = 0; col < TERM_COLS; col++) {
-            char c = g_terminal.buffer[row][col];
-            if (c != '\0')
-                fb_put_char(x + col * CHAR_WIDTH, y + row * CHAR_HEIGHT,
-                            c, 0x00FFFFFF, 0x00000000);
-        }
+    /* The prompt occupies the row after the last output line, unless that
+     * line is empty (then it reuses it). */
+    int out_lines = g_terminal.count;
+    if (term_line(out_lines - 1)[0] == 0)
+        out_lines--;
+
+    int start = out_lines - (rows - 1);
+    if (start < 0) start = 0;
+
+    int ty = y + 6;
+    for (int i = start; i < out_lines; i++, ty += 16)
+        fb_draw_text(x + 8, ty, term_line(i), TERM_FG);
+
+    fb_draw_text(x + 8, ty, TERM_PROMPT, 0x0046D3C6);
+    int px = x + 8 + fb_text_width(TERM_PROMPT);
+    fb_draw_text(px, ty, g_terminal.input, 0x00FFFFFF);
+
+    /* Block cursor, blinking only while the window has focus */
+    int focused = (g_wm_ctx.focused == win);
+    if (!focused || (g_kstate.uptime_ticks / 50) % 2 == 0) {
+        int cxp = px + g_terminal.input_len * 8;
+        if (focused) fb_fill_rect(cxp, ty, 8, 16, TERM_FG);
+        else         fb_draw_rect(cxp, ty, 8, 16, 0x00707070);
     }
-
-    /* Blinking block cursor */
-    int blink = (g_kstate.uptime_ticks / 25) % 2;
-    if (blink)
-        fb_fill_rect(x + g_terminal.cursor_x * CHAR_WIDTH,
-                     y + g_terminal.cursor_y * CHAR_HEIGHT,
-                     CHAR_WIDTH, CHAR_HEIGHT / 2, 0x00FFFFFF);
-
-    /* Input line */
-    int input_y = win->y + win->h - 42;
-    fb_fill_rect(win->x, input_y - 2, win->w, CHAR_HEIGHT + 8, 0x00111111);
-    fb_put_char(win->x + 4, input_y, '>', 0x0000FF00, 0x00111111);
-    fb_put_string(win->x + 16, input_y, g_terminal.input_line, 0x00FFFFFF, 0x00111111);
-
-    /* Status bar */
-    char status[128];
-    snprintf(status, sizeof(status), "Terminal | AI: %s | Voice: %s",
-        g_kstate.ai_ready ? "ready" : "loading",
-        g_kstate.speech_ready ? "ready" : "loading");
-    fb_fill_rect(win->x, win->y + win->h - 24, win->w, 24, 0x001A1A1A);
-    fb_put_string(win->x + 8, win->y + win->h - 18, status, 0x00808080, 0x001A1A1A);
 }
 
-/* ---- Command History ------------------------------------------------------- */
+/* ---- History ------------------------------------------------------------- */
 static void history_push(const char *cmd)
 {
-    if (strlen(cmd) == 0)
+    if (!*cmd) return;
+    if (g_terminal.history_count > 0 &&
+        strcmp(g_terminal.history[(g_terminal.history_count - 1) % HISTORY_MAX], cmd) == 0)
         return;
 
-    /* Don't push duplicate of last entry */
-    if (g_terminal.history_count > 0) {
-        int last = (g_terminal.history_count - 1) % HISTORY_MAX;
-        if (strcmp(g_terminal.history[last], cmd) == 0)
-            return;
-    }
-
-    int slot = g_terminal.history_count % HISTORY_MAX;
-    strncpy(g_terminal.history[slot], cmd, sizeof(g_terminal.history[0]) - 1);
-    g_terminal.history[slot][sizeof(g_terminal.history[0]) - 1] = '\0';
+    char *slot = g_terminal.history[g_terminal.history_count % HISTORY_MAX];
+    strncpy(slot, cmd, sizeof(g_terminal.history[0]) - 1);
+    slot[sizeof(g_terminal.history[0]) - 1] = 0;
     g_terminal.history_count++;
 }
 
-static void history_up(void)
+static void history_load(int pos)
 {
-    int count = g_terminal.history_count;
-    if (count == 0)
-        return;
+    int avail = g_terminal.history_count < HISTORY_MAX ? g_terminal.history_count : HISTORY_MAX;
 
-    if (g_terminal.history_pos < 0) {
-        /* Start browsing — save current draft */
-        strncpy(g_terminal.history_draft, g_terminal.input_line,
-                sizeof(g_terminal.history_draft) - 1);
-        g_terminal.history_pos = 0;
-    } else if (g_terminal.history_pos < count - 1 && g_terminal.history_pos < HISTORY_MAX - 1) {
-        g_terminal.history_pos++;
-    } else {
-        return;
-    }
-
-    int slot = (count - 1 - g_terminal.history_pos) % HISTORY_MAX;
-    if (slot < 0)
-        slot += HISTORY_MAX;
-    strncpy(g_terminal.input_line, g_terminal.history[slot],
-            sizeof(g_terminal.input_line) - 1);
-    g_terminal.input_line[sizeof(g_terminal.input_line) - 1] = '\0';
-    g_terminal.input_pos = (int)strlen(g_terminal.input_line);
-}
-
-static void history_down(void)
-{
-    if (g_terminal.history_pos < 0)
-        return;
-
-    if (g_terminal.history_pos == 0) {
-        /* Restore draft */
-        strncpy(g_terminal.input_line, g_terminal.history_draft,
-                sizeof(g_terminal.input_line) - 1);
-        g_terminal.input_line[sizeof(g_terminal.input_line) - 1] = '\0';
-        g_terminal.input_pos = (int)strlen(g_terminal.input_line);
+    if (pos < 0) {
         g_terminal.history_pos = -1;
+        g_terminal.input[0] = 0;
+        g_terminal.input_len = 0;
         return;
     }
+    if (pos >= avail) return;
 
-    g_terminal.history_pos--;
-    int count = g_terminal.history_count;
-    int slot = (count - 1 - g_terminal.history_pos) % HISTORY_MAX;
-    if (slot < 0)
-        slot += HISTORY_MAX;
-    strncpy(g_terminal.input_line, g_terminal.history[slot],
-            sizeof(g_terminal.input_line) - 1);
-    g_terminal.input_line[sizeof(g_terminal.input_line) - 1] = '\0';
-    g_terminal.input_pos = (int)strlen(g_terminal.input_line);
+    g_terminal.history_pos = pos;
+    int slot = (g_terminal.history_count - 1 - pos) % HISTORY_MAX;
+    strncpy(g_terminal.input, g_terminal.history[slot], sizeof(g_terminal.input) - 1);
+    g_terminal.input[sizeof(g_terminal.input) - 1] = 0;
+    g_terminal.input_len = (int)strlen(g_terminal.input);
 }
 
-/* ---- Command Dispatch ------------------------------------------------------ */
+/* ---- Commands ------------------------------------------------------------ */
+static void term_resolve(const char *arg, char *out, size_t n)
+{
+    if (!arg || !*arg)      snprintf(out, n, "/jarvis");
+    else if (arg[0] == '/') snprintf(out, n, "%s", arg);
+    else                    snprintf(out, n, "/jarvis/%s", arg);
+}
+
 static void cmd_help(void)
 {
-    terminal_app_write("Available commands:\n");
-    terminal_app_write("  help              Show this message\n");
-    terminal_app_write("  clear             Clear terminal screen\n");
-    terminal_app_write("  ls [path]         List directory (default: /jarvis)\n");
-    terminal_app_write("  echo <text>       Print text to terminal\n");
-    terminal_app_write("  status            Show desktop and kernel status\n");
-    terminal_app_write("  uptime            Show system uptime\n");
-    terminal_app_write("  open <app>        Open app (Files|Terminal|Settings|Calculator)\n");
-    terminal_app_write("  theme <mode>      Set theme: dark | light | hc\n");
-    terminal_app_write("  notify <msg>      Show a notification toast\n");
+    terminal_app_write(
+        "Files:    ls [dir]   cat <file>   mkdir <dir>   touch <file>\n"
+        "System:   status   uptime   date   clear   echo <text>\n"
+        "Desktop:  apps   open <app>   theme dark|light|hc   notify <text>\n"
+        "JARVIS:   ask <question>\n"
+        "Power:    lock   reboot   shutdown\n");
 }
 
-static void cmd_ls(const char *path)
+static void cmd_ls(const char *arg)
 {
-    if (!path || strlen(path) == 0)
-        path = "/jarvis";
+    static char listing[16384];
+    char dir[128];
+    term_resolve(arg, dir, sizeof(dir));
+    size_t dlen = strlen(dir);
+    int shown = 0;
 
-    char buf[2048];
-    if (vfs_list(path, buf, sizeof(buf)) < 0) {
-        terminal_app_write("ls: failed to list ");
-        terminal_app_write(path);
-        terminal_app_write("\n");
+    if (vfs_list(dir, listing, sizeof(listing)) < 0) {
+        terminal_app_write("ls: cannot read directory\n");
         return;
     }
 
-    terminal_app_write(path);
-    terminal_app_write(":\n");
+    for (const char *p = listing; *p;) {
+        const char *eol = p;
+        while (*eol && *eol != '\n') eol++;
 
-    const char *p = buf;
-    int count = 0;
-    while (*p) {
-        char name[128];
-        char type[16];
-        int name_len = 0, type_len = 0;
+        int is_dir = strncmp(p, "[dir] ", 6) == 0;
+        int is_file = strncmp(p, "[file] ", 7) == 0;
+        const char *full = p + (is_dir ? 6 : 7);
+        size_t flen = (size_t)(eol - full);
 
-        memset(name, 0, sizeof(name));
-        memset(type, 0, sizeof(type));
-
-        while (*p && *p != '|' && *p != '\n') {
-            if (name_len + 1 < (int)sizeof(name))
-                name[name_len++] = *p;
-            p++;
+        if ((is_dir || is_file) && flen > dlen + 1 &&
+            strncmp(full, dir, dlen) == 0 && full[dlen] == '/') {
+            const char *name = full + dlen + 1;
+            size_t nlen = flen - dlen - 1;
+            int direct = 1;
+            for (size_t i = 0; i < nlen; i++)
+                if (name[i] == '/') { direct = 0; break; }
+            if (direct) {
+                terminal_app_write(is_dir ? "  <DIR>  " : "         ");
+                for (size_t i = 0; i < nlen; i++)
+                    terminal_app_put_char(name[i]);
+                terminal_app_put_char('\n');
+                shown++;
+            }
         }
-        if (*p != '|') {
-            while (*p && *p != '\n') p++;
-            if (*p == '\n') p++;
-            continue;
-        }
-        p++;
-
-        while (*p && *p != '|' && *p != '\n') {
-            if (type_len + 1 < (int)sizeof(type))
-                type[type_len++] = *p;
-            p++;
-        }
-
-        int is_dir = (strcmp(type, "dir") == 0);
-        terminal_app_write(is_dir ? "  [D] " : "  [F] ");
-        terminal_app_write(name);
-        terminal_app_write("\n");
-        count++;
-
-        while (*p && *p != '\n') p++;
-        if (*p == '\n') p++;
+        p = *eol ? eol + 1 : eol;
     }
-
-    if (count == 0)
+    if (!shown)
         terminal_app_write("  (empty)\n");
+}
+
+static void cmd_cat(const char *arg)
+{
+    static char buf[4096];
+    char path[128];
+    if (!*arg) { terminal_app_write("usage: cat <file>\n"); return; }
+    term_resolve(arg, path, sizeof(path));
+    if (vfs_read_file(path, buf, sizeof(buf)) < 0) {
+        terminal_app_write("cat: no such file\n");
+        return;
+    }
+    terminal_app_write(buf);
+    terminal_app_write("\n");
 }
 
 static void cmd_status(void)
 {
-    char buf[128];
-
-    terminal_app_write("--- System Status ---\n");
-
-    snprintf(buf, sizeof(buf), "  AI Core:   %s\n", g_kstate.ai_ready ? "READY" : "LOADING");
+    char buf[96];
+    snprintf(buf, sizeof(buf), "  AI brain   %s\n", g_kstate.ai_ready ? "ready" : "loading");
     terminal_app_write(buf);
-
-    snprintf(buf, sizeof(buf), "  Speech:    %s\n", g_kstate.speech_ready ? "READY" : "LOADING");
+    snprintf(buf, sizeof(buf), "  Voice      %s\n", g_kstate.speech_ready ? "ready" : "loading");
     terminal_app_write(buf);
-
-    snprintf(buf, sizeof(buf), "  Security:  %s\n", g_kstate.security_enabled ? "ENABLED" : "DISABLED");
+    snprintf(buf, sizeof(buf), "  Security   %s (lock %s)\n", ui_shell_get_security_label(),
+             g_kstate.security_enabled ? "on" : "off");
     terminal_app_write(buf);
-
-    snprintf(buf, sizeof(buf), "  Windows:   %d open\n", wm_count_windows());
+    snprintf(buf, sizeof(buf), "  Network    %s\n", g_kstate.network_ready ? "adapter up" : "offline");
     terminal_app_write(buf);
-
-    snprintf(buf, sizeof(buf), "  Screen:    %ux%u\n", fb_get_width(), fb_get_height());
+    snprintf(buf, sizeof(buf), "  Display    %ux%u, %d window(s)\n",
+             fb_get_width(), fb_get_height(), wm_count_windows());
     terminal_app_write(buf);
-}
-
-static void cmd_uptime(void)
-{
-    char buf[64];
-    uint64_t secs = g_kstate.uptime_ticks / 100;
-    uint64_t h = secs / 3600;
-    uint64_t m = (secs % 3600) / 60;
-    uint64_t s = secs % 60;
-    snprintf(buf, sizeof(buf), "  Uptime: %llu h %llu m %llu s\n",
-             (unsigned long long)h, (unsigned long long)m, (unsigned long long)s);
-    terminal_app_write(buf);
-}
-
-static void cmd_theme(const char *mode)
-{
-    if (!mode || strlen(mode) == 0) {
-        terminal_app_write("usage: theme dark|light|hc\n");
-        return;
-    }
-    if (strcmp(mode, "dark") == 0) {
-        theme_set_mode(THEME_DARK);
-        terminal_app_write("Theme: Dark\n");
-    } else if (strcmp(mode, "light") == 0) {
-        theme_set_mode(THEME_LIGHT);
-        terminal_app_write("Theme: Light\n");
-    } else if (strcmp(mode, "hc") == 0 || strcmp(mode, "highcontrast") == 0) {
-        theme_set_mode(THEME_HIGH_CONTRAST);
-        terminal_app_write("Theme: High Contrast\n");
-    } else {
-        terminal_app_write("unknown theme (use: dark, light, hc)\n");
-    }
 }
 
 void terminal_app_execute_command(const char *cmd)
 {
-    if (!cmd || strlen(cmd) == 0)
-        return;
+    while (*cmd == ' ') cmd++;
+    if (!*cmd) return;
 
     history_push(cmd);
-    g_terminal.history_pos = -1;
 
-    terminal_app_write("\n> ");
-    terminal_app_write(cmd);
-    terminal_app_write("\n");
+    char verb[24] = {};
+    const char *rest = strchr(cmd, ' ');
+    size_t vlen = rest ? (size_t)(rest - cmd) : strlen(cmd);
+    if (vlen >= sizeof(verb)) vlen = sizeof(verb) - 1;
+    memcpy(verb, cmd, vlen);
+    rest = rest ? rest : "";
+    while (*rest == ' ') rest++;
 
-    /* Split into verb + rest */
-    char verb[64] = {};
-    const char *rest = "";
-    const char *sp = strchr(cmd, ' ');
-    if (sp) {
-        size_t vlen = (size_t)(sp - cmd);
-        if (vlen >= sizeof(verb))
-            vlen = sizeof(verb) - 1;
-        memcpy(verb, cmd, vlen);
-        rest = sp + 1;
-        while (*rest == ' ')
-            rest++;
-    } else {
-        strncpy(verb, cmd, sizeof(verb) - 1);
-    }
+    char buf[160], path[128];
 
     if (strcmp(verb, "help") == 0) {
         cmd_help();
-    } else if (strcmp(verb, "clear") == 0) {
+    } else if (strcmp(verb, "clear") == 0 || strcmp(verb, "cls") == 0) {
         terminal_app_clear();
-    } else if (strcmp(verb, "ls") == 0) {
+    } else if (strcmp(verb, "ls") == 0 || strcmp(verb, "dir") == 0) {
         cmd_ls(rest);
+    } else if (strcmp(verb, "cat") == 0 || strcmp(verb, "type") == 0) {
+        cmd_cat(rest);
+    } else if (strcmp(verb, "mkdir") == 0) {
+        term_resolve(rest, path, sizeof(path));
+        terminal_app_write(*rest && vfs_mkdir(path) == 0 ? "Folder created.\n"
+                                                         : "mkdir: failed\n");
+    } else if (strcmp(verb, "touch") == 0) {
+        term_resolve(rest, path, sizeof(path));
+        terminal_app_write(*rest && vfs_create_file(path) == 0 ? "File created.\n"
+                                                               : "touch: failed\n");
     } else if (strcmp(verb, "echo") == 0) {
         terminal_app_write(rest);
         terminal_app_write("\n");
     } else if (strcmp(verb, "status") == 0) {
         cmd_status();
     } else if (strcmp(verb, "uptime") == 0) {
-        cmd_uptime();
+        sys_format_uptime(buf, sizeof(buf));
+        terminal_app_write(buf);
+        terminal_app_write("\n");
+    } else if (strcmp(verb, "date") == 0) {
+        char clock[8];
+        sys_format_date(buf, sizeof(buf));
+        sys_format_clock(clock, sizeof(clock));
+        terminal_app_write(buf);
+        terminal_app_write("  ");
+        terminal_app_write(clock);
+        terminal_app_write("\n");
+    } else if (strcmp(verb, "apps") == 0) {
+        for (int i = 0; i < desktop_app_count(); i++) {
+            desktop_app_t *app = desktop_app_get(i);
+            snprintf(buf, sizeof(buf), "  %s%s\n", app->name, app->window ? "  (running)" : "");
+            terminal_app_write(buf);
+        }
     } else if (strcmp(verb, "open") == 0) {
-        if (strlen(rest) == 0) {
-            terminal_app_write("usage: open <app>\n");
-        } else {
-            desktop_system_open_app(rest);
-            terminal_app_write("Launched: ");
-            terminal_app_write(rest);
-            terminal_app_write("\n");
-        }
+        int idx = desktop_app_find(rest);
+        if (idx < 0) terminal_app_write("open: unknown app (try 'apps')\n");
+        else         desktop_app_launch(idx);
     } else if (strcmp(verb, "theme") == 0) {
-        cmd_theme(rest);
+        if (strcmp(rest, "dark") == 0)       theme_set_mode(THEME_DARK);
+        else if (strcmp(rest, "light") == 0) theme_set_mode(THEME_LIGHT);
+        else if (strcmp(rest, "hc") == 0)    theme_set_mode(THEME_HIGH_CONTRAST);
+        else { terminal_app_write("usage: theme dark|light|hc\n"); return; }
+        snprintf(buf, sizeof(buf), "Theme: %s\n", theme_get_name());
+        terminal_app_write(buf);
     } else if (strcmp(verb, "notify") == 0) {
-        if (strlen(rest) == 0) {
-            terminal_app_write("usage: notify <message>\n");
-        } else {
-            notification_show("Terminal", rest, NOTIF_INFO, 4000);
-            terminal_app_write("Notification sent\n");
+        if (!*rest) terminal_app_write("usage: notify <text>\n");
+        else        notification_show("Terminal", rest, NOTIF_INFO, 4000);
+    } else if (strcmp(verb, "ask") == 0) {
+        if (!*rest) terminal_app_write("usage: ask <question>\n");
+        else {
+            desktop_ask_jarvis(rest);
+            terminal_app_write("Sent to JARVIS (reply appears in the JARVIS window).\n");
         }
+    } else if (strcmp(verb, "lock") == 0) {
+        desktop_lock();
+    } else if (strcmp(verb, "reboot") == 0) {
+        desktop_system_restart();
+    } else if (strcmp(verb, "shutdown") == 0) {
+        desktop_system_shutdown();
     } else {
-        terminal_app_write("Unknown command: ");
-        terminal_app_write(verb);
-        terminal_app_write("\n(type 'help' for a list)\n");
+        snprintf(buf, sizeof(buf), "'%s' is not a command. Type 'help'.\n", verb);
+        terminal_app_write(buf);
     }
 }
 
-/* ---- Event Handling -------------------------------------------------------- */
+/* ---- Events -------------------------------------------------------------- */
 void terminal_app_event_callback(wm_window_t *win, wm_input_event_t *event)
 {
-    if (!event) return;
+    (void)win;
 
-    switch (event->type) {
-    case IE_TEXT_INPUT:
-        {
-            char ch = event->data.text.ch;
-            if (ch >= 32 && (uint8_t)ch < 127 &&
-                g_terminal.input_pos < (int)sizeof(g_terminal.input_line) - 1) {
-                g_terminal.input_line[g_terminal.input_pos++] = ch;
-                g_terminal.input_line[g_terminal.input_pos] = '\0';
-            }
+    if (event->type == IE_TEXT_INPUT) {
+        char ch = event->data.text.ch;
+        if (ch >= 32 && ch < 127 && g_terminal.input_len < (int)sizeof(g_terminal.input) - 1) {
+            g_terminal.input[g_terminal.input_len++] = ch;
+            g_terminal.input[g_terminal.input_len] = 0;
         }
-        break;
+        return;
+    }
 
-    case IE_KEY_DOWN:
-        {
-            uint32_t key = event->data.keyboard.key;
-            int mods = event->data.keyboard.mods;
+    if (event->type != IE_KEY_DOWN)
+        return;
 
-            if (key == 0x1C) {  /* Enter */
-                terminal_app_execute_command(g_terminal.input_line);
-                g_terminal.input_line[0] = '\0';
-                g_terminal.input_pos = 0;
-            } else if (key == 0x0E) {  /* Backspace */
-                if (g_terminal.input_pos > 0) {
-                    g_terminal.input_line[--g_terminal.input_pos] = '\0';
-                }
-            } else if (key == 0x48) {  /* Up arrow — history older */
-                history_up();
-            } else if (key == 0x50) {  /* Down arrow — history newer */
-                history_down();
-            } else if (key == 0x4B) {  /* Left arrow — cursor left */
-                if (g_terminal.input_pos > 0)
-                    g_terminal.input_pos--;
-            } else if (key == 0x4D) {  /* Right arrow — cursor right */
-                if (g_terminal.input_pos < (int)strlen(g_terminal.input_line))
-                    g_terminal.input_pos++;
-            } else if ((mods & KMOD_CTRL) && (key == 0x26 || key == 0x26)) {
-                /* Ctrl+L — clear */
-                terminal_app_clear();
-            } else {
-                /* Use the full scancode→ASCII table for all other keys */
-                char ch = input_scancode_to_char(key, mods);
-                if (ch && g_terminal.input_pos < (int)sizeof(g_terminal.input_line) - 1) {
-                    g_terminal.input_line[g_terminal.input_pos++] = ch;
-                    g_terminal.input_line[g_terminal.input_pos] = '\0';
-                }
-            }
-        }
-        break;
+    uint32_t key = event->data.keyboard.key;
+    int mods = event->data.keyboard.mods;
 
-    default:
-        break;
+    if (key == WM_KEY_ENTER) {
+        char cmd[sizeof(g_terminal.input)];
+        memcpy(cmd, g_terminal.input, sizeof(cmd));
+
+        /* Echo the command line into the scrollback, then run it. */
+        if (term_line(g_terminal.count - 1)[0] != 0)
+            term_newline();
+        terminal_app_write(TERM_PROMPT);
+        terminal_app_write(cmd);
+        terminal_app_write("\n");
+
+        g_terminal.input[0] = 0;
+        g_terminal.input_len = 0;
+        g_terminal.history_pos = -1;
+        terminal_app_execute_command(cmd);
+    } else if (key == WM_KEY_BACKSPACE) {
+        if (g_terminal.input_len > 0)
+            g_terminal.input[--g_terminal.input_len] = 0;
+    } else if (key == WM_KEY_UP) {
+        history_load(g_terminal.history_pos + 1);
+    } else if (key == WM_KEY_DOWN) {
+        history_load(g_terminal.history_pos - 1);
+    } else if (key == WM_KEY_ESC) {
+        history_load(-1);
+    } else if ((mods & KMOD_CTRL) && (key == 'l' || key == 'L')) {
+        terminal_app_clear();
     }
 }
 
-/* ---- Public API ------------------------------------------------------------ */
+/* ---- Public API ---------------------------------------------------------- */
 wm_window_t *terminal_app_open(int x, int y, int w, int h)
 {
     memset(&g_terminal, 0, sizeof(g_terminal));
     terminal_app_clear();
     g_terminal.history_pos = -1;
 
-    wm_window_t *win = wm_create_window(
-        "Terminal",
-        x, y, w, h,
-        WS_DEFAULT,
-        terminal_app_draw_callback,
-        terminal_app_event_callback
-    );
+    wm_window_t *win = wm_create_window("Terminal", x, y, w, h, WS_DEFAULT,
+                                        terminal_app_draw_callback,
+                                        terminal_app_event_callback);
+    if (!win) return NULL;
 
+    win->icon = ICON_TERMINAL;
     g_terminal.window = win;
-    g_terminal.bg_color = 0x00000000;
-    g_terminal.fg_color = 0x00FFFFFF;
 
-    terminal_app_write("JARVIS Terminal v1.0\n");
-    terminal_app_write("Type 'help' for available commands\n\n");
-
+    terminal_app_write("JARVIS OS Terminal\n");
+    terminal_app_write("Type 'help' for a list of commands.\n");
     return win;
 }

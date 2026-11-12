@@ -1,259 +1,230 @@
 /*
  * =============================================================================
- * JARVIS OS — Notifications System (desktop/notifications.c)
+ * JARVIS OS — Notifications (desktop/notifications.c)
  * Language: C17
  *
- * Toast notifications and notification center with priority levels.
+ * Toasts slide in at the bottom-right above the taskbar and expire on their
+ * own; every notification is also kept in the notification centre (opened
+ * from the bell / clock in the system tray) until cleared.
  * =============================================================================
  */
 
 #include "../kernel/kernel.h"
-#include "../drivers/gpu.h"
+#include "ui.h"
 #include <string.h>
 #include <stdio.h>
 
-#define MAX_NOTIFICATIONS 32
-#define NOTIFICATION_TIMEOUT_MS 5000
-#define TOAST_WIDTH 400
-#define TOAST_HEIGHT 100
-
-typedef enum {
-    NOTIF_INFO = 0,
-    NOTIF_WARNING = 1,
-    NOTIF_CRITICAL = 2,
-} notification_priority_t;
+#define MAX_NOTIFICATIONS 24
+#define TOAST_W   340
+#define TOAST_H   76
+#define CENTER_W  360
 
 typedef struct {
     uint32_t id;
-    char title[64];
-    char body[256];
+    char title[48];
+    char body[160];
     notification_priority_t priority;
-    uint32_t created_time;
-    uint32_t timeout_ms;
-    int active;
-    int dismissed;
+    uint64_t created_tick;
+    uint64_t toast_until_tick;      /* 0 once the toast has gone */
+    int unread;
 } notification_t;
 
-typedef struct {
-    notification_t notifications[MAX_NOTIFICATIONS];
-    uint32_t next_id;
-    int notification_count;
-    int center_visible;
-    int scroll_offset;
-} notification_context_t;
-
-static notification_context_t g_notif_ctx = {};
+static notification_t g_notifs[MAX_NOTIFICATIONS];   /* oldest first */
+static int g_notif_count = 0;
+static uint32_t g_notif_next_id = 1;
+static int g_center_visible = 0;
 
 void notifications_init(void)
 {
-    memset(&g_notif_ctx, 0, sizeof(g_notif_ctx));
-    g_notif_ctx.next_id = 1;
+    memset(g_notifs, 0, sizeof(g_notifs));
+    g_notif_count = 0;
+    g_notif_next_id = 1;
+    g_center_visible = 0;
+}
+
+static uint32_t priority_color(notification_priority_t p)
+{
+    switch (p) {
+    case NOTIF_WARNING:  return T(WARN);
+    case NOTIF_CRITICAL: return T(DANGER);
+    default:             return T(ACCENT);
+    }
 }
 
 uint32_t notification_show(const char *title, const char *body,
                            notification_priority_t priority, uint32_t timeout_ms)
 {
-    if (g_notif_ctx.notification_count >= MAX_NOTIFICATIONS)
-        return 0;
+    if (g_notif_count >= MAX_NOTIFICATIONS) {       /* drop the oldest */
+        memmove(&g_notifs[0], &g_notifs[1],
+                sizeof(notification_t) * (MAX_NOTIFICATIONS - 1));
+        g_notif_count = MAX_NOTIFICATIONS - 1;
+    }
 
-    notification_t *notif = &g_notif_ctx.notifications[g_notif_ctx.notification_count];
-    notif->id = g_notif_ctx.next_id++;
-    notif->priority = priority;
-    notif->created_time = g_kstate.uptime_ticks / 100;  /* Convert to seconds */
-    notif->timeout_ms = timeout_ms;
-    notif->active = 1;
-    notif->dismissed = 0;
+    notification_t *n = &g_notifs[g_notif_count++];
+    memset(n, 0, sizeof(*n));
+    n->id = g_notif_next_id++;
+    n->priority = priority;
+    n->created_tick = g_kstate.uptime_ticks;
+    n->toast_until_tick = n->created_tick + (timeout_ms ? timeout_ms : 4000) / 10;
+    n->unread = !g_center_visible;
+    strncpy(n->title, title ? title : "", sizeof(n->title) - 1);
+    strncpy(n->body, body ? body : "", sizeof(n->body) - 1);
 
-    strncpy(notif->title, title, sizeof(notif->title) - 1);
-    strncpy(notif->body, body, sizeof(notif->body) - 1);
-
-    g_notif_ctx.notification_count++;
-    return notif->id;
+    desktop_invalidate();
+    return n->id;
 }
 
-void notification_dismiss(uint32_t id)
+/* Expire toasts. Returns 1 if anything changed on screen. */
+int notifications_tick(void)
 {
-    for (int i = 0; i < g_notif_ctx.notification_count; i++) {
-        if (g_notif_ctx.notifications[i].id == id) {
-            g_notif_ctx.notifications[i].dismissed = 1;
-            break;
+    int changed = 0;
+    for (int i = 0; i < g_notif_count; i++) {
+        if (g_notifs[i].toast_until_tick &&
+            g_kstate.uptime_ticks >= g_notifs[i].toast_until_tick) {
+            g_notifs[i].toast_until_tick = 0;
+            changed = 1;
         }
+    }
+    return changed;
+}
+
+static void draw_toasts(void)
+{
+    int W = (int)fb_get_width();
+    int x = W - TOAST_W - 12;
+    int y = (int)fb_get_height() - TASKBAR_H - 12 - TOAST_H;
+    int shown = 0;
+
+    /* newest at the bottom, up to three */
+    for (int i = g_notif_count - 1; i >= 0 && shown < 3; i--) {
+        notification_t *n = &g_notifs[i];
+        if (!n->toast_until_tick) continue;
+
+        uint32_t col = priority_color(n->priority);
+        fb_blend_rounded_rect(x + 2, y + 4, TOAST_W, TOAST_H, 8, 0x00000000, 70);
+        fb_fill_rounded_rect(x, y, TOAST_W, TOAST_H, 8, T(BORDER));
+        fb_fill_rounded_rect(x + 1, y + 1, TOAST_W - 2, TOAST_H - 2, 7, T(MENU));
+        fb_fill_rounded_rect(x + 10, y + 14, 4, TOAST_H - 28, 2, col);
+
+        fb_draw_text_bold(x + 24, y + 14, n->title, T(TEXT));
+        ui_text_fit(x + 24, y + 38, TOAST_W - 36, n->body, T(TEXT_DIM));
+
+        y -= TOAST_H + 8;
+        shown++;
     }
 }
 
-void notifications_update(void)
+static void center_rect(int *x, int *y, int *w, int *h)
 {
-    uint32_t now = g_kstate.uptime_ticks / 100;
-
-    /* Remove expired notifications */
-    for (int i = 0; i < g_notif_ctx.notification_count; i++) {
-        notification_t *notif = &g_notif_ctx.notifications[i];
-        uint32_t age = (now - notif->created_time) * 1000;  /* ms */
-
-        if (age > notif->timeout_ms || notif->dismissed) {
-            /* Remove by shifting */
-            for (int j = i; j < g_notif_ctx.notification_count - 1; j++) {
-                g_notif_ctx.notifications[j] = g_notif_ctx.notifications[j + 1];
-            }
-            g_notif_ctx.notification_count--;
-            i--;
-        }
-    }
+    *w = CENTER_W;
+    *x = (int)fb_get_width() - CENTER_W - 12;
+    *y = 12;
+    *h = (int)fb_get_height() - TASKBAR_H - 24;
 }
 
-void notifications_draw_toasts(void)
+static void draw_center(void)
 {
-    uint32_t W = fb_get_width();
-    int x = W - TOAST_WIDTH - 20;
-    int y = 80;
+    int x, y, w, h;
+    center_rect(&x, &y, &w, &h);
 
-    /* Draw up to 3 toasts (top-right corner) */
-    int toast_count = 0;
-    for (int i = 0; i < g_notif_ctx.notification_count && toast_count < 3; i++) {
-        notification_t *notif = &g_notif_ctx.notifications[i];
-        if (notif->dismissed) continue;
+    fb_blend_rounded_rect(x + 2, y + 4, w, h, 8, 0x00000000, 70);
+    fb_fill_rounded_rect(x, y, w, h, 8, T(BORDER));
+    fb_fill_rounded_rect(x + 1, y + 1, w - 2, h - 2, 7, T(MENU));
 
-        /* Toast background color based on priority */
-        uint32_t bg_color;
-        uint32_t border_color;
-        switch (notif->priority) {
-        case NOTIF_INFO:
-            bg_color = 0x00284E8C;      /* Blue */
-            border_color = 0x005BA3D6;
-            break;
-        case NOTIF_WARNING:
-            bg_color = 0x008B6B00;      /* Orange */
-            border_color = 0x00FFB703;
-            break;
-        case NOTIF_CRITICAL:
-            bg_color = 0x008B0000;      /* Red */
-            border_color = 0x00FF3B5C;
-            break;
-        default:
-            bg_color = 0x003A3A3A;
-            border_color = 0x00FFFFFF;
-        }
+    /* Clock header */
+    char clock[8], date[32];
+    sys_format_clock(clock, sizeof(clock));
+    sys_format_date(date, sizeof(date));
+    fb_draw_text_scaled(x + 20, y + 18, clock, T(TEXT), 2);
+    fb_draw_text(x + 20, y + 54, date, T(TEXT_DIM));
+    fb_fill_rect(x + 16, y + 82, w - 32, 1, T(BORDER));
 
-        /* Draw toast */
-        fb_fill_rect(x, y, TOAST_WIDTH, TOAST_HEIGHT, bg_color);
-        fb_fill_rect(x, y, 4, TOAST_HEIGHT, border_color);
+    fb_draw_text_bold(x + 20, y + 94, "Notifications", T(TEXT));
+    if (g_notif_count > 0)
+        ui_button(x + w - 100, y + 88, 84, 26, "Clear all", T(HOVER), T(TEXT));
 
-        /* Draw title and body */
-        fb_put_string(x + 12, y + 8, notif->title, border_color, bg_color);
-        fb_put_string(x + 12, y + 28, notif->body, 0x00FFFFFF, bg_color);
+    fb_clip_t saved = fb_get_clip();
+    fb_set_clip(x + 1, y + 122, w - 2, h - 130);
 
-        /* Progress bar (time remaining) */
-        uint32_t now = g_kstate.uptime_ticks / 100;
-        uint32_t age_ms = (now - notif->created_time) * 1000;
-        int progress = (age_ms * TOAST_WIDTH) / notif->timeout_ms;
-        if (progress > TOAST_WIDTH) progress = TOAST_WIDTH;
+    if (g_notif_count == 0)
+        ui_text_center(x, y + 160, w, "No new notifications", T(TEXT_DIM));
 
-        fb_fill_rect(x, y + TOAST_HEIGHT - 4, progress, 4, border_color);
+    int cy = y + 124;
+    for (int i = g_notif_count - 1; i >= 0 && cy < y + h - 8; i--) {
+        notification_t *n = &g_notifs[i];
+        ui_card(x + 12, cy, w - 24, 66);
+        fb_fill_rounded_rect(x + 20, cy + 12, 4, 42, 2, priority_color(n->priority));
+        fb_draw_text_bold(x + 34, cy + 8, n->title, T(TEXT));
+        ui_text_fit(x + 34, cy + 28, w - 60, n->body, T(TEXT_DIM));
 
-        y += TOAST_HEIGHT + 12;
-        toast_count++;
+        char age[24];
+        uint32_t secs = (uint32_t)((g_kstate.uptime_ticks - n->created_tick) / 100);
+        if (secs < 60) snprintf(age, sizeof(age), "just now");
+        else           snprintf(age, sizeof(age), "%u min ago", secs / 60);
+        fb_draw_text(x + 34, cy + 46, age, T(TEXT_DIM));
+        cy += 72;
     }
-}
-
-void notifications_draw_center(void)
-{
-    if (!g_notif_ctx.center_visible)
-        return;
-
-    uint32_t W = fb_get_width();
-    uint32_t H = fb_get_height();
-
-    int x = W - 420;
-    int y = 60;
-    int w = 400;
-    int h = H - 140;
-
-    /* Notification center panel */
-    fb_fill_rect(x, y, w, h, 0x001F1F1F);
-    fb_fill_rect(x, y, 1, h, 0x005BA3D6);
-
-    /* Title */
-    fb_put_string(x + 12, y + 8, "Notifications", 0x00E0E0E0, 0x001F1F1F);
-
-    /* Clear all button */
-    fb_fill_rect(x + w - 120, y + 6, 110, 24, 0x005BA3D6);
-    fb_put_string(x + w - 110, y + 10, "Clear All", 0x00FFFFFF, 0x005BA3D6);
-
-    /* Separator */
-    fb_fill_rect(x + 12, y + 40, w - 24, 1, 0x003A3A3A);
-
-    /* Notification list */
-    int list_y = y + 50;
-    for (int i = g_notif_ctx.scroll_offset;
-         i < g_notif_ctx.notification_count && list_y < y + h - 40;
-         i++) {
-        notification_t *notif = &g_notif_ctx.notifications[i];
-
-        /* Priority indicator color */
-        uint32_t priority_color;
-        switch (notif->priority) {
-        case NOTIF_INFO:
-            priority_color = 0x005BA3D6;
-            break;
-        case NOTIF_WARNING:
-            priority_color = 0x00FFB703;
-            break;
-        case NOTIF_CRITICAL:
-            priority_color = 0x00FF3B5C;
-            break;
-        default:
-            priority_color = 0x00808080;
-        }
-
-        /* Notification item */
-        fb_fill_rect(x + 8, list_y, w - 16, 70, 0x002D2D2D);
-        fb_fill_rect(x + 8, list_y, 3, 70, priority_color);
-
-        /* Title and body */
-        fb_put_string(x + 16, list_y + 4, notif->title, priority_color, 0x002D2D2D);
-        fb_put_string(x + 16, list_y + 22, notif->body, 0x00A0A0A0, 0x002D2D2D);
-
-        /* Time ago */
-        char time_str[32];
-        uint32_t age_sec = g_kstate.uptime_ticks / 100 - notif->created_time;
-        if (age_sec < 60)
-            snprintf(time_str, sizeof(time_str), "%u sec ago", age_sec);
-        else
-            snprintf(time_str, sizeof(time_str), "%u min ago", age_sec / 60);
-        fb_put_string(x + 16, list_y + 50, time_str, 0x00808080, 0x002D2D2D);
-
-        list_y += 78;
-    }
+    fb_restore_clip(saved);
 }
 
 void notifications_draw(void)
 {
-    notifications_update();
-    notifications_draw_toasts();
-    notifications_draw_center();
+    if (g_center_visible)
+        draw_center();
+    else
+        draw_toasts();
 }
 
 void notifications_toggle_center(void)
 {
-    g_notif_ctx.center_visible = !g_notif_ctx.center_visible;
+    g_center_visible = !g_center_visible;
+    if (g_center_visible) {
+        for (int i = 0; i < g_notif_count; i++) {
+            g_notifs[i].unread = 0;
+            g_notifs[i].toast_until_tick = 0;
+        }
+    }
+    desktop_invalidate();
+}
+
+void notifications_close_center(void)
+{
+    if (g_center_visible) {
+        g_center_visible = 0;
+        desktop_invalidate();
+    }
 }
 
 int notifications_center_is_visible(void)
 {
-    return g_notif_ctx.center_visible;
+    return g_center_visible;
+}
+
+/* Click while the centre is open. Returns 1 if the click landed inside it. */
+int notifications_click(int px, int py)
+{
+    if (!g_center_visible) return 0;
+
+    int x, y, w, h;
+    center_rect(&x, &y, &w, &h);
+    if (!ui_hit(px, py, x, y, w, h)) return 0;
+
+    if (g_notif_count > 0 && ui_hit(px, py, x + w - 100, y + 88, 84, 26)) {
+        g_notif_count = 0;
+        desktop_invalidate();
+    }
+    return 1;
 }
 
 int notifications_get_count(void)
 {
-    return g_notif_ctx.notification_count;
+    return g_notif_count;
 }
 
 int notifications_get_unread_count(void)
 {
-    int count = 0;
-    for (int i = 0; i < g_notif_ctx.notification_count; i++) {
-        if (!g_notif_ctx.notifications[i].dismissed)
-            count++;
-    }
-    return count;
+    int n = 0;
+    for (int i = 0; i < g_notif_count; i++)
+        if (g_notifs[i].unread) n++;
+    return n;
 }

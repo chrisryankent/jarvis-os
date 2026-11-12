@@ -1,19 +1,23 @@
 /*
  * =============================================================================
- * JARVIS OS - Framebuffer UI Shell
+ * JARVIS OS — UI shell state + full-screen screens (desktop/ui_shell.c)
  *
- * Boot/setup/lock overlays plus the live desktop HUD used by the kernel, speech,
- * AI, and input layers. This stays deliberately small and framebuffer-native so
- * the OS still runs before there is a userspace graphics stack.
+ * Holds the assistant state the rest of the kernel reports into (status,
+ * transcript lines, mic level, security label) and draws the screens that
+ * replace the desktop: boot/loading, first-run setup and the lock screen.
+ *
+ * Once the desktop is up this file draws nothing itself: it just records the
+ * new state and asks the desktop for a redraw. (It used to paint its panels
+ * straight onto the screen from wherever it was called, on top of windows.)
  * =============================================================================
  */
 
 #include "../kernel/kernel.h"
-#include "../drivers/gpu.h"
+#include "ui.h"
 #include <string.h>
 #include <stdio.h>
 
-#define UI_MAX_LINES 8
+#define UI_MAX_LINES 64
 #define UI_LINE_LEN  128
 
 typedef enum {
@@ -35,7 +39,10 @@ typedef struct {
     char setup_title[64];
     char setup_detail[128];
     char lines[UI_MAX_LINES][UI_LINE_LEN];
-    int line_count;
+    int line_count;                 /* total ever added */
+    char pin_entry[16];
+    int pin_len;
+    int pin_wrong;
 } ui_shell_state_t;
 
 static ui_shell_state_t g_ui = {
@@ -63,168 +70,6 @@ static void ui_copy(char *dst, size_t dst_len, const char *src)
     dst[dst_len - 1] = '\0';
 }
 
-static void ui_draw_panel(int x, int y, int w, int h, uint32_t fill, uint32_t edge)
-{
-    fb_fill_rounded_rect(x + 4, y + 6, w, h, 8, 0x00000000);
-    fb_fill_rounded_rect(x, y, w, h, 8, fill);
-    fb_fill_rect(x + 8, y, w - 16, 1, edge);
-    fb_fill_rect(x + 8, y + h - 1, w - 16, 1, 0x0018242B);
-}
-
-static void ui_draw_bar(int x, int y, int w, int h, int percent,
-                        uint32_t track, uint32_t fill)
-{
-    int filled = (w * ui_clamp(percent, 0, 100)) / 100;
-    fb_fill_rounded_rect(x, y, w, h, h / 2, track);
-    if (filled > 0)
-        fb_fill_rounded_rect(x, y, filled, h, h / 2, fill);
-}
-
-static void ui_draw_cursor(void)
-{
-    int x = g_ui.cursor_x;
-    int y = g_ui.cursor_y;
-
-    fb_fill_rect(x, y, 2, 20, 0x00FFFFFF);
-    fb_fill_rect(x + 2, y + 2, 2, 18, 0x00FFFFFF);
-    fb_fill_rect(x + 4, y + 4, 2, 16, 0x00FFFFFF);
-    fb_fill_rect(x + 6, y + 6, 2, 14, 0x00FFFFFF);
-    fb_fill_rect(x + 8, y + 10, 8, 2, 0x00FFFFFF);
-    fb_fill_rect(x + 10, y + 12, 2, 8, 0x00FFFFFF);
-    fb_fill_rect(x + 12, y + 18, 6, 2, 0x00FFFFFF);
-    fb_fill_rect(x + 2, y + 20, 8, 2, 0x000E1116);
-}
-
-static void ui_draw_full_background(uint32_t top, uint32_t bottom)
-{
-    uint32_t W = fb_get_width();
-    uint32_t H = fb_get_height();
-
-    if (W == 0 || H == 0)
-        return;
-
-    for (uint32_t y = 0; y < H; y++) {
-        uint32_t t = (y * 255) / H;
-        uint32_t r = ((((top >> 16) & 0xFF) * (255 - t)) +
-                      (((bottom >> 16) & 0xFF) * t)) / 255;
-        uint32_t g = ((((top >> 8) & 0xFF) * (255 - t)) +
-                      (((bottom >> 8) & 0xFF) * t)) / 255;
-        uint32_t b = (((top & 0xFF) * (255 - t)) +
-                      ((bottom & 0xFF) * t)) / 255;
-        fb_fill_rect(0, (int)y, (int)W, 1, (r << 16) | (g << 8) | b);
-    }
-
-    for (uint32_t i = 0; i < W; i += 48) {
-        uint32_t shade = 0x00162226 + ((i / 48) % 4) * 0x00030503;
-        fb_blend_rect((int)i, 0, 2, (int)H, shade, 70);
-    }
-}
-
-static void ui_draw_loading(void)
-{
-    uint32_t W = fb_get_width();
-    uint32_t H = fb_get_height();
-    int panel_w = 540;
-    int panel_h = 210;
-    int x = ((int)W - panel_w) / 2;
-    int y = ((int)H - panel_h) / 2;
-    int progress = 18 + (int)((g_kstate.uptime_ticks / 4) % 76);
-
-    ui_draw_full_background(0x00070D10, 0x001A2930);
-    ui_draw_panel(x, y, panel_w, panel_h, 0x0010171B, 0x0046D3C6);
-
-    fb_put_string(x + 28, y + 28, "JARVIS OS", 0x00FFFFFF, 0x0010171B);
-    fb_put_string(x + 28, y + 54, "Native framebuffer desktop is starting",
-                  0x009CB6B4, 0x0010171B);
-    fb_put_string(x + 28, y + 92, "Kernel  Memory  Devices  Desktop",
-                  0x006CE5D2, 0x0010171B);
-    ui_draw_bar(x + 28, y + 128, panel_w - 56, 12, progress,
-                0x00203238, 0x0046D3C6);
-    fb_put_string(x + 28, y + 158, g_ui.status, 0x00FFFFFF, 0x0010171B);
-}
-
-static void ui_draw_setup(void)
-{
-    uint32_t W = fb_get_width();
-    uint32_t H = fb_get_height();
-    int panel_w = 620;
-    int panel_h = 260;
-    int x = ((int)W - panel_w) / 2;
-    int y = ((int)H - panel_h) / 2;
-
-    ui_draw_full_background(0x000A1114, 0x001D3034);
-    ui_draw_panel(x, y, panel_w, panel_h, 0x0011191E, 0x0046D3C6);
-    fb_put_string(x + 28, y + 26, "Welcome to JARVIS OS",
-                  0x00FFFFFF, 0x0011191E);
-    fb_put_string(x + 28, y + 62, g_ui.setup_title,
-                  0x0046D3C6, 0x0011191E);
-    fb_put_string(x + 28, y + 92, g_ui.setup_detail,
-                  0x00B7C8C4, 0x0011191E);
-    ui_draw_bar(x + 28, y + 150, panel_w - 56, 10, 74,
-                0x0026343A, 0x00F2C14E);
-    fb_put_string(x + 28, y + 184, "Profile ready  Security optional  Voice hooks armed",
-                  0x009CB6B4, 0x0011191E);
-}
-
-static void ui_draw_lock(void)
-{
-    uint32_t W = fb_get_width();
-    uint32_t H = fb_get_height();
-    int panel_w = 460;
-    int panel_h = 230;
-    int x = ((int)W - panel_w) / 2;
-    int y = ((int)H - panel_h) / 2;
-
-    ui_draw_full_background(0x00080C10, 0x00202A3A);
-    ui_draw_panel(x, y, panel_w, panel_h, 0x0010151C, 0x00F25F5C);
-    fb_put_string(x + 28, y + 30, "Session Locked", 0x00FFFFFF, 0x0010151C);
-    fb_put_string(x + 28, y + 66, "Voice verification is waiting.",
-                  0x00B7C8C4, 0x0010151C);
-    ui_draw_bar(x + 28, y + 116, panel_w - 56, 10, g_ui.mic_level,
-                0x0026343A, 0x00F25F5C);
-    fb_put_string(x + 28, y + 154, "Microphone level", 0x009CB6B4, 0x0010151C);
-}
-
-static void ui_draw_desktop_overlay(void)
-{
-    uint32_t W = fb_get_width();
-    uint32_t H = fb_get_height();
-    int right_w = 318;
-    int x = (int)W - right_w - 18;
-    int y = 18;
-
-    if (W < 640 || H < 480)
-        return;
-
-    ui_draw_panel(x, y, right_w, 118, 0x0010191D, 0x0046D3C6);
-    fb_put_string(x + 18, y + 14, "JARVIS", 0x00FFFFFF, 0x0010191D);
-    fb_put_string(x + 18, y + 36, g_ui.status, 0x0046D3C6, 0x0010191D);
-
-    fb_put_string(x + 18, y + 66, "SEC", 0x009CB6B4, 0x0010191D);
-    fb_put_string(x + 52, y + 66, g_ui.security_label,
-                  g_ui.security_alert ? 0x00F25F5C : 0x006BE585, 0x0010191D);
-    fb_put_string(x + 142, y + 66, "MIC", 0x009CB6B4, 0x0010191D);
-    ui_draw_bar(x + 176, y + 70, 108, 8, g_ui.mic_level,
-                0x0026343A, 0x0046D3C6);
-
-    int deck_h = 132;
-    int deck_y = (int)H - 64 - deck_h - 14;
-    ui_draw_panel(18, deck_y, right_w + 150, deck_h, 0x0010191D, 0x002F454A);
-    fb_put_string(36, deck_y + 14, "AI Console", 0x00FFFFFF, 0x0010191D);
-
-    int first = g_ui.line_count > UI_MAX_LINES ? g_ui.line_count - UI_MAX_LINES : 0;
-    int draw_y = deck_y + 40;
-    for (int i = first; i < g_ui.line_count; i++) {
-        const char *line = g_ui.lines[i % UI_MAX_LINES];
-        fb_put_string(36, draw_y, line, 0x00B7C8C4, 0x0010191D);
-        draw_y += 16;
-        if (draw_y > deck_y + deck_h - 18)
-            break;
-    }
-
-    ui_draw_cursor();
-}
-
 static void ui_shell_ensure_init(void)
 {
     if (g_ui.initialized)
@@ -239,6 +84,101 @@ static void ui_shell_ensure_init(void)
     g_ui.initialized = 1;
 }
 
+/* ---- Full-screen screens ------------------------------------------------- */
+static void draw_backdrop(void)
+{
+    fb_reset_clip();
+    fb_gradient_v(0, 0, (int)fb_get_width(), (int)fb_get_height(),
+                  T(WALL_TOP), T(WALL_BOTTOM));
+}
+
+static void draw_loading(void)
+{
+    int W = (int)fb_get_width(), H = (int)fb_get_height();
+    int cx = W / 2, cy = H / 2;
+
+    draw_backdrop();
+    icon_draw(ICON_JARVIS, cx - 48, cy - 130, 96);
+    fb_draw_text_scaled(cx - fb_text_width("JARVIS OS"), cy - 10, "JARVIS OS", 0x00FFFFFF, 2);
+
+    int progress = 15 + (g_ui.line_count * 12) % 80;
+    ui_progress(cx - 120, cy + 50, 240, 6, progress, 0x00203040, T(ACCENT));
+    ui_text_center(0, cy + 72, W, g_ui.status, 0x00C0D0E0);
+}
+
+static void draw_setup(void)
+{
+    int W = (int)fb_get_width(), H = (int)fb_get_height();
+    int pw = 520, ph = 220;
+    int x = (W - pw) / 2, y = (H - ph) / 2;
+
+    draw_backdrop();
+    fb_blend_rounded_rect(x + 2, y + 6, pw, ph, 10, 0x00000000, 80);
+    fb_fill_rounded_rect(x, y, pw, ph, 10, T(MENU));
+    icon_draw(ICON_JARVIS, x + 28, y + 28, 40);
+    fb_draw_text_scaled(x + 84, y + 30, "Welcome", T(TEXT), 2);
+    fb_draw_text_bold(x + 28, y + 96, g_ui.setup_title, T(ACCENT));
+    ui_text_fit(x + 28, y + 122, pw - 56, g_ui.setup_detail, T(TEXT_DIM));
+    ui_progress(x + 28, y + 170, pw - 56, 6, 75, T(HOVER), T(ACCENT));
+}
+
+static void draw_lock(void)
+{
+    int W = (int)fb_get_width(), H = (int)fb_get_height();
+    char clock[8], date[32];
+
+    draw_backdrop();
+    sys_format_clock(clock, sizeof(clock));
+    sys_format_date(date, sizeof(date));
+
+    fb_draw_text_scaled((W - fb_text_width(clock) * 6) / 2, H / 4, clock, 0x00FFFFFF, 6);
+    fb_draw_text_scaled((W - fb_text_width(date) * 2) / 2, H / 4 + 110, date, 0x00FFFFFF, 2);
+
+    int by = H - 200;
+    fb_fill_circle(W / 2, by, 28, T(ACCENT));
+    glyph_draw(GLYPH_USER, W / 2 - 14, by - 15, 28, T(ACCENT_TEXT), T(ACCENT));
+    ui_text_center(0, by + 40, W,
+                   g_kstate.username[0] ? g_kstate.username : "User", 0x00FFFFFF);
+
+    if (g_kstate.security_enabled && g_kstate.security_pin[0]) {
+        char dots[17];
+        int n = g_ui.pin_len;
+        for (int i = 0; i < n; i++) dots[i] = '*';
+        dots[n] = 0;
+        fb_fill_rounded_rect(W / 2 - 110, by + 66, 220, 34, 6, 0x00101820);
+        ui_text_center(0, by + 75, W, n ? dots : "Enter PIN", n ? 0x00FFFFFF : 0x008090A0);
+        if (g_ui.pin_wrong)
+            ui_text_center(0, by + 108, W, "Incorrect PIN", T(DANGER));
+    } else {
+        ui_text_center(0, by + 70, W, "Press any key or click to unlock", 0x00C0D0E0);
+    }
+}
+
+void ui_shell_render_fullscreen(void)
+{
+    if (!fb_get_base())
+        return;
+    ui_shell_ensure_init();
+
+    switch (g_ui.mode) {
+    case UI_MODE_LOADING: draw_loading(); break;
+    case UI_MODE_SETUP:   draw_setup();   break;
+    case UI_MODE_LOCK:    draw_lock();    break;
+    default: return;
+    }
+    fb_present();
+}
+
+/* Called whenever shell state changes. */
+void ui_shell_draw_frame(void)
+{
+    if (g_ui.mode == UI_MODE_DESKTOP)
+        desktop_invalidate();
+    else
+        ui_shell_render_fullscreen();
+}
+
+/* ---- State reported by the rest of the kernel ---------------------------- */
 void ui_shell_init(void)
 {
     memset(&g_ui, 0, sizeof(g_ui));
@@ -248,37 +188,8 @@ void ui_shell_init(void)
     ui_shell_ensure_init();
 }
 
-void ui_shell_draw_frame(void)
-{
-    if (!fb_get_base())
-        return;
-
-    ui_shell_ensure_init();
-
-    switch (g_ui.mode) {
-    case UI_MODE_LOADING:
-        ui_draw_loading();
-        break;
-    case UI_MODE_SETUP:
-        ui_draw_setup();
-        ui_draw_cursor();
-        break;
-    case UI_MODE_LOCK:
-        ui_draw_lock();
-        ui_draw_cursor();
-        break;
-    case UI_MODE_DESKTOP:
-    default:
-        ui_draw_desktop_overlay();
-        break;
-    }
-}
-
 void ui_shell_display(const char *text)
 {
-    if (!text)
-        text = "";
-
     ui_copy(g_ui.lines[g_ui.line_count % UI_MAX_LINES], UI_LINE_LEN, text);
     g_ui.line_count++;
     ui_shell_draw_frame();
@@ -288,7 +199,7 @@ void ui_shell_show_loading_desktop(void)
 {
     ui_shell_ensure_init();
     g_ui.mode = UI_MODE_LOADING;
-    ui_copy(g_ui.status, sizeof(g_ui.status), "LOADING DESKTOP");
+    ui_copy(g_ui.status, sizeof(g_ui.status), "Starting services");
     ui_shell_draw_frame();
 }
 
@@ -296,8 +207,10 @@ void ui_shell_show_lock_screen(void)
 {
     ui_shell_ensure_init();
     g_ui.mode = UI_MODE_LOCK;
+    g_ui.pin_len = 0;
+    g_ui.pin_wrong = 0;
     ui_copy(g_ui.status, sizeof(g_ui.status), "LOCKED");
-    ui_shell_draw_frame();
+    desktop_invalidate();
 }
 
 void ui_shell_show_setup_wizard(void)
@@ -316,7 +229,7 @@ void ui_shell_unlock_desktop(void)
     ui_shell_ensure_init();
     g_ui.mode = UI_MODE_DESKTOP;
     ui_copy(g_ui.status, sizeof(g_ui.status), "READY");
-    ui_shell_display("Desktop ready. Say or type help for commands.");
+    desktop_invalidate();
 }
 
 void ui_shell_set_setup_step(const char *title, const char *detail)
@@ -328,6 +241,8 @@ void ui_shell_set_setup_step(const char *title, const char *detail)
 
 void ui_shell_set_status(const char *status)
 {
+    if (strcmp(g_ui.status, status ? status : "") == 0)
+        return;
     ui_copy(g_ui.status, sizeof(g_ui.status), status);
     ui_shell_draw_frame();
 }
@@ -341,17 +256,78 @@ void ui_shell_set_security(const char *label, int alert)
 
 void ui_shell_set_mic_level(int level)
 {
-    g_ui.mic_level = ui_clamp(level, 0, 100);
-    ui_shell_draw_frame();
+    level = ui_clamp(level, 0, 100);
+    if (level == g_ui.mic_level)
+        return;
+    g_ui.mic_level = level;
+    if (g_ui.mode == UI_MODE_DESKTOP)
+        desktop_invalidate();
 }
 
 void ui_shell_add_transcript(const char *text)
 {
     char line[UI_LINE_LEN];
-    snprintf(line, sizeof(line), "Voice: %s", text ? text : "");
+    snprintf(line, sizeof(line), "You: %s", text ? text : "");
     ui_shell_display(line);
 }
 
+/* ---- Read-only accessors ------------------------------------------------- */
+int ui_shell_is_desktop(void)               { return g_ui.mode == UI_MODE_DESKTOP; }
+int ui_shell_is_locked(void)                { return g_ui.mode == UI_MODE_LOCK; }
+const char *ui_shell_get_status(void)       { return g_ui.status; }
+const char *ui_shell_get_security_label(void) { return g_ui.security_label; }
+int ui_shell_get_security_alert(void)       { return g_ui.security_alert; }
+int ui_shell_get_mic_level(void)            { return g_ui.mic_level; }
+
+int ui_shell_line_count(void)
+{
+    return g_ui.line_count < UI_MAX_LINES ? g_ui.line_count : UI_MAX_LINES;
+}
+
+const char *ui_shell_get_line(int index_from_oldest)
+{
+    int count = ui_shell_line_count();
+    if (index_from_oldest < 0 || index_from_oldest >= count)
+        return "";
+    int first = g_ui.line_count - count;
+    return g_ui.lines[(first + index_from_oldest) % UI_MAX_LINES];
+}
+
+/* ---- Lock screen input --------------------------------------------------- */
+/* Any key / click unlocks when no PIN is set; otherwise the PIN is typed and
+ * confirmed with Enter. key == 0 means "mouse click". */
+void ui_shell_lock_input(uint32_t key, char ch)
+{
+    if (g_ui.mode != UI_MODE_LOCK)
+        return;
+
+    if (!(g_kstate.security_enabled && g_kstate.security_pin[0])) {
+        ui_shell_unlock_desktop();
+        return;
+    }
+
+    if (ch >= 32 && ch < 127) {
+        if (g_ui.pin_len < (int)sizeof(g_ui.pin_entry) - 1) {
+            g_ui.pin_entry[g_ui.pin_len++] = ch;
+            g_ui.pin_entry[g_ui.pin_len] = 0;
+        }
+        g_ui.pin_wrong = 0;
+    } else if (key == 8) {                      /* Backspace */
+        if (g_ui.pin_len > 0)
+            g_ui.pin_entry[--g_ui.pin_len] = 0;
+    } else if (key == 10) {                     /* Enter */
+        if (strcmp(g_ui.pin_entry, g_kstate.security_pin) == 0) {
+            ui_shell_unlock_desktop();
+        } else {
+            g_ui.pin_wrong = 1;
+            g_ui.pin_len = 0;
+            g_ui.pin_entry[0] = 0;
+        }
+    }
+    desktop_invalidate();
+}
+
+/* ---- Mouse --------------------------------------------------------------- */
 void ui_shell_move_cursor(int dx, int dy)
 {
     uint32_t W = fb_get_width();
@@ -361,18 +337,27 @@ void ui_shell_move_cursor(int dx, int dy)
     if (W == 0 || H == 0)
         return;
 
-    g_ui.cursor_x = ui_clamp(g_ui.cursor_x + dx, 0, (int)W - 20);
-    g_ui.cursor_y = ui_clamp(g_ui.cursor_y + dy, 0, (int)H - 20);
+    g_ui.cursor_x = ui_clamp(g_ui.cursor_x + dx, 0, (int)W - 1);
+    g_ui.cursor_y = ui_clamp(g_ui.cursor_y + dy, 0, (int)H - 1);
 
     if (desktop_system_is_initialized())
         desktop_system_handle_mouse_move(g_ui.cursor_x, g_ui.cursor_y);
 }
 
-void ui_shell_click_cursor(void)
+void ui_shell_mouse_button(int button, int pressed)
 {
     if (!desktop_system_is_initialized())
         return;
 
-    desktop_system_handle_mouse_click(g_ui.cursor_x, g_ui.cursor_y, 1);
-    desktop_system_handle_mouse_release(g_ui.cursor_x, g_ui.cursor_y, 1);
+    if (pressed)
+        desktop_system_handle_mouse_click(g_ui.cursor_x, g_ui.cursor_y, button);
+    else
+        desktop_system_handle_mouse_release(g_ui.cursor_x, g_ui.cursor_y, button);
+}
+
+/* Used by the "click" voice command. */
+void ui_shell_click_cursor(void)
+{
+    ui_shell_mouse_button(1, 1);
+    ui_shell_mouse_button(1, 0);
 }

@@ -1,449 +1,516 @@
 /*
  * =============================================================================
- * JARVIS OS — Taskbar System (desktop/taskbar.c)
+ * JARVIS OS — Taskbar and Start menu (desktop/taskbar.c)
  * Language: C17
  *
- * Bottom panel with Start button, app launcher, pinned apps, system tray, clock.
+ * Taskbar: centred Start button, search and app icons (with running / focused
+ * indicators); system tray on the right with the JARVIS status chip, network
+ * and volume, clock and the notification bell.
+ *
+ * Start menu: search box (type to filter, Enter to launch or ask JARVIS),
+ * app grid, JARVIS status card, and lock / restart / shut down.
  * =============================================================================
  */
 
 #include "../kernel/kernel.h"
 #include "../wm/wm.h"
-#include "../drivers/gpu.h"
+#include "ui.h"
 #include <string.h>
 #include <stdio.h>
 
-/* Defined later in desktop_init.c (the outermost file in this unity
- * build); a plain forward declaration here is safe since no enum/typedef
- * is involved (unlike notification_priority_t — see desktop.c's history
- * with that one). */
-void desktop_system_open_app(const char *app);
+typedef struct { int x, y, w, h; } rect_t;
 
-#define TASKBAR_HEIGHT     64
-#define TASKBAR_Y          (fb_get_height() - TASKBAR_HEIGHT)
-#define START_BUTTON_W     90
-#define SEARCH_BOX_W       220
-#define ICON_SIZE          48
-#define ICON_SPACING       12
+static int rect_hit(const rect_t *r, int px, int py)
+{
+    return ui_hit(px, py, r->x, r->y, r->w, r->h);
+}
 
-/* Colors (BGRA) */
-#define COL_TASKBAR_BG     0x0010191D
-#define COL_TASKBAR_BORDER 0x002F454A
-#define COL_START_BG       0x0046D3C6
-#define COL_START_TEXT     0x00FFFFFF
-#define COL_ICON_BG        0x00282828
-#define COL_ICON_HOVER     0x003A3A3A
-#define COL_TEXT           0x00E0E0E0
-#define COL_DIM            0x00808080
+/* ==========================================================================
+ * TASKBAR
+ * ========================================================================== */
+#define TB_MAX_APPS 16
 
-typedef struct {
-    char label[64];
-    wm_window_t *window;
-    int icon_index;
-    int active;
-} taskbar_app_t;
+enum {
+    TBH_NONE = 0, TBH_START, TBH_SEARCH, TBH_CHIP, TBH_CLOCK, TBH_BELL,
+    TBH_SHOWDESK, TBH_APP0 = 100,
+};
 
-typedef struct {
-    taskbar_app_t apps[32];
+static struct {
+    rect_t start, search, apps[TB_MAX_APPS], chip, status, clock, bell, showdesk;
     int app_count;
-    int start_menu_open;
-} taskbar_context_t;
+    int wide_search;
+    int hover;
+} g_tb;
 
-static taskbar_context_t g_taskbar = {};
+static struct {
+    int open;
+    char query[40];
+    int qlen;
+    int hover;
+} g_start;
 
-/* Click-hit bounds, recomputed every draw call alongside the actual
- * drawing so taskbar_handle_click() can never drift from what's on
- * screen (the same class of bug fixed for titlebar buttons in wm.c). */
-static int g_tb_start_bounds[4];          /* x,y,w,h */
-static int g_tb_search_bounds[4];
-static int g_tb_pinned_bounds[8][4];
-static int g_tb_pinned_count = 0;
-static const char *g_tb_pinned_app_names[8];
-static int g_tb_window_bounds[32][4];
-static int g_tb_window_count = 0;
+static int taskbar_y(void)
+{
+    return (int)fb_get_height() - TASKBAR_H;
+}
+
+/* One layout function shared by drawing and hit-testing, so what you see is
+ * always exactly what you can click. */
+static void taskbar_layout(void)
+{
+    int W = (int)fb_get_width();
+    int y = taskbar_y();
+    int n = desktop_app_count();
+    if (n > TB_MAX_APPS) n = TB_MAX_APPS;
+
+    g_tb.app_count = n;
+    g_tb.wide_search = W >= 1200;
+    int search_w = g_tb.wide_search ? 200 : 44;
+    int total = 44 + 4 + search_w + 4 + n * 44;
+    int x = (W - total) / 2;
+
+    g_tb.start = (rect_t){ x, y + 4, 44, 40 };            x += 48;
+    g_tb.search = (rect_t){ x, y + 4, search_w, 40 };     x += search_w + 4;
+    for (int i = 0; i < n; i++, x += 44)
+        g_tb.apps[i] = (rect_t){ x, y + 4, 44, 40 };
+
+    int rx = W - 6;
+    g_tb.showdesk = (rect_t){ rx, y, 6, TASKBAR_H };
+    g_tb.bell   = (rect_t){ rx - 36, y + 4, 36, 40 };     rx -= 38;
+    g_tb.clock  = (rect_t){ rx - 96, y + 4, 96, 40 };     rx -= 98;
+    g_tb.status = (rect_t){ rx - 52, y + 4, 52, 40 };     rx -= 54;
+    g_tb.chip   = (rect_t){ rx - 92, y + 4, 92, 40 };
+}
+
+static int taskbar_hit(int x, int y)
+{
+    taskbar_layout();
+    if (rect_hit(&g_tb.start, x, y))    return TBH_START;
+    if (rect_hit(&g_tb.search, x, y))   return TBH_SEARCH;
+    for (int i = 0; i < g_tb.app_count; i++)
+        if (rect_hit(&g_tb.apps[i], x, y)) return TBH_APP0 + i;
+    if (rect_hit(&g_tb.chip, x, y))     return TBH_CHIP;
+    if (rect_hit(&g_tb.clock, x, y))    return TBH_CLOCK;
+    if (rect_hit(&g_tb.bell, x, y))     return TBH_BELL;
+    if (rect_hit(&g_tb.showdesk, x, y)) return TBH_SHOWDESK;
+    return TBH_NONE;
+}
 
 void taskbar_init(void)
 {
-    memset(&g_taskbar, 0, sizeof(g_taskbar));
+    memset(&g_tb, 0, sizeof(g_tb));
+    memset(&g_start, 0, sizeof(g_start));
+    g_start.hover = -1;
 }
 
-void taskbar_draw_start_button(void)
+int taskbar_hover(int x, int y)
 {
-    int y = TASKBAR_Y;
-    int x = 12;
-    int bw = START_BUTTON_W, bh = 48;
-
-    uint32_t bg = g_taskbar.start_menu_open ? 0x006BE585 : COL_START_BG;
-    fb_fill_rounded_rect(x, y + 8, bw, bh, 8, bg);
-
-    /* Windows-11-style four-coloured grid icon (2×2 blocks, 6px each) */
-    int gx = x + 10, gy = y + 18;
-    fb_fill_rect(gx,     gy,     6, 6, 0x00F35325); /* red    (top-left)     */
-    fb_fill_rect(gx + 8, gy,     6, 6, 0x0081BC06); /* green  (top-right)    */
-    fb_fill_rect(gx,     gy + 8, 6, 6, 0x05A6F0FF); /* blue   (bottom-left)  */
-    fb_fill_rect(gx + 8, gy + 8, 6, 6, 0x00FFBA08); /* yellow (bottom-right) */
-
-    fb_put_string(x + 28, y + 22, "Start", COL_START_TEXT, bg);
-
-    /* Record hit bounds */
-    g_tb_start_bounds[0] = x; g_tb_start_bounds[1] = y + 8;
-    g_tb_start_bounds[2] = bw; g_tb_start_bounds[3] = bh;
+    int h = taskbar_hit(x, y);
+    if (h == g_tb.hover) return 0;
+    g_tb.hover = h;
+    return 1;
 }
 
-void taskbar_draw_search_box(void)
+static void tb_hover_bg(const rect_t *r, int code)
 {
-    int y = TASKBAR_Y;
-    int x = START_BUTTON_W + 24;
-    int sw = SEARCH_BOX_W, sh = 48;
-
-    fb_fill_rounded_rect(x, y + 8, sw, sh, 8, COL_ICON_BG);
-    fb_fill_rect(x + 8, y + 8, sw - 16, 1, COL_TASKBAR_BORDER);
-
-    /* Magnifying glass icon (3×3 circle + 2px handle) */
-    fb_fill_rect(x + 8, y + 18, 10, 10, COL_ICON_BG);
-    fb_fill_rect(x + 9, y + 17, 8,  1, COL_DIM);
-    fb_fill_rect(x + 9, y + 28, 8,  1, COL_DIM);
-    fb_fill_rect(x + 8, y + 18, 1,  10, COL_DIM);
-    fb_fill_rect(x + 17,y + 18, 1,  10, COL_DIM);
-    fb_fill_rect(x + 17,y + 27, 4,  1, COL_DIM);
-    fb_fill_rect(x + 20,y + 27, 1,  4, COL_DIM);
-
-    const char *search_text = g_kstate.ai_ready ?
-        "Ask JARVIS" : "Loading AI";
-    fb_put_string(x + 26, y + 18, search_text, COL_DIM, COL_ICON_BG);
-
-    g_tb_search_bounds[0] = x; g_tb_search_bounds[1] = y + 8;
-    g_tb_search_bounds[2] = sw; g_tb_search_bounds[3] = sh;
-}
-
-void taskbar_draw_pinned_apps(void)
-{
-    uint32_t W = fb_get_width();
-    int y = TASKBAR_Y;
-
-    /* Windows 11 centres the pinned icons in the middle of the taskbar —
-     * calculate from screen centre, not from the left edge */
-    static const struct { const char *label; const char *app; uint32_t col; } pinned[] = {
-        { "Files",  "Files",      0x0000D9FF },
-        { "Term",   "Terminal",   0x0000E676 },
-        { "Web",    "Browser",    0x00BB86FC },
-        { "Guard",  "Security",   0x00FF6B6B },
-        { "AI",     "AI",         0x00FFB703 },
-    };
-    int n = 5;
-    int total_w = n * (ICON_SIZE + ICON_SPACING) - ICON_SPACING;
-    int start_x = ((int)W - total_w) / 2;
-    int x = start_x;
-
-    g_tb_pinned_count = 0;
-    for (int i = 0; i < n; i++) {
-        uint32_t bg = COL_ICON_BG;
-        /* Highlight if this app's window is the focused one */
-        wm_window_t *focused = g_wm_ctx.focused;
-        for (int k = 0; k < g_taskbar.app_count; k++) {
-            if (g_taskbar.apps[k].window == focused &&
-                strcmp(g_taskbar.apps[k].label, pinned[i].label) == 0) {
-                bg = COL_ICON_HOVER;
-                break;
-            }
-        }
-
-        fb_fill_rounded_rect(x, y + 8, ICON_SIZE, ICON_SIZE, 8, bg);
-        /* 2-px accent underline if running */
-        for (int k = 0; k < g_taskbar.app_count; k++) {
-            if (strcmp(g_taskbar.apps[k].label, pinned[i].label) == 0) {
-                fb_fill_rect(x + ICON_SIZE/2 - 8, y + ICON_SIZE + 7, 16, 2, 0x0046D3C6);
-                break;
-            }
-        }
-        fb_put_string(x + 4, y + 28, pinned[i].label, 0x00FFFFFF, bg);
-
-        if (g_tb_pinned_count < 8) {
-            g_tb_pinned_bounds[g_tb_pinned_count][0] = x;
-            g_tb_pinned_bounds[g_tb_pinned_count][1] = y + 8;
-            g_tb_pinned_bounds[g_tb_pinned_count][2] = ICON_SIZE;
-            g_tb_pinned_bounds[g_tb_pinned_count][3] = ICON_SIZE;
-            g_tb_pinned_app_names[g_tb_pinned_count] = pinned[i].app;
-            g_tb_pinned_count++;
-        }
-        x += ICON_SIZE + ICON_SPACING;
-    }
-
-    /* Open-window buttons (right of pinned, left of tray) — show running
-     * apps that are NOT in the pinned list so the user can click to
-     * bring them forward. Previously these were tracked (taskbar_add_window
-     * existed) but never drawn or click-tested, so the taskbar always
-     * appeared to show only pinned icons regardless of what was open. */
-    g_tb_window_count = 0;
-    int wx = x + 24;
-    for (int i = 0; i < g_taskbar.app_count && g_tb_window_count < 32; i++) {
-        if (wx + ICON_SIZE >= (int)W - 260) break;
-        int pinned_match = 0;
-        for (int k = 0; k < n; k++) {
-            if (strcmp(g_taskbar.apps[i].label, pinned[k].label) == 0) {
-                pinned_match = 1; break;
-            }
-        }
-        if (pinned_match) continue;
-
-        uint32_t bg = (g_taskbar.apps[i].window == g_wm_ctx.focused)
-                      ? COL_ICON_HOVER : COL_ICON_BG;
-        fb_fill_rounded_rect(wx, y + 8, ICON_SIZE, ICON_SIZE, 8, bg);
-        /* Truncate label to 4 chars to fit the icon */
-        char short_label[5]; short_label[4] = 0;
-        strncpy(short_label, g_taskbar.apps[i].label, 4);
-        fb_put_string(wx + 4, y + 28, short_label, COL_TEXT, bg);
-        if (g_taskbar.apps[i].window == g_wm_ctx.focused)
-            fb_fill_rect(wx + ICON_SIZE/2 - 8, y + ICON_SIZE + 7, 16, 2, 0x0046D3C6);
-
-        g_tb_window_bounds[g_tb_window_count][0] = wx;
-        g_tb_window_bounds[g_tb_window_count][1] = y + 8;
-        g_tb_window_bounds[g_tb_window_count][2] = ICON_SIZE;
-        g_tb_window_bounds[g_tb_window_count][3] = ICON_SIZE;
-        g_tb_window_count++;
-        wx += ICON_SIZE + ICON_SPACING;
-    }
-}
-
-void taskbar_draw_system_tray(void)
-{
-    uint32_t W = fb_get_width();
-    int y = TASKBAR_Y;
-    int tray_x = (int)W - 220;
-
-    /* System tray pill background */
-    fb_fill_rounded_rect(tray_x - 4, y + 10, 218, 44, 8, COL_ICON_BG);
-
-    /* Wi-Fi icon (3 stacked arcs, simplified as bars) */
-    int ix = tray_x;
-    fb_fill_rect(ix,     y + 40, 3, 4,  COL_TEXT);
-    fb_fill_rect(ix + 4, y + 36, 3, 8,  COL_TEXT);
-    fb_fill_rect(ix + 8, y + 32, 3, 12, COL_TEXT);
-    fb_fill_rect(ix+12,  y + 28, 3, 16, 0x0046D3C6); /* brightest bar = connected */
-    ix += 20;
-
-    /* Volume icon (simplified speaker + wave) */
-    fb_fill_rect(ix,     y + 22, 6,  20, COL_TEXT);
-    fb_fill_rect(ix + 6, y + 18, 4,  28, COL_TEXT);
-    fb_fill_rect(ix +10, y + 26, 2,  12, COL_TEXT);
-    fb_fill_rect(ix +14, y + 28, 2,   8, 0x0046D3C6);
-    ix += 22;
-
-    /* Battery (thin rect + nub) */
-    fb_fill_rect(ix, y + 22, 24, 20, COL_TEXT);
-    fb_fill_rect(ix + 24, y + 27, 3, 10, COL_TEXT);  /* nub */
-    fb_fill_rect(ix + 2, y + 24, 20, 16, 0x0034C759); /* green fill = 100% */
-    ix += 32;
-
-    /* Clock: HH:MM on top, day-counter on bottom */
-    char time_buf[16], day_buf[16];
-    uint64_t total_secs  = g_kstate.uptime_ticks / 100;
-    uint64_t total_mins  = total_secs / 60;
-    uint64_t display_min = total_mins % 60;
-    uint64_t display_hr  = (total_mins / 60) % 24;
-    snprintf(time_buf, sizeof(time_buf), "%02lu:%02lu",
-             (unsigned long)display_hr, (unsigned long)display_min);
-    snprintf(day_buf,  sizeof(day_buf),  "Day %lu",
-             (unsigned long)(total_mins / 1440 + 1));
-    fb_put_string(ix, y + 14, time_buf, COL_TEXT, COL_ICON_BG);
-    fb_put_string(ix, y + 30, day_buf,  COL_DIM,  COL_ICON_BG);
+    if (g_tb.hover == code)
+        fb_fill_rounded_rect(r->x, r->y, r->w, r->h, 5, T(HOVER));
 }
 
 void taskbar_draw(void)
 {
-    uint32_t W = fb_get_width();
-    int y = TASKBAR_Y;
+    int W = (int)fb_get_width();
+    int y = taskbar_y();
 
-    /* Taskbar background */
-    fb_blend_rect(0, y, W, TASKBAR_HEIGHT, 0x00000000, 110);
-    fb_fill_rect(0, y + 1, W, TASKBAR_HEIGHT - 1, COL_TASKBAR_BG);
-    fb_fill_rect(0, y, W, 1, COL_TASKBAR_BORDER);
+    taskbar_layout();
 
-    taskbar_draw_start_button();
-    taskbar_draw_search_box();
-    taskbar_draw_pinned_apps();
-    taskbar_draw_system_tray();
-}
+    fb_fill_rect(0, y, W, TASKBAR_H, T(TASKBAR));
+    fb_fill_rect(0, y, W, 1, T(BORDER));
 
-void taskbar_add_window(wm_window_t *win, const char *label)
-{
-    if (g_taskbar.app_count < 32) {
-        strncpy(g_taskbar.apps[g_taskbar.app_count].label, label,
-                sizeof(g_taskbar.apps[0].label) - 1);
-        g_taskbar.apps[g_taskbar.app_count].window = win;
-        g_taskbar.apps[g_taskbar.app_count].active = 1;
-        g_taskbar.app_count++;
+    /* ---- Start ---- */
+    if (g_start.open)
+        fb_fill_rounded_rect(g_tb.start.x, g_tb.start.y, 44, 40, 5, T(HOVER));
+    tb_hover_bg(&g_tb.start, TBH_START);
+    icon_draw(ICON_START, g_tb.start.x + 10, g_tb.start.y + 8, 24);
+
+    /* ---- Search ---- */
+    if (g_tb.wide_search) {
+        rect_t *s = &g_tb.search;
+        fb_fill_rounded_rect(s->x, s->y + 4, s->w, 32, 16,
+                             g_tb.hover == TBH_SEARCH ? T(HOVER) : T(INPUT));
+        glyph_draw(GLYPH_SEARCH, s->x + 12, s->y + 12, 16, T(TEXT_DIM), T(INPUT));
+        fb_draw_text(s->x + 36, s->y + 12, "Ask JARVIS", T(TEXT_DIM));
+    } else {
+        tb_hover_bg(&g_tb.search, TBH_SEARCH);
+        glyph_draw(GLYPH_SEARCH, g_tb.search.x + 12, g_tb.search.y + 10, 20,
+                   T(TEXT), g_tb.hover == TBH_SEARCH ? T(HOVER) : T(TASKBAR));
     }
-}
 
-void taskbar_remove_window(wm_window_t *win)
-{
-    for (int i = 0; i < g_taskbar.app_count; i++) {
-        if (g_taskbar.apps[i].window == win) {
-            for (int j = i; j < g_taskbar.app_count - 1; j++)
-                g_taskbar.apps[j] = g_taskbar.apps[j + 1];
-            g_taskbar.app_count--;
-            break;
+    /* ---- Apps ---- */
+    for (int i = 0; i < g_tb.app_count; i++) {
+        desktop_app_t *app = desktop_app_get(i);
+        rect_t *r = &g_tb.apps[i];
+        int running = app->window != NULL;
+        int focused = running && app->window == g_wm_ctx.focused;
+
+        if (focused || g_tb.hover == TBH_APP0 + i)
+            fb_fill_rounded_rect(r->x + 2, r->y, r->w - 4, r->h, 5, T(HOVER));
+        icon_draw(app->icon, r->x + 10, r->y + 6, 24);
+
+        if (focused)
+            fb_fill_rounded_rect(r->x + 14, r->y + 35, 16, 3, 1, T(ACCENT));
+        else if (running)
+            fb_fill_rounded_rect(r->x + 19, r->y + 35, 6, 3, 1, T(TEXT_DIM));
+    }
+
+    /* ---- JARVIS status chip ---- */
+    {
+        rect_t *r = &g_tb.chip;
+        uint32_t col = ui_shell_get_security_alert() ? T(DANGER) : T(ACCENT);
+        char status[9];
+        tb_hover_bg(r, TBH_CHIP);
+        glyph_draw(GLYPH_MIC, r->x + 6, r->y + 12, 16, col,
+                   g_tb.hover == TBH_CHIP ? T(HOVER) : T(TASKBAR));
+        strncpy(status, ui_shell_get_status(), 8);
+        status[8] = 0;
+        fb_draw_text(r->x + 26, r->y + 12, status, col);
+    }
+
+    /* ---- Network + volume ---- */
+    glyph_draw(GLYPH_NET, g_tb.status.x + 6, g_tb.status.y + 12, 16,
+               g_kstate.network_ready ? T(TEXT) : T(TEXT_DIM), T(TASKBAR));
+    glyph_draw(GLYPH_VOLUME, g_tb.status.x + 30, g_tb.status.y + 12, 16,
+               g_kstate.audio_ready ? T(TEXT) : T(TEXT_DIM), T(TASKBAR));
+
+    /* ---- Clock ---- */
+    {
+        static const char *const months[12] =
+            { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+        rect_t *r = &g_tb.clock;
+        char clock[8], date[16];
+        sys_time_t t;
+
+        tb_hover_bg(r, TBH_CLOCK);
+        sys_get_time(&t);
+        sys_format_clock(clock, sizeof(clock));
+        snprintf(date, sizeof(date), "%d %s %d", t.day, months[t.month - 1], t.year);
+        fb_draw_text(r->x + r->w - 6 - fb_text_width(clock), r->y + 3, clock, T(TEXT));
+        fb_draw_text(r->x + r->w - 6 - fb_text_width(date), r->y + 21, date, T(TEXT));
+    }
+
+    /* ---- Notification bell ---- */
+    {
+        rect_t *r = &g_tb.bell;
+        int unread = notifications_get_unread_count();
+        if (notifications_center_is_visible())
+            fb_fill_rounded_rect(r->x, r->y, r->w, r->h, 5, T(HOVER));
+        tb_hover_bg(r, TBH_BELL);
+        glyph_draw(GLYPH_BELL, r->x + 9, r->y + 11, 18, T(TEXT), T(TASKBAR));
+        if (unread > 0) {
+            char num[4];
+            snprintf(num, sizeof(num), "%d", unread > 9 ? 9 : unread);
+            fb_fill_circle(r->x + 27, r->y + 11, 8, T(ACCENT));
+            fb_draw_text(r->x + 23, r->y + 3, num, T(ACCENT_TEXT));
         }
     }
+
+    /* ---- Show desktop sliver ---- */
+    fb_fill_rect(g_tb.showdesk.x, y + 8, 1, TASKBAR_H - 16, T(BORDER));
 }
 
-/* ---- Start Menu ---------------------------------------------------------- */
-void start_menu_draw(void)
-{
-    uint32_t H = fb_get_height();
-    int menu_w = 640;
-    int menu_h = (int)H - 80;
-    int x = 12;
-    int y = TASKBAR_Y - menu_h - 8;  /* 8px gap above taskbar */
-
-    /* Semi-transparent dark panel (acrylic effect via a flat dark bg) */
-    fb_fill_rounded_rect(x, y, menu_w, menu_h, 8, 0x0010191D);
-    /* Top border accent */
-    fb_fill_rect(x, y, menu_w, 1, COL_TASKBAR_BORDER);
-    /* Right border */
-    fb_fill_rect(x + menu_w - 1, y, 1, menu_h, COL_TASKBAR_BORDER);
-
-    /* ---- User banner ---------------------------------------------------- */
-    fb_fill_rounded_rect(x + 10, y + 10, menu_w - 20, 50, 8, 0x0018242B);
-    /* User icon circle */
-    fb_fill_rounded_rect(x + 20, y + 17, 36, 36, 8, 0x0046D3C6);
-    fb_put_string(x + 30, y + 27, "JV", 0x00FFFFFF, 0x0046D3C6);
-    fb_put_string(x + 66, y + 20, "JARVIS User", COL_TEXT, 0x0018242B);
-    fb_put_string(x + 66, y + 37, "Administrator", COL_DIM, 0x0018242B);
-
-    /* ---- Search box ----------------------------------------------------- */
-    int sy = y + 72;
-    fb_fill_rounded_rect(x + 16, sy, menu_w - 32, 42, 8, COL_ICON_BG);
-    fb_fill_rect(x + 24, sy, menu_w - 48, 1, 0x0046D3C6);
-    fb_put_string(x + 28, sy + 12, "Search apps, files, and settings...", COL_DIM, COL_ICON_BG);
-
-    /* ---- Pinned section -------------------------------------------------- */
-    int py = sy + 56;
-    fb_put_string(x + 16, py, "Pinned", COL_TEXT, 0x00151515);
-    fb_fill_rect(x + 16, py + 16, 60, 1, COL_TASKBAR_BORDER);
-
-    static const struct { const char *label; uint32_t col; } pinned[] = {
-        { "Files",      0x0000D9FF }, { "Terminal",  0x0000E676 },
-        { "Settings",   0x00BB86FC }, { "Security",  0x00FF6B6B },
-        { "Calculator", 0x00FFB703 }, { "Browser",   0x00FF9500 },
-    };
-    int icon_x = x + 20, icon_y = py + 28;
-    int icons_per_row = 5;
-    for (int i = 0; i < 6; i++) {
-        fb_fill_rounded_rect(icon_x, icon_y, 72, 72, 8, pinned[i].col);
-        /* First letter as large icon glyph */
-        char first[2] = { pinned[i].label[0], 0 };
-        fb_put_string(icon_x + 28, icon_y + 24, first, 0x00FFFFFF, pinned[i].col);
-        fb_put_string(icon_x + 4,  icon_y + 56, pinned[i].label, 0x00FFFFFF, pinned[i].col);
-        icon_x += 82;
-        if ((i + 1) % icons_per_row == 0) { icon_x = x + 20; icon_y += 86; }
-    }
-
-    /* ---- Recommended / Recent ------------------------------------------- */
-    int ry = icon_y + 18;
-    fb_put_string(x + 16, ry, "Recommended", COL_TEXT, 0x00151515);
-    fb_fill_rect(x + 16, ry + 16, 90, 1, COL_TASKBAR_BORDER);
-
-    static const char *recent[] = { "kernel_core.o", "brain.py", "speech_engine.cpp",
-                                    "vfs.c", "desktop_init.c", "CHANGELOG.md" };
-    int rx = x + 20, rrow_y = ry + 28;
-    for (int i = 0; i < 6; i++) {
-        fb_fill_rect(rx, rrow_y, 12, 16, 0x005BA3D6);
-        fb_put_string(rx + 16, rrow_y, recent[i], COL_TEXT, 0x00151515);
-        rrow_y += 22;
-        if (rrow_y > y + menu_h - 50) break;
-    }
-
-    /* ---- Power strip (bottom) ------------------------------------------- */
-    int bot_y = y + menu_h - 40;
-    fb_fill_rect(x, bot_y, menu_w, 40, 0x0018242B);
-    fb_put_string(x + 16,  bot_y + 12, "All Apps >",   COL_TEXT, 0x0018242B);
-    fb_put_string(x + menu_w - 180, bot_y + 12, "[Sleep]  [Restart]  [Shutdown]",
-                  COL_DIM, 0x0018242B);
-}
-
-/* ---- Click Handler (was completely absent — taskbar was draw-only) ------- */
-
-static int point_in(int px, int py, int *bounds)
-{
-    return (px >= bounds[0] && px < bounds[0] + bounds[2] &&
-            py >= bounds[1] && py < bounds[1] + bounds[3]);
-}
-
-/*
- * Returns 1 if the click was handled by the taskbar (so the WM layer
- * knows not to forward it to a window), 0 otherwise. Previously the
- * taskbar was draw-only — nothing called click-test functions because none
- * existed; Start, pinned icons, and running-window buttons were inert.
- */
+/* Returns 1 if the click landed on the taskbar. */
 int taskbar_handle_click(int x, int y)
 {
-    /* Start button */
-    if (point_in(x, y, g_tb_start_bounds)) {
+    if (y < taskbar_y())
+        return 0;
+
+    int hit = taskbar_hit(x, y);
+
+    if (hit != TBH_START && hit != TBH_SEARCH)
+        start_menu_close();
+    if (hit != TBH_BELL && hit != TBH_CLOCK)
+        notifications_close_center();
+
+    if (hit == TBH_START) {
         taskbar_toggle_start_menu();
-        return 1;
+    } else if (hit == TBH_SEARCH) {
+        if (!g_start.open) taskbar_toggle_start_menu();
+    } else if (hit >= TBH_APP0) {
+        desktop_app_activate(hit - TBH_APP0);
+    } else if (hit == TBH_CHIP) {
+        desktop_app_launch(desktop_app_find("JARVIS"));
+    } else if (hit == TBH_CLOCK || hit == TBH_BELL) {
+        notifications_toggle_center();
+    } else if (hit == TBH_SHOWDESK) {
+        wm_minimize_all();
     }
 
-    /* Clicking anywhere while start menu is open and NOT on the taskbar
-     * should dismiss the start menu — handled upstream in the desktop
-     * click router. Here: clicking the search box while start is open. */
-    if (point_in(x, y, g_tb_search_bounds)) {
-        if (g_taskbar.start_menu_open)
-            g_taskbar.start_menu_open = 0;
-        /* TODO: open a global search/spotlight overlay */
-        return 1;
-    }
+    desktop_invalidate();
+    return 1;
+}
 
-    /* Pinned icons */
-    for (int i = 0; i < g_tb_pinned_count; i++) {
-        if (point_in(x, y, g_tb_pinned_bounds[i])) {
-            desktop_system_open_app(g_tb_pinned_app_names[i]);
-            if (g_taskbar.start_menu_open)
-                g_taskbar.start_menu_open = 0;
-            return 1;
-        }
-    }
+/* ==========================================================================
+ * START MENU
+ * ========================================================================== */
+#define SM_W        600
+#define SM_COLS     6
+#define SM_CELL_W   92
+#define SM_CELL_H   84
+#define SM_FOOTER_H 60
 
-    /* Open-window (non-pinned) buttons */
-    for (int i = 0; i < g_tb_window_count; i++) {
-        if (point_in(x, y, g_tb_window_bounds[i])) {
-            wm_window_t *win = g_taskbar.apps[i].window;
-            if (win) {
-                if (win->state == WIN_STATE_MINIMIZED)
-                    wm_set_minimized(win, 0);
-                else if (g_wm_ctx.focused == win)
-                    wm_set_minimized(win, 1);  /* click running app = minimize */
-                else
-                    wm_set_focused(win);
-            }
-            return 1;
-        }
-    }
+enum { SMH_NONE = -1, SMH_LOCK = 200, SMH_RESTART, SMH_POWER };
 
-    /* Any click on the taskbar bar itself (background) */
-    if (y >= (int)TASKBAR_Y && y < (int)(TASKBAR_Y + TASKBAR_HEIGHT)) {
-        /* Dismiss start menu on background click */
-        if (g_taskbar.start_menu_open)
-            g_taskbar.start_menu_open = 0;
-        return 1;
-    }
+static void start_rect(int *x, int *y, int *w, int *h)
+{
+    int H = (int)fb_get_height() - TASKBAR_H - 24;
+    *w = SM_W;
+    if (*w > (int)fb_get_width() - 24) *w = (int)fb_get_width() - 24;
+    *h = H < 600 ? H : 600;
+    *x = ((int)fb_get_width() - *w) / 2;
+    *y = taskbar_y() - *h - 12;
+}
 
-    /* Click outside taskbar when start menu is open → dismiss */
-    if (g_taskbar.start_menu_open) {
-        g_taskbar.start_menu_open = 0;
-        return 0;  /* don't consume — also let the click reach the window below */
-    }
+static char lower(char c)
+{
+    return (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+}
 
+static int icontains(const char *hay, const char *needle)
+{
+    if (!*needle) return 1;
+    for (; *hay; hay++) {
+        const char *h = hay, *n = needle;
+        while (*h && *n && lower(*h) == lower(*n)) { h++; n++; }
+        if (!*n) return 1;
+    }
     return 0;
+}
+
+/* Fills out[] with the indices of apps matching the search query. */
+static int start_matches(int *out, int max)
+{
+    int n = 0;
+    for (int i = 0; i < desktop_app_count() && n < max; i++)
+        if (icontains(desktop_app_get(i)->name, g_start.query))
+            out[n++] = i;
+    return n;
+}
+
+static void start_cell_rect(int k, int sx, int sy, rect_t *r)
+{
+    r->x = sx + 24 + (k % SM_COLS) * SM_CELL_W;
+    r->y = sy + 106 + (k / SM_COLS) * SM_CELL_H;
+    r->w = SM_CELL_W;
+    r->h = SM_CELL_H - 4;
+}
+
+static void start_power_rect(int which, int sx, int sy, int sw, int sh, rect_t *r)
+{
+    /* which: 0 = lock, 1 = restart, 2 = power (right-most) */
+    r->w = 36; r->h = 36;
+    r->x = sx + sw - 20 - 36 - (2 - which) * 42;
+    r->y = sy + sh - SM_FOOTER_H + 12;
+}
+
+static int start_hit(int px, int py)
+{
+    int x, y, w, h, m[TB_MAX_APPS];
+    rect_t r;
+
+    start_rect(&x, &y, &w, &h);
+    int n = start_matches(m, TB_MAX_APPS);
+    for (int k = 0; k < n; k++) {
+        start_cell_rect(k, x, y, &r);
+        if (rect_hit(&r, px, py)) return 100 + k;
+    }
+    for (int b = 0; b < 3; b++) {
+        start_power_rect(b, x, y, w, h, &r);
+        if (rect_hit(&r, px, py)) return SMH_LOCK + b;
+    }
+    return SMH_NONE;
 }
 
 void taskbar_toggle_start_menu(void)
 {
-    g_taskbar.start_menu_open = !g_taskbar.start_menu_open;
+    g_start.open = !g_start.open;
+    g_start.query[0] = 0;
+    g_start.qlen = 0;
+    g_start.hover = SMH_NONE;
+    if (g_start.open) {
+        notifications_close_center();
+        desktop_context_close();
+    }
+    desktop_invalidate();
 }
 
 int taskbar_is_start_menu_open(void)
 {
-    return g_taskbar.start_menu_open;
+    return g_start.open;
+}
+
+void start_menu_close(void)
+{
+    if (g_start.open)
+        taskbar_toggle_start_menu();
+}
+
+int start_menu_hover(int px, int py)
+{
+    if (!g_start.open) return 0;
+    int h = start_hit(px, py);
+    if (h == g_start.hover) return 0;
+    g_start.hover = h;
+    return 1;
+}
+
+static void status_row(int x, int y, const char *label, const char *value, uint32_t dot)
+{
+    fb_fill_circle(x + 5, y + 8, 4, dot);
+    fb_draw_text(x + 18, y, label, T(TEXT_DIM));
+    fb_draw_text(x + 18 + fb_text_width(label) + 8, y, value, T(TEXT));
+}
+
+void start_menu_draw(void)
+{
+    if (!g_start.open) return;
+
+    int x, y, w, h, m[TB_MAX_APPS];
+    rect_t r;
+    start_rect(&x, &y, &w, &h);
+
+    fb_blend_rounded_rect(x + 2, y + 6, w, h, 10, 0x00000000, 80);
+    fb_fill_rounded_rect(x, y, w, h, 10, T(BORDER));
+    fb_fill_rounded_rect(x + 1, y + 1, w - 2, h - 2, 9, T(MENU));
+
+    /* ---- Search box ---- */
+    fb_fill_rounded_rect(x + 24, y + 24, w - 48, 36, 18, T(INPUT));
+    fb_fill_rect(x + 40, y + 59, w - 80, 1, T(ACCENT));
+    glyph_draw(GLYPH_SEARCH, x + 38, y + 34, 16, T(TEXT_DIM), T(INPUT));
+    if (g_start.qlen) {
+        fb_draw_text(x + 64, y + 34, g_start.query, T(TEXT));
+        fb_fill_rect(x + 64 + g_start.qlen * 8 + 1, y + 34, 1, 16, T(TEXT));
+    } else {
+        fb_draw_text(x + 64, y + 34, "Type to search apps, or ask JARVIS", T(TEXT_DIM));
+    }
+
+    /* ---- App grid ---- */
+    int n = start_matches(m, TB_MAX_APPS);
+    fb_draw_text_bold(x + 32, y + 78, g_start.qlen ? "Best match" : "Pinned", T(TEXT));
+
+    for (int k = 0; k < n; k++) {
+        desktop_app_t *app = desktop_app_get(m[k]);
+        start_cell_rect(k, x, y, &r);
+        if (g_start.hover == 100 + k || (g_start.qlen && k == 0))
+            fb_fill_rounded_rect(r.x + 2, r.y, r.w - 4, r.h, 6, T(HOVER));
+        icon_draw(app->icon, r.x + (r.w - 36) / 2, r.y + 8, 36);
+        ui_text_center(r.x, r.y + 54, r.w, app->name, T(TEXT));
+        if (app->window)
+            fb_fill_rounded_rect(r.x + r.w / 2 - 4, r.y + r.h - 6, 8, 3, 1, T(ACCENT));
+    }
+
+    if (n == 0) {
+        fb_draw_text(x + 32, y + 116, "No app matches. Press Enter to ask JARVIS:", T(TEXT_DIM));
+        fb_draw_text(x + 32, y + 138, g_start.query, T(ACCENT));
+    }
+
+    /* ---- JARVIS status card ---- */
+    int card_h = 96;
+    int card_y = y + h - SM_FOOTER_H - card_h - 16;
+    int rows_end = y + 106 + ((n + SM_COLS - 1) / SM_COLS) * SM_CELL_H;
+    if (card_y >= rows_end + 8) {
+        int half = (w - 48) / 2;
+        ui_card(x + 24, card_y, w - 48, card_h);
+        icon_draw(ICON_JARVIS, x + 36, card_y + 10, 20);
+        fb_draw_text_bold(x + 64, card_y + 12, "JARVIS", T(TEXT));
+        fb_draw_text(x + 64 + 56, card_y + 12, ui_shell_get_status(), T(ACCENT));
+
+        status_row(x + 36, card_y + 42, "AI brain", g_kstate.ai_ready ? "Ready" : "Loading",
+                   g_kstate.ai_ready ? T(OK) : T(WARN));
+        status_row(x + 36 + half, card_y + 42, "Voice", g_kstate.speech_ready ? "Ready" : "Loading",
+                   g_kstate.speech_ready ? T(OK) : T(WARN));
+        status_row(x + 36, card_y + 66, "Security", ui_shell_get_security_label(),
+                   ui_shell_get_security_alert() ? T(DANGER) : T(OK));
+        status_row(x + 36 + half, card_y + 66, "Network", g_kstate.network_ready ? "Adapter up" : "Offline",
+                   g_kstate.network_ready ? T(OK) : T(TEXT_DIM));
+    }
+
+    /* ---- Footer: user + power ---- */
+    int fy = y + h - SM_FOOTER_H;
+    fb_fill_rect(x + 1, fy, w - 2, 1, T(BORDER));
+    fb_fill_circle(x + 40, fy + 30, 16, T(ACCENT));
+    glyph_draw(GLYPH_USER, x + 31, fy + 20, 18, T(ACCENT_TEXT), T(ACCENT));
+    fb_draw_text(x + 66, fy + 22, g_kstate.username[0] ? g_kstate.username : "User", T(TEXT));
+
+    static const glyph_id_t power_glyphs[3] = { GLYPH_LOCK, GLYPH_RESTART, GLYPH_POWER };
+    for (int b = 0; b < 3; b++) {
+        start_power_rect(b, x, y, w, h, &r);
+        uint32_t bg = (g_start.hover == SMH_LOCK + b) ? T(HOVER) : T(MENU);
+        if (g_start.hover == SMH_LOCK + b)
+            fb_fill_rounded_rect(r.x, r.y, r.w, r.h, 5, bg);
+        glyph_draw(power_glyphs[b], r.x + 9, r.y + 9, 18, T(TEXT), bg);
+    }
+}
+
+/* Click while the Start menu is open. Returns 1 if it landed inside. */
+int start_menu_click(int px, int py)
+{
+    if (!g_start.open) return 0;
+
+    int x, y, w, h, m[TB_MAX_APPS];
+    start_rect(&x, &y, &w, &h);
+    if (!ui_hit(px, py, x, y, w, h))
+        return 0;
+
+    int hit = start_hit(px, py);
+    if (hit >= 100 && hit < 200) {
+        int n = start_matches(m, TB_MAX_APPS);
+        int k = hit - 100;
+        start_menu_close();
+        if (k < n) desktop_app_launch(m[k]);
+    } else if (hit == SMH_LOCK) {
+        start_menu_close();
+        desktop_lock();
+    } else if (hit == SMH_RESTART) {
+        desktop_system_restart();
+    } else if (hit == SMH_POWER) {
+        desktop_system_shutdown();
+    }
+    return 1;
+}
+
+int start_menu_key(uint32_t key, int mods)
+{
+    (void)mods;
+    if (!g_start.open) return 0;
+
+    if (key == WM_KEY_ESC) {
+        start_menu_close();
+    } else if (key == WM_KEY_BACKSPACE) {
+        if (g_start.qlen > 0)
+            g_start.query[--g_start.qlen] = 0;
+    } else if (key == WM_KEY_ENTER) {
+        int m[TB_MAX_APPS];
+        int n = start_matches(m, TB_MAX_APPS);
+        char query[sizeof(g_start.query)];
+        memcpy(query, g_start.query, sizeof(query));
+        start_menu_close();
+        if (n > 0)
+            desktop_app_launch(m[0]);
+        else if (query[0])
+            desktop_ask_jarvis(query);
+    }
+    desktop_invalidate();
+    return 1;                       /* the menu swallows all keys while open */
+}
+
+int start_menu_text(char ch)
+{
+    if (!g_start.open) return 0;
+    if (ch >= 32 && ch < 127 && g_start.qlen < (int)sizeof(g_start.query) - 1) {
+        g_start.query[g_start.qlen++] = ch;
+        g_start.query[g_start.qlen] = 0;
+        desktop_invalidate();
+    }
+    return 1;
 }
