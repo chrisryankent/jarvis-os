@@ -1,0 +1,6 @@
+{
+  "brain": "tools/models/brain/model.gguf",
+  "stt": "tools/models/stt/ggml-medium.en.bin",
+  "tts": "tools/models/tts",
+  "wake": "tools/models/wake/wake_word.onnx"
+}

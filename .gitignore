@@ -1,0 +1,98 @@
+ # OS files
+.DS_Store
+Thumbs.db
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies and build output
+node_modules/
+dist/
+build/
+coverage/
+out/
+release/
+debug/
+*.min.js
+*.min.css
+*.map
+*.wasm
+*.bin
+*.exe
+*.dll
+*.so
+*.dylib
+*.zip
+*.tar
+*.gz
+*.7z
+*.rar
+*.iso
+*.img
+*.pdf
+*.mp4
+*.mov
+*.mp3
+*.wav
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.ico
+*.woff
+*.woff2
+*.ttf
+*.otf
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Java artifacts
+*.class
+target/
+
+# Local configuration
+.cache/
+.terraform/
+
+# --- JARVIS OS build / generated output ---
+*.o
+*.a
+*.d
+*.elf
+/iso/
+/build/
+/disk.img
+__pycache__/
+*.pyc
+
+# Downloaded AI models and vendored third-party checkouts (re-fetch with tools/download_models.py)
+/tools/models/*
+!/tools/models/manifest.json
+/tools/vendor/
+*.pth
+*.onnx
+*.gguf
+*.safetensors
+
+# Local agent / tool settings
+.claude/settings.local.json
+.agents/
+.codex/

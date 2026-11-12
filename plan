@@ -1,0 +1,298 @@
+I'll help you add a GUI to JARVIS OS following the OS architecture patterns. Let me first explore the codebase to understand the current structure.
+
+Ran terminal command: find /home/chriskent/Desktop/jarvis-os -type f -name "*.c" -o -name "*.h" -o -name "Makefile" | head -20
+
+Read [](file:///home/chriskent/Desktop/jarvis-os)
+
+Ran terminal command: ls -la /home/chriskent/Desktop/jarvis-os/
+
+Read [](file:///home/chriskent/Desktop/jarvis-os/Makefile)
+
+Read [](file:///home/chriskent/Desktop/jarvis-os/kernel/kernel.h)
+
+Read [](file:///home/chriskent/Desktop/jarvis-os/drivers/gpu.c)
+
+Read [](file:///home/chriskent/Desktop/jarvis-os/ui/ui_shell.c)
+
+Ran terminal command: ls -la /home/chriskent/Desktop/jarvis-os/ui/
+
+Now I understand the structure. The project has a GPU driver and UI shell ready, but the framebuffer isn't being initialized. Let me check the bootloader to see why GOP isn't being detected.
+
+Read [](file:///home/chriskent/Desktop/jarvis-os/boot/stage2.asm)
+
+Ran terminal command: ls -la /home/chriskent/Desktop/jarvis-os/boot/
+
+Read [](file:///home/chriskent/Desktop/jarvis-os/boot/multiboot2.asm)
+
+Read [](file:///home/chriskent/Desktop/jarvis-os/kernel/kernel.c)
+
+Let me save my analysis to memory and create a plan for the GUI implementation.
+````
+
+````
+I've analyzed the JARVIS OS codebase. The GUI infrastructure exists but isn't working because:
+
+1. **Bootloader doesn't extract GOP** (graphics) info from GRUB
+2. **GPU driver skips high-memory framebuffers** 
+3. **UI shell isn't initialized** in the boot sequence
+4. **No refresh timer** for rendering
+
+Let me create an implementation plan.
+
+Used tool: EnterPlanMode
+
+I'll explore the codebase to understand how to properly integrate the GUI. Let me search for key patterns in the boot sequence and device initialization.
+
+Used tool: Agent
+
+Ran terminal command: find /home/chriskent/Desktop/jarvis-os -type f -name "*.c" -o -name "*.h" | head -30
+
+Searched for files matching `**/*.c`
+
+Searched for files matching `**/*.h`
+
+Searched for regex `multiboot`
+
+Searched for regex `framebuffer|fb_addr`
+
+Searched for regex `device_init`
+
+Searched for regex `interrupt|irq_handler|IRQ`
+
+Searched for regex `timer|PIT|pit_init`
+
+Read [](file:///home/chriskent/Desktop/jarvis-os/kernel/kernel.c)
+
+Read [](file:///home/chriskent/Desktop/jarvis-os/kernel/platform.c)
+
+Read [](file:///home/chriskent/Desktop/jarvis-os/kernel/kernel.h)
+
+Read [](file:///home/chriskent/Desktop/jarvis-os/drivers/gpu.c)
+
+Read [](file:///home/chriskent/Desktop/jarvis-os/drivers/ahci.c)
+
+Read [](file:///home/chriskent/Desktop/jarvis-os/drivers/nic.c)
+
+Read [](file:///home/chriskent/Desktop/jarvis-os/drivers/usb.c)
+
+Read [](file:///home/chriskent/Desktop/jarvis-os/drivers/audio.c)
+
+Read [](file:///home/chriskent/Desktop/jarvis-os/boot/multiboot2.asm)
+
+Read [](file:///home/chriskent/Desktop/jarvis-os/drivers/pci.c)
+
+Searched for regex `idt_init|pit_set_frequency|irq0_timer_handler|context_switch`
+
+Ran terminal command: find /home/chriskent/Desktop/jarvis-os -type f \( -name "*.c" -o -name "*.h" -o -name "*.asm" \) | grep -E "(platform|ipc_sched|syscall)" | head -10
+
+Read [](file:///home/chriskent/Desktop/jarvis-os/kernel/ipc_sched_pmm.c)
+
+Searched for regex `e820|E820|memory.*map|bootloader`
+
+Read [](file:///home/chriskent/Desktop/jarvis-os/kernel/platform.c)
+
+Searched for regex `multiboot|tag|framebuffer|gop`
+
+Read [](file:///home/chriskent/Desktop/jarvis-os/kernel/linker.ld)
+
+Searched for regex `ui_shell|framebuffer|gpu_framebuffer_init`
+
+Now let me create the implementation plan:Now I'll request approval for the plan:
+
+Here is Claude's plan:
+
+# JARVIS OS GUI Integration Plan
+
+## Context
+The JARVIS OS has complete UI rendering infrastructure in place (ui/ui_shell.c) but the framebuffer is not being initialized because:
+1. The multiboot2 bootloader doesn't parse GOP (Graphics Output Protocol) info from GRUB
+2. GOP info isn't written to the expected location (0x7000) for the GPU driver
+3. gpu_framebuffer_init() is called but finds no GOP data
+4. ui_shell_init() is never called in the boot sequence
+5. UI refresh timer isn't wired up to the IRQ0 tick
+
+This plan implements full GUI support by:
+- Adding multiboot2 GOP tag parsing to the bootloader
+- Enabling UI shell initialization in device_init()
+- Wiring the UI refresh to the 100 Hz timer interrupt
+- Fixing the high-memory framebuffer check
+
+## Implementation Steps
+
+### Step 1: Parse Multiboot2 GOP Tag in Bootloader
+**File:** `boot/multiboot2.asm`
+
+Add code after multiboot2_start to:
+1. Read multiboot2 info pointer (passed by GRUB in RBX in long mode)
+2. Iterate multiboot2 tags to find framebuffer tag (type 8)
+3. Extract framebuffer info (address, width, height, pitch)
+4. Write parsed info to fixed location 0x7000 (physical address)
+
+**Details:**
+- Multiboot2 tag structure: `dd type, dd size, [flags], [tag-specific data]`
+- Framebuffer tag contains GOP data and pixel format
+- Must be done BEFORE paging is enabled (can use physical addresses directly)
+
+**Reference:** Boot tags passed at RBX+8 (skip multiboot info header)
+
+### Step 2: Update GPU Driver to Handle High MMIO Addresses
+**File:** `drivers/gpu.c`
+
+Current code at line 68-72 skips framebuffer if `gop->fb_base >= 0x40000000`:
+```c
+if (gop->fb_base >= 0x40000000ULL) {
+    terminal_printf("[GPU] Framebuffer at 0x%llx is not mapped yet; skipping\n", gop->fb_base);
+    return;
+}
+```
+
+This fails on QEMU where framebuffer is in high MMIO space. Solution:
+- Remove this check OR
+- Map high MMIO addresses correctly in paging setup
+
+**Recommended:** Extend vmm_map_range() to handle high MMIO correctly, OR simply remove the check and let vmm_map_range() handle it.
+
+### Step 3: Initialize UI Shell During Device Boot
+**File:** `kernel/kernel.c`
+
+Add ui_shell_init() call after gpu_framebuffer_init() in device_init():
+```c
+gpu_framebuffer_init();
+ui_shell_init();  // NEW: Initialize JARVIS UI shell
+```
+
+This initializes framebuffer rendering, clears screen to black, draws boot splash.
+
+### Step 4: Wire UI Refresh Timer to IRQ0
+**File:** `kernel/kernel.c` and `kernel/platform.c`
+
+The 100 Hz IRQ0 timer currently only calls ai_scheduler_tick(). Add:
+1. Create ui_refresh_handler() that calls ui_shell_draw_frame() every 60 FPS
+   - Counter: increment every IRQ0, render when counter % 2 == 0 (runs at 50 FPS from 100 Hz)
+   - OR set PIT to lower frequency (50 Hz) for efficiency
+2. Register handler with IDT in interrupt_init()
+
+Current pattern (from kernel.c line 154):
+```c
+idt_set_handler(0x20, irq0_timer_handler);
+```
+
+New pattern:
+```c
+idt_set_handler(0x20, irq0_combined_handler);  // Calls both scheduler and UI refresh
+```
+
+Or use a static counter in irq0_timer_handler to throttle UI refresh.
+
+### Step 5: Verify Font Data is Available
+**File:** `drivers/gpu.c` and `kernel/platform.c`
+
+Current code expects extern PSF font:
+```c
+extern const uint8_t font8x16[256][16];
+```
+
+In platform.c line 8: `const uint8_t font8x16[256][16] = {{0}};`
+
+This is a zero-filled stub. For proper text rendering:
+- Keep the stub (displays nothing, doesn't crash)
+- OR provide actual PSF font data (optional, text will be blank otherwise)
+
+## Critical Files to Modify
+
+1. **boot/multiboot2.asm** (70 lines) — Parse GOP from multiboot2 tags, write to 0x7000
+2. **drivers/gpu.c** (5 lines) — Remove high MMIO check at line 68-72
+3. **kernel/kernel.c** (2 lines) — Call ui_shell_init() after gpu_framebuffer_init() in device_init()
+4. **kernel/platform.c** (20 lines) — Add UI refresh timer handler wired to IRQ0
+
+## Reusable Code Pattern Reference
+
+**IRQ handler registration pattern** (kernel.c line 154):
+```c
+idt_set_handler(0x20, irq0_timer_handler);  // Maps IRQ0 → handler function
+```
+
+**Device initialization pattern** (kernel.c lines 274-284):
+```c
+static void device_init(void)
+{
+    terminal_puts("[DEV] PCI enumeration...\n");
+    pci_enumerate();
+
+    ahci_init();      // All follow: check PCI → map MMIO → configure
+    usb_init();
+    nic_init();
+    audio_init();
+    gpu_framebuffer_init();
+}
+```
+
+**Multiboot2 iteration pattern** (in stage2.asm, but need 64-bit version):
+- RBX contains multiboot info pointer
+- Iterate from RBX+8 onwards, each tag: `type (4B) | size (4B) | [data]`
+- Tag type 0 = end of tags
+- Tag type 8 = framebuffer info
+
+## Verification & Testing
+
+1. **Build & Run:**
+   ```bash
+   make clean && make qemu
+   ```
+
+2. **Expected Output:**
+   - Boot sequence messages in serial console
+   - `[GPU] Framebuffer: 1920x1080 at vaddr 0x...` (instead of "No GOP framebuffer found")
+   - `[UI] Shell ready`
+   - QEMU window shows JARVIS ASCII art splash screen with cyan accent lines
+   - Status bar at top/bottom with system info
+
+3. **Visual Verification:**
+   - Screen displays "J A R V I S" text in center
+   - Top bar shows "[ JARVIS AI OS ]", uptime, AI status
+   - Bottom bar shows mic level meter
+   - Dark space-black background (#050510)
+   - Cyan accent lines (#00E5FF)
+
+4. **Functional Checks:**
+   - Type text in serial console, should appear in transcript panel (once IPC wired up)
+   - AI responses should display in right panel
+   - Framebuffer updates smoothly at 60 FPS
+
+## Build Requirements
+
+Already in place:
+- Framebuffer rendering functions: fb_put_pixel, fb_fill_rect, fb_put_string
+- UI panel drawing: draw_top_bar, draw_bottom_bar, draw_transcript_panel, draw_response_panel
+- Font glyph rendering with embedded PSF font
+
+No new dependencies needed.
+
+## Timeline Estimate
+
+- Step 1 (multiboot2 GOP parsing): ~30 lines, ~15 min
+- Step 2 (fix GPU driver): ~5 lines, ~5 min
+- Step 3 (ui_shell_init call): ~2 lines, ~2 min
+- Step 4 (timer integration): ~20 lines, ~20 min
+- Step 5 (font validation): No changes needed
+- Testing & debug: ~30 min
+
+Total: ~1.5 hours including boot testing in QEMU
+
+
+
+
+Made changes.
+
+Voice/Audio Issues Still Need Work:
+The speech system boots but has feedback loop issues:
+
+No VAD (Voice Activity Detection): Can't distinguish TTS playback from real voice
+Audio routing: Microphone picks up speaker output
+No echo cancellation: Self-audio causes garbage transcriptions
+To Get Voice Working Properly:
+Would need to:
+
+Implement Voice Activity Detection in speech/speech_engine.c to filter TTS
+Add audio routing isolation in the audio driver
+Load real Whisper models instead of stubs
