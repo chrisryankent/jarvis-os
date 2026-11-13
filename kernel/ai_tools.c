@@ -110,15 +110,42 @@ static long json_int(const char *json, const char *key, long dflt)
     return neg ? -r : r;
 }
 
-/* Paths from the model may be relative to /jarvis ("data/notes.txt"). */
+/* Paths from the model may be relative ("data/notes.txt") or use the names
+ * people say ("Documents/notes.txt", "my downloads"). Map them onto the
+ * real folders instead of failing. */
 static void resolve(const char *in, char *out, size_t n)
 {
-    if (!in[0])                         snprintf(out, n, "/jarvis");
-    else if (in[0] == '/')              snprintf(out, n, "%s", in);
-    else if (!strncmp(in, "jarvis/", 7)) snprintf(out, n, "/%s", in);
-    else                                snprintf(out, n, "/jarvis/%s", in);
-    size_t l = strlen(out);
-    while (l > 1 && out[l - 1] == '/') out[--l] = 0;
+    static const struct { const char *name; const char *path; } alias[] = {
+        { "/jarvis/data/documents", "/jarvis/data" },  { "/jarvis/documents", "/jarvis/data" },
+        { "documents", "/jarvis/data" },               { "my documents", "/jarvis/data" },
+        { "/jarvis/downloads", "/jarvis/data/Downloads" }, { "downloads", "/jarvis/data/Downloads" },
+        { "desktop", "/jarvis/desktop" },              { "recycle bin", "/jarvis/trash" },
+        { "home", "/jarvis" },                         { "~", "/jarvis" },
+    };
+    char tmp[200];
+    snprintf(tmp, sizeof(tmp), "%s", in);
+    while (tmp[0] == ' ') memmove(tmp, tmp + 1, strlen(tmp));
+
+    for (size_t i = 0; i < sizeof(alias) / sizeof(alias[0]); i++) {
+        size_t l = strlen(alias[i].name);
+        int match = 1;
+        for (size_t k = 0; k < l; k++) {
+            char c = tmp[k];
+            if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+            if (c != alias[i].name[k]) { match = 0; break; }
+        }
+        if (match && (tmp[l] == 0 || tmp[l] == '/')) {
+            snprintf(out, n, "%s%s", alias[i].path, tmp + l);
+            goto trim;
+        }
+    }
+    if (!tmp[0])                          snprintf(out, n, "/jarvis");
+    else if (tmp[0] == '/')               snprintf(out, n, "%s", tmp);
+    else if (!strncmp(tmp, "jarvis/", 7)) snprintf(out, n, "/%s", tmp);
+    else                                  snprintf(out, n, "/jarvis/%s", tmp);
+trim:;
+    size_t len = strlen(out);
+    while (len > 1 && out[len - 1] == '/') out[--len] = 0;
 }
 
 /* ==========================================================================

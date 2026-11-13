@@ -9,10 +9,8 @@ ASK: lines, and the model answers or calls tools that JARVIS OS executes
 (kernel/ai_tools.c). Destructive tools wait for the user's Allow click in
 JARVIS OS, so the model can never delete, kill or shut down by itself.
 
-Used by tools/voice_bridge.py. Can be tried on its own, without JARVIS OS
-(tools are then only printed, not run):
-
-    tools/jarvis_brain.py --chat
+Started by tools/voice_bridge.py (`make run-voice`); every tool runs in the
+real JARVIS OS.
 """
 from __future__ import annotations
 
@@ -33,15 +31,6 @@ LLAMA_SERVER = ROOT / "vendor" / "llama.cpp" / "build" / "bin" / "llama-server"
 DEFAULT_MODEL = ROOT / "models" / "brain" / "model.gguf"
 PORT = 8180
 
-SYSTEM_PROMPT = """You are JARVIS, the assistant built into JARVIS OS, a desktop operating system. You talk to your user by voice, so answer in one to three short, natural sentences, without markdown or lists.
-
-You can act on the computer with the tools provided. Use them whenever the user asks about or wants something done on this PC: look things up instead of guessing, and act instead of explaining how. Call one tool at a time and wait for its result. After acting, say briefly what you did. If a tool returns an error, explain it plainly.
-
-Folders: /jarvis/data is Documents, /jarvis/data/Downloads is Downloads, /jarvis/desktop is the Desktop, USB drives appear as /jarvis/usb0 and so on (read-only). Deleting moves things to the Recycle Bin. Actions such as deleting, ending a process, installing or shutting down ask the user for permission inside JARVIS OS; if the user denies, accept it.
-
-Never invent file names, process numbers or system facts: get them with a tool."""
-
-
 def _tool(name: str, description: str, props: dict | None = None, required: list[str] | None = None) -> dict:
     return {"type": "function", "function": {
         "name": name, "description": description,
@@ -51,11 +40,11 @@ def _tool(name: str, description: str, props: dict | None = None, required: list
 S = {"type": "string"}
 I = {"type": "integer"}
 TOOLS = [
-    _tool("open_app", "Open an app: Files, Terminal, JARVIS, Security, Settings, Calculator, Tasks, Notepad, Apps, or an installed app.", {"name": S}, ["name"]),
+    _tool("open_app", "Open an app (Files, Terminal, Settings, Calculator, Tasks, Notepad, Apps, Security).", {"name": S}, ["name"]),
     _tool("close_app", "Close an open app window.", {"name": S}, ["name"]),
     _tool("list_apps", "List the apps on this PC and which are open."),
     _tool("list_files", "List the files and folders in a folder.", {"path": S}, ["path"]),
-    _tool("find_files", "Find files and folders whose name contains some text, on the disk and USB drives.", {"name": S}, ["name"]),
+    _tool("find_files", "Find files by part of their name.", {"name": S}, ["name"]),
     _tool("read_file", "Read a text file (first 3000 characters).", {"path": S}, ["path"]),
     _tool("write_file", "Create or replace a text file with the given text.", {"path": S, "text": S}, ["path", "text"]),
     _tool("create_folder", "Create a folder.", {"path": S}, ["path"]),
@@ -63,7 +52,7 @@ TOOLS = [
     _tool("move", "Move or rename a file or folder.", {"from": S, "to": S}, ["from", "to"]),
     _tool("copy", "Copy a file or folder.", {"from": S, "to": S}, ["from", "to"]),
     _tool("open_file", "Open a file in Notepad, or a folder in Files.", {"path": S}, ["path"]),
-    _tool("system_status", "Time, date, uptime, memory, disk, network and process count."),
+    _tool("system_status", "Time, date, memory, disk, network."),
     _tool("list_processes", "List running processes with their PID."),
     _tool("kill_process", "End a process by PID.", {"pid": I}, ["pid"]),
     _tool("suspend_process", "Pause a process by PID.", {"pid": I}, ["pid"]),
@@ -97,7 +86,7 @@ class LlamaServer:
         log = open(Path(os.environ.get("TMPDIR", "/tmp")) / "jarvis-llama.log", "ab")
         self.proc = subprocess.Popen(
             [str(LLAMA_SERVER), "-m", str(model), "--host", "127.0.0.1", "--port", str(PORT),
-             "-c", str(ctx), "-t", str(threads), "--jinja", "-np", "1", "--cache-reuse", "256"],
+             "-c", str(ctx), "-t", str(threads), "-np", "1", "--cache-reuse", "256"],
             stdout=log, stderr=log, stdin=subprocess.DEVNULL)
 
     def healthy(self) -> bool:
@@ -120,59 +109,99 @@ class LlamaServer:
             time.sleep(1)
         return False
 
-    def chat(self, messages: list, tools: list) -> dict:
-        body = json.dumps({"messages": messages, "tools": tools, "temperature": 0.3,
-                           "max_tokens": 300, "cache_prompt": True}).encode()
+    def complete(self, messages: list, schema: dict | None = None, max_tokens: int = 120) -> str:
+        """Chat completion; with a schema the output is forced to match it."""
+        req = {"messages": messages, "temperature": 0.1, "max_tokens": max_tokens, "cache_prompt": True}
+        if schema:
+            req["response_format"] = {"type": "json_object", "schema": schema}
         c = http.client.HTTPConnection("127.0.0.1", PORT, timeout=300)
         try:
-            c.request("POST", "/v1/chat/completions", body, {"Content-Type": "application/json"})
-            r = c.getresponse()
-            data = json.loads(r.read().decode() or "{}")
+            c.request("POST", "/v1/chat/completions", json.dumps(req).encode(), {"Content-Type": "application/json"})
+            data = json.loads(c.getresponse().read().decode() or "{}")
         finally:
             c.close()
         if "choices" not in data:
             raise RuntimeError(str(data.get("error", data))[:200])
-        return data["choices"][0]["message"]
+        return data["choices"][0]["message"].get("content") or ""
 
     def close(self) -> None:
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
 
 
-class Brain:
-    """The conversation and the tool loop. `run_tool(name, args) -> str`
-    executes a tool (in JARVIS OS, through the bridge)."""
+INFO_TOOLS = {"list_files", "find_files", "read_file", "system_status", "list_processes", "list_devices",
+              "list_drives", "network_info", "list_apps", "list_packages"}
 
-    def __init__(self, server: LlamaServer, run_tool, max_steps: int = 6):
+
+def tool_catalogue() -> str:
+    """One line per tool: name(arg, arg) - what it does."""
+    lines = []
+    for t in TOOLS:
+        f = t["function"]
+        args = ", ".join(f["parameters"]["properties"].keys())
+        lines.append(f"{f['name']}({args}) - {f['description']}")
+    return "\n".join(lines)
+
+
+DECIDE_PROMPT = """You are JARVIS, the voice assistant of JARVIS OS. Decide how to handle the user's latest request.
+Answer only with JSON: {"tool": <tool name or "none">, "args": {...}, "say": <text>}.
+- If the request is about this PC (files, apps, settings, processes, devices, network, memory, time), pick the ONE tool that does it, fill its args, and set say to "".
+- Otherwise use "tool": "none" and put your answer in say: one or two short spoken sentences, no markdown.
+- Only use delete, write_file over an existing file, kill_process, uninstall_app or power when the user clearly asked for exactly that.
+Folders: Documents, Downloads, Desktop (write paths like "Documents/notes.txt"). USB drives: /jarvis/usb0 (read-only).
+Tools:
+""" + tool_catalogue()
+
+ANSWER_PROMPT = """You are JARVIS, the voice assistant of JARVIS OS. Answer the user's question in one or two short spoken sentences, using only the information given. No markdown, no lists, no file paths unless asked."""
+
+DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "tool": {"type": "string", "enum": [t["function"]["name"] for t in TOOLS] + ["none"]},
+        "args": {"type": "object"},
+        "say": {"type": "string"},
+    },
+    "required": ["tool", "args", "say"],
+}
+
+
+class Brain:
+    """One request = one decision. The model chooses a single tool (or none)
+    in constrained JSON, so it cannot loop or chain unasked actions; JARVIS OS
+    runs the tool; questions get a short second pass that words the result.
+    `run_tool(name, args) -> str` executes a tool in JARVIS OS."""
+
+    def __init__(self, server: "LlamaServer", run_tool):
         self.server = server
         self.run_tool = run_tool
-        self.max_steps = max_steps
-        self.history: list[dict] = []
+        self.history: list[dict] = []                # recent exchanges, for follow-ups
 
     def ask(self, text: str) -> str:
-        self.history.append({"role": "user", "content": text})
-        self.history = self.history[-16:]            # keep the context small and fast
-        while self.history and self.history[0]["role"] != "user":
-            self.history.pop(0)
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + self.history
-        for _ in range(self.max_steps):
-            msg = self.server.chat(messages, TOOLS)
-            calls = msg.get("tool_calls") or []
-            if not calls:
-                answer = (msg.get("content") or "").strip() or "Done."
-                self.history.append({"role": "assistant", "content": answer})
-                return answer
-            messages.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls[:1]})
-            call = calls[0]                           # one at a time, as instructed
-            name = call["function"]["name"]
-            try:
-                args = json.loads(call["function"].get("arguments") or "{}")
-            except json.JSONDecodeError:
-                args = {}
-            result = self.run_tool(name, args)
-            messages.append({"role": "tool", "tool_call_id": call.get("id", "0"), "name": name, "content": result})
-            self.history.extend(messages[-2:])
-        return "I could not finish that in a few steps. Could you put it another way?"
+        context = self.history[-6:]
+        decision = self.server.complete(
+            [{"role": "system", "content": DECIDE_PROMPT}] + context + [{"role": "user", "content": text}],
+            schema=DECISION_SCHEMA, max_tokens=120)
+        try:
+            d = json.loads(decision)
+        except json.JSONDecodeError:
+            d = {"tool": "none", "args": {}, "say": decision}
+        tool, args, say = d.get("tool", "none"), d.get("args") or {}, (d.get("say") or "").strip()
+
+        if tool == "none":
+            answer = say or "Sorry, I am not sure how to help with that."
+        else:
+            result = self.run_tool(tool, args)
+            if tool in INFO_TOOLS and not result.startswith("error"):
+                answer = self.server.complete(
+                    [{"role": "system", "content": ANSWER_PROMPT},
+                     {"role": "user", "content": f"{text}\n\nInformation:\n{result[:1800]}"}],
+                    max_tokens=90).strip()
+            else:
+                answer = result.replace("/jarvis/data/Downloads", "Downloads").replace("/jarvis/data", "Documents") \
+                               .replace("/jarvis/desktop", "the Desktop").replace("error: ", "Sorry, ")
+        self.history += [{"role": "user", "content": text}, {"role": "assistant", "content": answer}]
+        self.history = self.history[-6:]
+        return answer
 
 
 class GuestLink:
@@ -230,7 +259,15 @@ def start_for_bridge(sock: socket.socket, sock_lock: threading.Lock, model: str 
         if not server.wait():
             print("[brain] llama-server did not start; see /tmp/jarvis-llama.log", flush=True)
             return
-        print(f"[brain] {name} is ready", flush=True)
+        # Read the (long) instructions once now, so they are cached and the
+        # user's first request is as fast as the rest.
+        started = time.time()
+        try:
+            server.complete([{"role": "system", "content": DECIDE_PROMPT}, {"role": "user", "content": "hello"}],
+                            schema=DECISION_SCHEMA, max_tokens=8)
+        except Exception as exc:
+            print(f"[brain] warm-up failed: {exc}", flush=True)
+        print(f"[brain] {name} is ready (instructions loaded in {time.time() - started:.0f}s)", flush=True)
         while True:
             try:
                 link.send(f"AI:ONLINE {name}")
@@ -259,31 +296,8 @@ def start_for_bridge(sock: socket.socket, sock_lock: threading.Lock, model: str 
 
 
 def main() -> int:
-    if "--chat" not in sys.argv:
-        print(__doc__)
-        return 1
-    server = LlamaServer(DEFAULT_MODEL, threads=max(1, (os.cpu_count() or 4) // 2))
-    print("Loading the model...", flush=True)
-    if not server.wait():
-        print("llama-server did not start; see /tmp/jarvis-llama.log")
-        return 1
-
-    def fake_tool(name: str, args: dict) -> str:
-        print(f"  [tool] {name}({json.dumps(args)})")
-        return input("  result> ") or "ok"
-
-    brain = Brain(server, fake_tool)
-    try:
-        while True:
-            text = input("you> ").strip()
-            if text:
-                t0 = time.time()
-                print(f"jarvis> {brain.ask(text)}   ({time.time() - t0:.1f}s)")
-    except (EOFError, KeyboardInterrupt):
-        print()
-    finally:
-        server.close()
-    return 0
+    print("The brain runs as part of the voice bridge: start JARVIS OS with `make run-voice`.")
+    return 1
 
 
 if __name__ == "__main__":
