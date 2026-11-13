@@ -282,6 +282,25 @@ void terminal_app_execute_command(const char *cmd)
 
     desktop_files_changed();    /* cheap; covers mkdir / touch / rm / mv / cp */
 
+    /* The account and settings folder cannot be read or changed from here:
+     * check every argument as a path. */
+    for (const char *t = rest; *t;) {
+        while (*t == ' ') t++;
+        const char *e = t;
+        while (*e && *e != ' ') e++;
+        if (e > t && e - t < 120) {
+            char tok[128];
+            memcpy(tok, t, (size_t)(e - t));
+            tok[e - t] = 0;
+            term_resolve(tok, path, sizeof(path));
+            if (vfs_is_private(path)) {
+                terminal_app_write("Access denied: that is the protected system folder.\n");
+                return;
+            }
+        }
+        t = e;
+    }
+
     if (strcmp(verb, "help") == 0) {
         cmd_help();
     } else if (strcmp(verb, "clear") == 0 || strcmp(verb, "cls") == 0) {
@@ -492,7 +511,7 @@ void terminal_app_execute_command(const char *cmd)
         terminal_app_write(buf);
         terminal_app_write("\n");
     } else if (strcmp(verb, "date") == 0) {
-        char clock[8];
+        char clock[12];
         sys_format_date(buf, sizeof(buf));
         sys_format_clock(clock, sizeof(clock));
         terminal_app_write(buf);

@@ -263,6 +263,7 @@ void vfs_init(void)
         "/jarvis/apps",
         "/jarvis/trash",
         "/jarvis/data/Downloads",
+        "/jarvis/system",
         NULL
     };
     for (int i = 0; dirs[i]; i++) {
@@ -402,6 +403,12 @@ int vfs_read_file(const char *path, char *buf, size_t max)
  * are listed as folders here but never stored in the ramfs, so nothing about
  * them is saved to the JARVIS disk. */
 static char vfs_mounts[4][16];
+
+/* The account and settings folder: only the kernel may touch it. */
+int vfs_is_private(const char *path)
+{
+    return path && !strncmp(path, "/jarvis/system", 14) && (path[14] == 0 || path[14] == '/');
+}
 
 void vfs_mount_point(const char *path)
 {

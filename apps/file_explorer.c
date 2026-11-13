@@ -339,6 +339,7 @@ static void fx_load_folder(void)
             }
             /* the Recycle Bin has its own sidebar entry; not listed in Local Disk */
             int known = flen == strlen(FX_TRASH) && !strncmp(full, FX_TRASH, flen);
+            if (flen >= 14 && !strncmp(full, "/jarvis/system", 14)) known = 1;   /* hidden system folder */
             for (int d = 0; d < fx.drive_count && !known; d++)       /* other drives: in This PC */
                 if (fx.drives[d].removable && fx.drives[d].mount[0] &&
                     strlen(fx.drives[d].mount) == flen && !strncmp(fx.drives[d].mount, full, flen))
@@ -377,6 +378,7 @@ static void fx_navigate(const char *path, int record)
     while (l > 1 && target[l - 1] == '/') target[--l] = 0;
 
     if (!strcmp(target, FX_TRASH)) vfs_mkdir(FX_TRASH);
+    if (vfs_is_private(target)) { fx_toast("Files", "That is a protected system folder."); return; }
     if (strcmp(target, LOC_THISPC) && !vfs_is_dir(target)) {
         fx_toast("Files", "That folder does not exist.");
         return;

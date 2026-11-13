@@ -68,7 +68,76 @@ TOOLS = [
     _tool("uninstall_app", "Uninstall an app that was installed from a package.", {"name": S}, ["name"]),
     _tool("run_program", "Run an installed app by name, or a program file by path.", {"path": S}, ["path"]),
     _tool("power", "Shut down or restart the computer.", {"action": {"type": "string", "enum": ["shutdown", "restart"]}}, ["action"]),
+    _tool("web_search", "Search the internet: news, facts, people, anything not on this PC.", {"query": S}, ["query"]),
+    _tool("read_webpage", "Read the text of a web page.", {"url": S}, ["url"]),
 ]
+
+
+# ==========================================================================
+# Internet tools. They run here on the host, which has a full HTTPS stack
+# (JARVIS OS itself only speaks plain http so far).
+# ==========================================================================
+import html as _html
+import re as _re
+import urllib.parse
+import urllib.request
+from html.parser import HTMLParser
+
+_UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"}
+
+
+class _DDGParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.results: list[dict] = []
+        self._in = None
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        cls = a.get("class") or ""
+        if tag == "a" and "result__a" in cls:
+            href = a.get("href", "")
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+            self.results.append({"title": "", "url": q.get("uddg", [href])[0], "snippet": ""})
+            self._in = "title"
+        elif "result__snippet" in cls and self.results:
+            self._in = "snippet"
+
+    def handle_endtag(self, tag):
+        if tag in ("a", "td", "div"):
+            self._in = None
+
+    def handle_data(self, data):
+        if self._in and self.results:
+            self.results[-1][self._in] += data
+
+
+def web_search(query: str) -> str:
+    url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
+    page = urllib.request.urlopen(urllib.request.Request(url, headers=_UA), timeout=15).read().decode("utf-8", "ignore")
+    p = _DDGParser()
+    p.feed(page)
+    found = [r for r in p.results if r["title"].strip() and "duckduckgo.com/y.js" not in r["url"]][:5]
+    if not found:
+        return "error: the search returned no results"
+    return "\n".join(f"{i + 1}. {r['title'].strip()} ({urllib.parse.urlparse(r['url']).netloc}): "
+                     f"{' '.join(r['snippet'].split())}" for i, r in enumerate(found))
+
+
+def read_webpage(url: str) -> str:
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    raw = urllib.request.urlopen(urllib.request.Request(url, headers=_UA), timeout=15).read(600000)
+    text = raw.decode("utf-8", "ignore")
+    text = _re.sub(r"(?is)<(script|style|noscript|svg|header|footer|nav)[^>]*>.*?</\1>", " ", text)
+    text = _html.unescape(_re.sub(r"(?s)<[^>]+>", " ", text))
+    return " ".join(text.split())[:2500] or "error: the page had no readable text"
+
+
+HOST_TOOLS = {
+    "web_search": lambda a: web_search(str(a.get("query", ""))),
+    "read_webpage": lambda a: read_webpage(str(a.get("url", ""))),
+}
 
 
 class LlamaServer:
@@ -86,7 +155,7 @@ class LlamaServer:
         log = open(Path(os.environ.get("TMPDIR", "/tmp")) / "jarvis-llama.log", "ab")
         self.proc = subprocess.Popen(
             [str(LLAMA_SERVER), "-m", str(model), "--host", "127.0.0.1", "--port", str(PORT),
-             "-c", str(ctx), "-t", str(threads), "-np", "1", "--cache-reuse", "256"],
+             "-c", str(ctx), "-t", str(threads), "-tb", str(os.cpu_count() or 4), "-np", "1", "--cache-reuse", "256"],
             stdout=log, stderr=log, stdin=subprocess.DEVNULL)
 
     def healthy(self) -> bool:
@@ -130,7 +199,7 @@ class LlamaServer:
 
 
 INFO_TOOLS = {"list_files", "find_files", "read_file", "system_status", "list_processes", "list_devices",
-              "list_drives", "network_info", "list_apps", "list_packages"}
+              "list_drives", "network_info", "list_apps", "list_packages", "web_search", "read_webpage"}
 
 
 def tool_catalogue() -> str:
@@ -146,8 +215,10 @@ def tool_catalogue() -> str:
 DECIDE_PROMPT = """You are JARVIS, the voice assistant of JARVIS OS. Decide how to handle the user's latest request.
 Answer only with JSON: {"tool": <tool name or "none">, "args": {...}, "say": <text>}.
 - If the request is about this PC (files, apps, settings, processes, devices, network, memory, time), pick the ONE tool that does it, fill its args, and set say to "".
+- For current events, facts about people, places, prices or anything you are not sure of, use web_search.
 - Otherwise use "tool": "none" and put your answer in say: one or two short spoken sentences, no markdown.
-- Only use delete, write_file over an existing file, kill_process, uninstall_app or power when the user clearly asked for exactly that.
+- You have full control of this PC, but only delete, overwrite, end processes, uninstall or shut down when the user clearly asked for exactly that.
+- The words come from speech recognition and may be misheard: pick the app or command that sounds closest (e.g. "not bad" means Notepad).
 Folders: Documents, Downloads, Desktop (write paths like "Documents/notes.txt"). USB drives: /jarvis/usb0 (read-only).
 Tools:
 """ + tool_catalogue()
@@ -171,12 +242,15 @@ class Brain:
     runs the tool; questions get a short second pass that words the result.
     `run_tool(name, args) -> str` executes a tool in JARVIS OS."""
 
-    def __init__(self, server: "LlamaServer", run_tool):
+    def __init__(self, server: "LlamaServer", run_tool, prefs: dict | None = None):
         self.server = server
         self.run_tool = run_tool
+        self.prefs = prefs if prefs is not None else {"web": True}
         self.history: list[dict] = []                # recent exchanges, for follow-ups
 
     def ask(self, text: str) -> str:
+        if self.prefs.pop("forget", False):         # Settings > Privacy: clear history
+            self.history = []
         context = self.history[-6:]
         decision = self.server.complete(
             [{"role": "system", "content": DECIDE_PROMPT}] + context + [{"role": "user", "content": text}],
@@ -190,12 +264,21 @@ class Brain:
         if tool == "none":
             answer = say or "Sorry, I am not sure how to help with that."
         else:
-            result = self.run_tool(tool, args)
+            if tool in HOST_TOOLS and not self.prefs.get("web", True):
+                result = "error: internet search is switched off in Settings > Privacy & security"
+            elif tool in HOST_TOOLS:
+                try:
+                    result = HOST_TOOLS[tool](args)
+                except Exception as exc:
+                    result = f"error: the internet request failed ({exc})"
+                print(f"[brain] {tool} {json.dumps(args)[:100]} -> {len(result)} chars", flush=True)
+            else:
+                result = self.run_tool(tool, args)
             if tool in INFO_TOOLS and not result.startswith("error"):
                 answer = self.server.complete(
                     [{"role": "system", "content": ANSWER_PROMPT},
-                     {"role": "user", "content": f"{text}\n\nInformation:\n{result[:1800]}"}],
-                    max_tokens=90).strip()
+                     {"role": "user", "content": f"{text}\n\nInformation:\n{result[:1400]}"}],
+                    max_tokens=70).strip()
             else:
                 answer = result.replace("/jarvis/data/Downloads", "Downloads").replace("/jarvis/data", "Documents") \
                                .replace("/jarvis/desktop", "the Desktop").replace("error: ", "Sorry, ")
@@ -250,7 +333,8 @@ def start_for_bridge(sock: socket.socket, sock_lock: threading.Lock, model: str 
         print(f"[brain] not available: {exc}", flush=True)
         return None
     link = GuestLink(sock, sock_lock)
-    brain = Brain(server, link.run_tool)
+    prefs = {"web": True}
+    brain = Brain(server, link.run_tool, prefs)
     asks: "queue.Queue[str]" = queue.Queue()
     name = "Llama 3.2 3B (local)"
 
@@ -278,6 +362,9 @@ def start_for_bridge(sock: socket.socket, sock_lock: threading.Lock, model: str 
     def worker() -> None:
         while True:
             text = asks.get()
+            while not asks.empty():                  # newer request: the old one is stale
+                dropped, text = text, asks.get()
+                print(f"[brain] skipped an older request: {dropped}", flush=True)
             started = time.time()
             try:
                 link.send("AI:THINKING")
@@ -292,7 +379,7 @@ def start_for_bridge(sock: socket.socket, sock_lock: threading.Lock, model: str 
 
     threading.Thread(target=heartbeat, daemon=True).start()
     threading.Thread(target=worker, daemon=True).start()
-    return link, asks
+    return link, asks, prefs
 
 
 def main() -> int:

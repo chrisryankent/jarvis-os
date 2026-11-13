@@ -48,6 +48,8 @@ void         theme_set_mode(theme_mode_t mode);
 theme_mode_t theme_get_mode(void);
 const char  *theme_get_name(void);
 uint32_t     theme_color(theme_color_t id);
+void         theme_set_accent(int idx);         /* 0 = theme default, 1..6 */
+void         theme_set_wallpaper(int idx);      /* 0 = theme default, 1..5 */
 #define T(id) theme_color(TC_##id)
 
 /* ---- Icons --------------------------------------------------------------- */
@@ -113,7 +115,10 @@ typedef struct {
 } sys_time_t;
 
 void sys_get_time(sys_time_t *t);                   /* CMOS real-time clock  */
-void sys_format_clock(char *buf, size_t n);         /* "14:05"               */
+void sys_format_clock(char *buf, size_t n);         /* "14:05" or "2:05 PM"  */
+void sys_set_clock_24h(int on);
+int  sys_clock_24h(void);
+void sys_cpu_name(char *out, size_t n);
 void sys_format_date(char *buf, size_t n);          /* "Thu 12 Nov 2026"     */
 void sys_format_uptime(char *buf, size_t n);        /* "1h 04m 09s"          */
 void sys_poweroff(void);

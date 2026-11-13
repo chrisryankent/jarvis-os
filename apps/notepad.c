@@ -401,6 +401,7 @@ static void reset_doc(void)
 static int load_file(const char *path)
 {
     long size = vfs_size(path);
+    if (vfs_is_private(path)) { np_toast("That file is part of the protected system folder."); return -1; }
     if (size < 0 || vfs_is_dir(path)) { np_toast("The file could not be opened."); return -1; }
     if ((size_t)size > NP_MAX_TEXT) { np_toast("The file is larger than 4 MB."); return -1; }
 
@@ -440,6 +441,7 @@ static int load_file(const char *path)
 static int save_to(const char *path)
 {
     if (fatfs_owns(path)) { np_toast("USB drives are read-only. Choose a folder on the Local Disk."); return -1; }
+    if (vfs_is_private(path)) { np_toast("That is the protected system folder."); return -1; }
     size_t out_len = np.len;
     if (np.crlf) for (size_t i = 0; i < np.len; i++) if (np.text[i] == '\n') out_len++;
     char *out = np.text;
@@ -678,7 +680,7 @@ enum {
 
 static void insert_time_date(void)
 {
-    char clock[8], date[32], both[48];
+    char clock[12], date[32], both[48];
     sys_format_clock(clock, sizeof(clock));
     sys_format_date(date, sizeof(date));
     snprintf(both, sizeof(both), "%s %s", clock, date);

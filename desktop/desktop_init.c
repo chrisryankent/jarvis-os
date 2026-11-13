@@ -19,6 +19,7 @@
 #include <stdio.h>
 
 void ui_shell_lock_input(uint32_t key, char ch);    /* desktop/ui_shell.c */
+void ui_shell_login_click(int x, int y);
 
 #include "../input/input_events.c"
 #include "theme.c"
@@ -52,7 +53,7 @@ static app_entry_t g_apps[] = {
     { { "Terminal",   ICON_TERMINAL, NULL }, terminal_app_open,   640, 400, "terminal term console shell" },
     { { "JARVIS",     ICON_JARVIS,   NULL }, assistant_app_open,  460, 500, "jarvis ai assistant voice" },
     { { "Security",   ICON_SHIELD,   NULL }, security_app_open,   470, 440, "security guard" },
-    { { "Settings",   ICON_GEAR,     NULL }, settings_app_open,   680, 400, "settings personalize" },
+    { { "Settings",   ICON_GEAR,     NULL }, settings_app_open,   1000, 600, "settings personalize" },
     { { "Calculator", ICON_CALC,     NULL }, calculator_app_open, 300, 430, "calculator calc" },
     { { "Tasks",      ICON_CHART,    NULL }, sysmon_app_open,     640, 470, "system monitor taskmgr processes" },
     { { "Notepad",    ICON_FILE,     NULL }, notepad_app_open,    780, 520, "notepad editor text" },
@@ -264,6 +265,41 @@ void desktop_ask_jarvis(const char *text)
     ipc_send(&msg);
 }
 
+/* ---- Settings that take effect outside the Settings app ----------------- */
+void desktop_apply_settings(void)
+{
+    theme_set_mode((theme_mode_t)setting_get_int("theme", THEME_DARK));
+    theme_set_accent(setting_get_int("accent", 0));
+    theme_set_wallpaper(setting_get_int("wallpaper", 0));
+    sys_set_clock_24h(setting_get_int("clock_24h", 1));
+    ui_shell_set_mouse(setting_get_int("mouse_speed", 2), setting_get_int("mouse_swap", 0));
+    audio_set_volume(setting_get_int("volume", 80));
+    ai_tools_set_ask_first(setting_get_int("ai_ask_first", 0));
+    if (setting_get_int("airplane", 0)) net_set_offline(1);
+}
+
+void desktop_send_host_prefs(void)
+{
+    char p[32];
+    snprintf(p, sizeof(p), "web=%d", setting_get_int("ai_web", 1));
+    ai_host_pref(p);
+    snprintf(p, sizeof(p), "volume=%d", setting_get_int("voice_volume", 100));
+    ai_host_pref(p);
+}
+
+/* Apps chosen in Settings > Apps > Startup open after each sign-in. */
+static void run_startup_apps(void)
+{
+    for (int i = 0; i < APP_COUNT; i++) {
+        char key[48];
+        snprintf(key, sizeof(key), "startup_%s", g_apps[i].pub.name);
+        if (setting_get_int(key, 0)) desktop_app_launch(i);
+    }
+}
+
+static uint64_t g_last_input_tick = 0;
+void desktop_note_input(void) { g_last_input_tick = g_kstate.uptime_ticks; }
+
 void desktop_lock(void)
 {
     start_menu_close();
@@ -362,8 +398,24 @@ void desktop_system_render(void)
     }
 
     char sched_msg[96];
-    if (scheduler_take_event(sched_msg, sizeof(sched_msg)))
-        notification_show("Process manager", sched_msg, NOTIF_WARNING, 8000);
+    if (scheduler_take_event(sched_msg, sizeof(sched_msg))) {
+        int usb = !strncmp(sched_msg, "USB drive", 9);
+        notification_show(usb ? "USB" : "Process manager", sched_msg, usb ? NOTIF_INFO : NOTIF_WARNING, 8000);
+        /* AutoPlay: show the new drive in This PC */
+        if (!strncmp(sched_msg, "USB drive connected", 19) && setting_get_int("autoplay", 1) && ui_shell_is_desktop()) {
+            desktop_app_launch(desktop_app_find("Files"));
+            file_explorer_navigate_to("::thispc");
+        }
+    }
+
+    /* Sign-in after each unlock: startup apps; idle: lock automatically. */
+    static int was_desktop = 0;
+    int is_desktop = ui_shell_is_desktop();
+    if (is_desktop && !was_desktop) { g_last_input_tick = now; run_startup_apps(); }
+    was_desktop = is_desktop;
+    int idle_min = setting_get_int("lock_after_min", 0);
+    if (is_desktop && idle_min > 0 && account_has_sign_in() && now - g_last_input_tick > (uint64_t)idle_min * 6000)
+        desktop_lock();
 
     if (notifications_tick())
         g_ds.dirty = 1;
@@ -402,6 +454,7 @@ void desktop_system_render(void)
 /* ---- Mouse --------------------------------------------------------------- */
 void desktop_system_handle_mouse_move(int x, int y)
 {
+    g_last_input_tick = g_kstate.uptime_ticks;
     fb_cursor_set_pos(x, y);
     g_ds.cursor_dirty = 1;
 
@@ -446,12 +499,10 @@ void desktop_system_handle_mouse_click(int x, int y, int button)
         return;
     g_ds.dirty = 1;
 
-    if (ui_shell_is_locked()) {
-        ui_shell_lock_input(0, 0);
+    if (!ui_shell_is_desktop()) {          /* sign-in or first-run setup screen */
+        if (button == 1) ui_shell_login_click(x, y);
         return;
     }
-    if (!ui_shell_is_desktop())
-        return;
 
     /* Clicking anywhere accepts a desktop rename in progress. */
     if (desktop_rename_active())
@@ -529,10 +580,11 @@ static int desktop_shortcut(uint32_t key, int mods)
 
 void desktop_dispatch_event(wm_input_event_t *event)
 {
+    g_last_input_tick = g_kstate.uptime_ticks;
     if (!g_ds.initialized || !event)
         return;
 
-    if (ui_shell_is_locked()) {
+    if (!ui_shell_is_desktop()) {          /* sign-in or first-run setup screen */
         if (event->type == IE_KEY_DOWN)
             ui_shell_lock_input(event->data.keyboard.key, 0);
         else if (event->type == IE_TEXT_INPUT)
@@ -540,8 +592,6 @@ void desktop_dispatch_event(wm_input_event_t *event)
         g_ds.dirty = 1;
         return;
     }
-    if (!ui_shell_is_desktop())
-        return;
 
     switch (event->type) {
     case IE_KEY_DOWN: {

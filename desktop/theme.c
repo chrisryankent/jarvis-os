@@ -108,9 +108,43 @@ const char *theme_get_name(void)
     return names[g_theme_mode];
 }
 
+/* Accent colour and wallpaper chosen in Settings > Personalization
+ * (index 0 = the theme's own). High contrast keeps its fixed colours. */
+static const uint32_t g_accents[] = { 0, 0x0060CDFF, 0x00E74856, 0x0016C60C, 0x00FFB900, 0x00B146C2, 0x00FF8C00 };
+static const uint32_t g_walls[][2] = {
+    { 0, 0 }, { 0x00200A30, 0x006B2D8F }, { 0x00052A1A, 0x001E7A4C }, { 0x00301008, 0x00C4501E },
+    { 0x00101010, 0x00383838 }, { 0x00042030, 0x00087A8C },
+};
+static int g_accent_idx = 0, g_wall_idx = 0;
+
+void theme_set_accent(int idx)
+{
+    if (idx < 0 || idx >= (int)(sizeof(g_accents) / sizeof(g_accents[0]))) idx = 0;
+    g_accent_idx = idx;
+    desktop_invalidate();
+}
+
+void theme_set_wallpaper(int idx)
+{
+    if (idx < 0 || idx >= (int)(sizeof(g_walls) / sizeof(g_walls[0]))) idx = 0;
+    g_wall_idx = idx;
+    desktop_wallpaper_invalidate();
+    desktop_invalidate();
+}
+
 uint32_t theme_color(theme_color_t id)
 {
     if ((unsigned)id >= TC_COUNT)
         id = TC_WINDOW;
+    if (g_theme_mode != THEME_HIGH_CONTRAST) {
+        if (g_accent_idx && id == TC_ACCENT) return g_accents[g_accent_idx];
+        if (g_accent_idx && id == TC_ACCENT_TEXT) {
+            uint32_t c = g_accents[g_accent_idx];
+            int lum = (int)(((c >> 16) & 255) * 3 + ((c >> 8) & 255) * 6 + (c & 255)) / 10;
+            return lum > 140 ? 0x00000000 : 0x00FFFFFF;
+        }
+        if (g_wall_idx && id == TC_WALL_TOP)    return g_walls[g_wall_idx][0];
+        if (g_wall_idx && id == TC_WALL_BOTTOM) return g_walls[g_wall_idx][1];
+    }
     return g_palettes[g_theme_mode][id];
 }

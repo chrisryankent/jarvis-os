@@ -30,8 +30,8 @@ static void ai_core_init(void);
 static void speech_daemon_init(void);
 static void security_daemon_init(void);
 static void first_boot_setup(void);
-static void authenticate_session(void);
 static void kernel_desktop_loop(void);
+int kernel_voice_bridge_connected(void);
 static void kernel_service_ipc(void);
 static void kernel_service_console(void);
 static void kernel_service_voice_serial(void);
@@ -113,6 +113,8 @@ void jarvis_kernel_main(void)
     usb_start_hotplug();           /* notice drives plugged in / removed later */
     usermode_install_programs();   /* bundled user programs -> /jarvis/bin */
     pkg_place_samples();           /* sample .jpk packages -> Downloads */
+    accounts_init();               /* the owner's account and settings (from disk) */
+    desktop_apply_settings();      /* theme, clock, mouse, network ... */
     ui_shell_show_loading_desktop();
 
     /*
@@ -127,10 +129,7 @@ void jarvis_kernel_main(void)
 
     g_kstate.mode = KMODE_RUNNING;
 
-    if (!g_kstate.setup_complete)
-        first_boot_setup();
-    else
-        authenticate_session();
+    first_boot_setup();
 
     terminal_puts("[JARVIS] Boot complete. Running desktop loop.\n");
     terminal_puts("[JARVIS] Foreground runtime active until preemptive IDT scheduling is complete.\n");
@@ -292,6 +291,16 @@ static void ipc_dispatch(ipc_message_t *msg)
     switch (msg->type) {
     case IPC_VOICE_INPUT:
         /* Speech engine decoded audio — forward to LLM brain */
+        if (!ui_shell_is_desktop()) {
+            /* Locked: speech is a sign-in attempt and nothing else. It may be
+             * the passphrase, so it is neither shown nor acted on. */
+            ui_shell_voice_attempt((const char *)msg->payload);
+            break;
+        }
+        if (!setting_get_int("voice_input", 1)) {        /* Settings: JARVIS does not listen */
+            terminal_puts("[VOICE] Ignored: voice commands are switched off in Settings\n");
+            break;
+        }
         ui_shell_set_status("THINKING");
         ui_shell_add_transcript((const char *)msg->payload);
         /* Simple commands ("open terminal") stay instant and work offline.
@@ -355,48 +364,20 @@ static void device_init(void)
     terminal_puts("[DEV] All devices online\n");
 }
 
+/* First run: create the account. Later boots: sign in if the account has a
+ * password, PIN or spoken passphrase; otherwise straight to the desktop. */
 static void first_boot_setup(void)
 {
-    if (g_kstate.setup_complete)
-        return;
-
-    ui_shell_show_setup_wizard();
-    terminal_puts("\n[JARVIS SETUP] First boot setup\n");
-    terminal_puts("[JARVIS SETUP] Desktop setup wizard is active.\n");
-    terminal_puts("[JARVIS SETUP] Continuing without blocking on serial input.\n");
-
-    ui_shell_set_setup_step("Create Your Profile",
-                            "Temporary local profile created for this boot.");
-    strncpy(g_kstate.username, "JARVIS User", sizeof(g_kstate.username) - 1);
-    g_kstate.username[sizeof(g_kstate.username) - 1] = '\0';
-
-    ui_shell_set_setup_step("Security Features",
-                            "Security setup is available after GUI input is wired.");
-    g_kstate.security_enabled = 0;
-    g_kstate.security_pin[0] = '\0';
-
-    ui_shell_set_setup_step("Voice Verification",
-                            "Voice enrollment hooks are enabled for the speech pipeline.");
-    ui_shell_display("Voice verification will use microphone transcripts when capture is linked.");
     g_kstate.setup_complete = 1;
-    terminal_printf("[JARVIS SETUP] Welcome, %s.\n", g_kstate.username);
-    terminal_printf("[JARVIS SETUP] Security lock: %s\n",
-        g_kstate.security_enabled ? "enabled" : "disabled");
-    terminal_puts("[JARVIS SETUP] Settings are in-memory until VFS persistence is implemented.\n\n");
-
-    ui_shell_unlock_desktop();
-}
-
-static void authenticate_session(void)
-{
-    if (!g_kstate.security_enabled) {
+    if (!account_exists()) {
+        terminal_puts("[JARVIS] First run: account setup\n");
+        ui_shell_show_setup_wizard();
+    } else if (account_has_sign_in()) {
+        terminal_printf("[JARVIS] Sign-in required for %s\n", account_name());
+        ui_shell_show_lock_screen();
+    } else {
         ui_shell_unlock_desktop();
-        return;
     }
-
-    ui_shell_show_lock_screen();
-    terminal_puts("\n[JARVIS LOGIN] Voice verification screen is active.\n");
-    terminal_puts("[JARVIS LOGIN] Waiting for voice auth; serial login prompt disabled.\n");
 }
 
 static void kernel_service_ipc(void)
@@ -774,7 +755,10 @@ static void kernel_deliver_voice_text(const char *text)
     msg.payload_len = len;
     ipc_send(&msg);
 
-    terminal_printf("[VOICE] Host bridge transcript: %s\n", (const char *)msg.payload);
+    if (ui_shell_is_desktop())
+        terminal_printf("[VOICE] Host bridge transcript: %s\n", (const char *)msg.payload);
+    else
+        terminal_puts("[VOICE] Host bridge transcript (hidden: signed out)\n");
     ui_shell_set_status("LISTENED");
 }
 
@@ -795,6 +779,8 @@ static void kernel_handle_voice_serial_line(const char *line)
         host_voice_bridge_active = 1;
         terminal_puts("[VOICE] Host voice bridge connected; COM2 transcripts enabled\n");
         ui_shell_display("Host voice bridge connected.");
+        ui_shell_voice_prompt();            /* signed out: ask for the passphrase now */
+        desktop_send_host_prefs();          /* web search permission, voice volume */
         return;
     }
 
@@ -995,4 +981,10 @@ static void security_daemon_init(void)
     disk_encryption_init();
 
     terminal_puts("[SEC] Security daemon active\n");
+}
+
+/* 1 once the host voice bridge (microphone + speech) has connected. */
+int kernel_voice_bridge_connected(void)
+{
+    return host_voice_bridge_active;
 }

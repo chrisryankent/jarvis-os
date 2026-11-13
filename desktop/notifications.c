@@ -66,6 +66,15 @@ uint32_t notification_show(const char *title, const char *body,
     n->priority = priority;
     n->created_tick = g_kstate.uptime_ticks;
     n->toast_until_tick = n->created_tick + (timeout_ms ? timeout_ms : 4000) / 10;
+    /* Do not disturb: kept in the notification centre, no pop-up (critical
+     * ones still show). */
+    if (setting_get_int("dnd", 0) && priority != NOTIF_CRITICAL) n->toast_until_tick = 0;
+    /* Accessibility: JARVIS reads notifications aloud. */
+    if (setting_get_int("narrator", 0)) {
+        char spoken[220];
+        snprintf(spoken, sizeof(spoken), "%s. %s", title ? title : "", body ? body : "");
+        tts_speak(spoken, strlen(spoken));
+    }
     n->unread = !g_center_visible;
     strncpy(n->title, title ? title : "", sizeof(n->title) - 1);
     strncpy(n->body, body ? body : "", sizeof(n->body) - 1);
@@ -132,7 +141,7 @@ static void draw_center(void)
     fb_fill_rounded_rect(x + 1, y + 1, w - 2, h - 2, 7, T(MENU));
 
     /* Clock header */
-    char clock[8], date[32];
+    char clock[12], date[32];
     sys_format_clock(clock, sizeof(clock));
     sys_format_date(date, sizeof(date));
     fb_draw_text_scaled(x + 20, y + 18, clock, T(TEXT), 2);

@@ -195,7 +195,7 @@ void taskbar_draw(void)
             { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
         rect_t *r = &g_tb.clock;
-        char clock[8], date[16];
+        char clock[12], date[16];
         sys_time_t t;
 
         tb_hover_bg(r, TBH_CLOCK);

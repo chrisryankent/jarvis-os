@@ -14,6 +14,8 @@
 
 #include "../kernel/kernel.h"
 #include "ui.h"
+
+int kernel_voice_bridge_connected(void); /* kernel/kernel.c */
 #include <string.h>
 #include <stdio.h>
 
@@ -108,37 +110,7 @@ static void draw_loading(void)
                    0x00C0D0E0);
 }
 
-static void draw_lock(void)
-{
-    int W = (int)fb_get_width(), H = (int)fb_get_height();
-    char clock[8], date[32];
-
-    draw_backdrop();
-    sys_format_clock(clock, sizeof(clock));
-    sys_format_date(date, sizeof(date));
-
-    fb_draw_text_scaled((W - fb_text_width(clock) * 6) / 2, H / 4, clock, 0x00FFFFFF, 6);
-    fb_draw_text_scaled((W - fb_text_width(date) * 2) / 2, H / 4 + 110, date, 0x00FFFFFF, 2);
-
-    int by = H - 200;
-    fb_fill_circle(W / 2, by, 28, T(ACCENT));
-    glyph_draw(GLYPH_USER, W / 2 - 14, by - 15, 28, T(ACCENT_TEXT), T(ACCENT));
-    ui_text_center(0, by + 40, W,
-                   g_kstate.username[0] ? g_kstate.username : "User", 0x00FFFFFF);
-
-    if (g_kstate.security_enabled && g_kstate.security_pin[0]) {
-        char dots[17];
-        int n = g_ui.pin_len;
-        for (int i = 0; i < n; i++) dots[i] = '*';
-        dots[n] = 0;
-        fb_fill_rounded_rect(W / 2 - 110, by + 66, 220, 34, 6, 0x00101820);
-        ui_text_center(0, by + 75, W, n ? dots : "Enter PIN", n ? 0x00FFFFFF : 0x008090A0);
-        if (g_ui.pin_wrong)
-            ui_text_center(0, by + 108, W, "Incorrect PIN", T(DANGER));
-    } else {
-        ui_text_center(0, by + 70, W, "Press any key or click to unlock", 0x00C0D0E0);
-    }
-}
+#include "login.c"
 
 void ui_shell_render_fullscreen(void)
 {
@@ -147,9 +119,9 @@ void ui_shell_render_fullscreen(void)
     ui_shell_ensure_init();
 
     switch (g_ui.mode) {
-    case UI_MODE_LOADING:
-    case UI_MODE_SETUP:   draw_loading(); break;
-    case UI_MODE_LOCK:    draw_lock();    break;
+    case UI_MODE_LOADING: draw_loading(); break;
+    case UI_MODE_SETUP:   login_draw_setup(); break;
+    case UI_MODE_LOCK:    login_draw_lock();  break;
     default: return;
     }
     fb_present();
@@ -193,9 +165,8 @@ void ui_shell_show_lock_screen(void)
 {
     ui_shell_ensure_init();
     g_ui.mode = UI_MODE_LOCK;
-    g_ui.pin_len = 0;
-    g_ui.pin_wrong = 0;
     ui_copy(g_ui.status, sizeof(g_ui.status), "LOCKED");
+    login_on_show_lock();
     desktop_invalidate();
 }
 
@@ -204,10 +175,8 @@ void ui_shell_show_setup_wizard(void)
     ui_shell_ensure_init();
     g_ui.mode = UI_MODE_SETUP;
     ui_copy(g_ui.status, sizeof(g_ui.status), "SETUP");
-    ui_copy(g_ui.setup_title, sizeof(g_ui.setup_title), "Preparing your profile");
-    ui_copy(g_ui.setup_detail, sizeof(g_ui.setup_detail),
-            "The desktop will open automatically after first-boot setup.");
-    ui_shell_draw_frame();
+    login_on_show_setup();
+    desktop_invalidate();
 }
 
 void ui_shell_unlock_desktop(void)
@@ -279,43 +248,36 @@ const char *ui_shell_get_line(int index_from_oldest)
     return g_ui.lines[(first + index_from_oldest) % UI_MAX_LINES];
 }
 
-/* ---- Lock screen input --------------------------------------------------- */
-/* Any key / click unlocks when no PIN is set; otherwise the PIN is typed and
- * confirmed with Enter. key == 0 means "mouse click". */
+/* ---- Sign-in / setup input ---------------------------------------------- */
+/* key: WM key code (8 Backspace, 10 Enter, 9 Tab, ...) or 0; ch: typed char */
 void ui_shell_lock_input(uint32_t key, char ch)
 {
-    if (g_ui.mode != UI_MODE_LOCK)
-        return;
+    if (g_ui.mode == UI_MODE_LOCK)       login_lock_input(key, ch);
+    else if (g_ui.mode == UI_MODE_SETUP) login_setup_input(key, ch);
+    desktop_invalidate();
+}
 
-    if (!(g_kstate.security_enabled && g_kstate.security_pin[0])) {
-        ui_shell_unlock_desktop();
-        return;
-    }
-
-    if (ch >= 32 && ch < 127) {
-        if (g_ui.pin_len < (int)sizeof(g_ui.pin_entry) - 1) {
-            g_ui.pin_entry[g_ui.pin_len++] = ch;
-            g_ui.pin_entry[g_ui.pin_len] = 0;
-        }
-        g_ui.pin_wrong = 0;
-    } else if (key == 8) {                      /* Backspace */
-        if (g_ui.pin_len > 0)
-            g_ui.pin_entry[--g_ui.pin_len] = 0;
-    } else if (key == 10) {                     /* Enter */
-        if (strcmp(g_ui.pin_entry, g_kstate.security_pin) == 0) {
-            ui_shell_unlock_desktop();
-        } else {
-            g_ui.pin_wrong = 1;
-            g_ui.pin_len = 0;
-            g_ui.pin_entry[0] = 0;
-        }
-    }
+void ui_shell_login_click(int x, int y)
+{
+    if (g_ui.mode == UI_MODE_LOCK)       login_lock_click(x, y);
+    else if (g_ui.mode == UI_MODE_SETUP) login_setup_click(x, y);
     desktop_invalidate();
 }
 
 /* ---- Mouse --------------------------------------------------------------- */
+static int g_mouse_speed = 2;           /* 1 slow, 2 normal, 3 fast, 4 fastest */
+static int g_mouse_swap = 0;            /* left-handed: swap the buttons */
+
+void ui_shell_set_mouse(int speed, int swap)
+{
+    g_mouse_speed = speed < 1 ? 1 : speed > 4 ? 4 : speed;
+    g_mouse_swap = swap ? 1 : 0;
+}
+
 void ui_shell_move_cursor(int dx, int dy)
 {
+    dx = dx * g_mouse_speed / 2;
+    dy = dy * g_mouse_speed / 2;
     uint32_t W = fb_get_width();
     uint32_t H = fb_get_height();
 
@@ -332,6 +294,7 @@ void ui_shell_move_cursor(int dx, int dy)
 
 void ui_shell_mouse_button(int button, int pressed)
 {
+    if (g_mouse_swap && (button == 1 || button == 2)) button = 3 - button;
     if (!desktop_system_is_initialized())
         return;
 
@@ -346,4 +309,11 @@ void ui_shell_click_cursor(void)
 {
     ui_shell_mouse_button(1, 1);
     ui_shell_mouse_button(1, 0);
+}
+
+/* Settings > Privacy: forget the conversation shown in the JARVIS window. */
+void ui_shell_clear_lines(void)
+{
+    g_ui.line_count = 0;
+    desktop_invalidate();
 }

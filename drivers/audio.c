@@ -701,6 +701,14 @@ void audio_set_volume(int percent)
     if (percent < 0)   percent = 0;
     if (percent > 100) percent = 100;
     terminal_printf("[AUDIO] Volume set to %d%%\n", percent);
+    if (ac97_ready) {
+        /* AC97 master and PCM out: 6-bit attenuation per channel (0 = loudest,
+         * 1.5 dB steps), bit 15 = mute. */
+        uint16_t att = (uint16_t)((100 - percent) * 63 / 100);
+        uint16_t v = percent == 0 ? 0x8000 : (uint16_t)((att << 8) | att);
+        ac97_codec_write(0x02, v);
+        ac97_codec_write(AC97_NAM_PCM_OUT_VOL, percent == 0 ? 0x8000 : (uint16_t)(((att / 2) << 8) | (att / 2)));
+    }
     /*
      * Real: send HDA verb to mixer widget to set amplifier gain.
      * Verb: SET_AMPLIFIER_GAIN_MUTE (0x3) with payload = volume level.

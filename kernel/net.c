@@ -496,15 +496,43 @@ void net_receive(const uint8_t *frame, size_t len)
 }
 
 /* ---- The network process ------------------------------------------------- */
+static int g_offline = 0;               /* airplane mode */
+
 static void net_process(void)
 {
     for (;;) {
         net_lock();
-        nic_poll();
-        dhcp_timer();
+        if (!g_offline) {
+            nic_poll();
+            dhcp_timer();
+        }
         net_unlock();
         kthread_sleep(1);
     }
+}
+
+/* Airplane mode: drop the address and stop all traffic; off again asks
+ * DHCP for a new address. */
+void net_set_offline(int off)
+{
+    if (g_lock < 0) return;
+    net_lock();
+    g_offline = off ? 1 : 0;
+    g_ip = 0;
+    g_dhcp_state = DHCP_IDLE;
+    for (int i = 0; i < ARP_CACHE; i++) g_arp[i].valid = 0;
+    net_unlock();
+}
+
+int net_is_offline(void) { return g_offline; }
+
+/* Ask DHCP for an address again (keeps the old one until answered). */
+void net_renew(void)
+{
+    if (g_lock < 0 || g_offline) return;
+    net_lock();
+    g_dhcp_state = DHCP_IDLE;
+    net_unlock();
 }
 
 void net_init(void)

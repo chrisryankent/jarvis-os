@@ -58,7 +58,7 @@ def serve(voice: str) -> int:
     import torch
     from kokoro import KModel, KPipeline
 
-    torch.set_num_threads(max(1, (os.cpu_count() or 4) // 2))
+    torch.set_num_threads(3)                    # share the CPU with speech recognition and the brain
     started = time.time()
     model = KModel(config=str(MODEL_DIR / "config.json"),
                    model=str(MODEL_DIR / "kokoro-v1_0.pth")).eval()

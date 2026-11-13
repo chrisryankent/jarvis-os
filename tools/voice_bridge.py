@@ -61,6 +61,7 @@ VOICE_PROFILE = Path(__file__).resolve().parent / "voice" / "profile.json"
 # JARVIS is talking (and for a moment after) the microphone is ignored, and
 # anything transcribed that matches what was just said is dropped. Without
 # this the bridge heard JARVIS's own voice and answered it, forever.
+VOICE_VOLUME = [1.0]                  # Settings > System > Sound (JARVIS voice)
 SEND_LOCK = threading.Lock()          # the brain and the bridge share the socket
 BRAIN = None                          # (GuestLink, ask queue) when the language model runs
 SPEAKING = threading.Event()
@@ -196,7 +197,7 @@ def speak_with_profile(text: str, profile: dict) -> bool:
             ready[i].wait()
             if clips[i] is None:
                 break
-            subprocess.run(["pw-play", str(clips[i])], check=False)
+            subprocess.run(["pw-play", "--volume", f"{VOICE_VOLUME[0]:.2f}", str(clips[i])], check=False)
             spoke = True
         worker.join(timeout=1)
         return spoke
@@ -214,7 +215,7 @@ def speak_host(text: str, wait: bool = True) -> None:
         profile = load_voice_profile()
         cached = cached_phrase(text, profile)
         if cached and shutil.which("pw-play"):
-            subprocess.run(["pw-play", str(cached)], check=False)   # pre-recorded, your voice
+            subprocess.run(["pw-play", "--volume", f"{VOICE_VOLUME[0]:.2f}", str(cached)], check=False)
             return
         if speak_with_profile(text, profile):
             return
@@ -236,10 +237,15 @@ def is_echo_of_speech(text: str, window: float = 20.0) -> bool:
     now = time.time()
     with SPOKEN_LOCK:
         recent = [spoken for when, spoken in RECENT_SPOKEN if now - when <= window]
+    stop = {"the", "a", "an", "to", "is", "i", "im", "you", "it", "and", "of", "what", "get", "go", "now", "this", "that"}
     for spoken in recent:
         spoken_words = set(spoken.split())
         hits = sum(1 for w in words if w in spoken_words)
         if hits / len(words) >= 0.6:
+            return True
+        # short phrases: any meaningful word JARVIS just said is enough ("Get ready." after "I'm ready")
+        content = [w for w in words if w not in stop]
+        if len(words) <= 3 and content and any(w in spoken_words for w in content):
             return True
     return False
 
@@ -270,6 +276,16 @@ def guest_reader(sock: socket.socket, args: argparse.Namespace, stop: threading.
                 continue
             if line.startswith("RESULT:") and BRAIN:
                 BRAIN[0].deliver(line)
+                continue
+            if line.startswith("PREF:"):
+                key, _, val = line[5:].strip().partition("=")
+                if key == "volume":
+                    VOICE_VOLUME[0] = max(0, min(100, int(val or 100))) / 100.0
+                elif key == "web" and BRAIN:
+                    BRAIN[2]["web"] = val == "1"
+                elif key == "forget" and BRAIN:
+                    BRAIN[2]["forget"] = True
+                print(f"[bridge] setting from JARVIS OS: {line[5:].strip()}", flush=True)
                 continue
             if line.startswith("SAY:"):
                 text = line[4:].strip()
@@ -466,7 +482,7 @@ def listen_utterances(target: str | None, max_seconds: float):
                 return
 
             # Deaf while JARVIS is speaking, and briefly after (room echo).
-            if SPEAKING.is_set() or time.time() - LAST_SPEECH_END[0] < 0.7:
+            if SPEAKING.is_set() or time.time() - LAST_SPEECH_END[0] < 1.5:
                 voiced.clear(); preroll.clear()
                 in_speech = False; loud_run = quiet_run = 0
                 continue
@@ -513,8 +529,10 @@ def write_wav(path: Path, pcm: bytes) -> None:
         w.writeframes(pcm)
 
 
-WHISPER_PROMPT = ("Jarvis, open terminal. Open files. Open settings. Show status. "
-                  "Lock the computer. What can you do? Shut down.")
+# Words JARVIS hears most: biases recognition towards them ("Notepad", not "not bad").
+WHISPER_PROMPT = ("Jarvis, open Notepad. Open Terminal. Open Files. Open Settings. Open Calculator. "
+                  "Open Tasks. Open Apps. Close Notepad. Show my Documents and Downloads. "
+                  "Search the internet for the news. Lock the computer. Shut down. Restart.")
 
 
 def transcribe_with_whisper(whisper_cli: str, model: str, wav: Path) -> str:
@@ -557,7 +575,7 @@ def run_whisper_loop(args: argparse.Namespace, sock: socket.socket) -> None:
     server_exe = Path(whisper_cli).with_name("whisper-server")
     if server_exe.exists():
         try:
-            server = WhisperServer(str(server_exe), args.model, max(1, (os.cpu_count() or 4) // 2))
+            server = WhisperServer(str(server_exe), args.model, 3)   # leave cores for the brain and voice
             print(f"[bridge] speech recognition: {Path(args.model).name}, kept loaded", flush=True)
         except RuntimeError as exc:
             print(f"[bridge] whisper-server unavailable ({exc}); loading the model per sentence", flush=True)

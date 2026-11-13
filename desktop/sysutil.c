@@ -89,15 +89,48 @@ static char *put2(char *p, int v)
     return p;
 }
 
+static int g_clock_24h = 1;
+void sys_set_clock_24h(int on) { g_clock_24h = on ? 1 : 0; }
+int  sys_clock_24h(void)       { return g_clock_24h; }
+
+/* "14:05", or "2:05 PM" with the 12-hour clock (needs n >= 9). */
 void sys_format_clock(char *buf, size_t n)
 {
     sys_time_t t;
     if (n < 6) { if (n) buf[0] = 0; return; }
     sys_get_time(&t);
+    if (!g_clock_24h && n >= 9) {
+        int h = t.hour % 12 ? t.hour % 12 : 12;
+        char *p = buf;
+        if (h >= 10) *p++ = (char)('0' + h / 10);
+        *p++ = (char)('0' + h % 10);
+        *p++ = ':';
+        p = put2(p, t.minute);
+        *p++ = ' '; *p++ = t.hour < 12 ? 'A' : 'P'; *p++ = 'M';
+        *p = 0;
+        return;
+    }
     char *p = put2(buf, t.hour);
     *p++ = ':';
     p = put2(p, t.minute);
     *p = 0;
+}
+
+/* The processor's own name, from CPUID (e.g. "Intel(R) Core(TM) i5-8250U"). */
+void sys_cpu_name(char *out, size_t n)
+{
+    uint32_t r[12];
+    uint32_t max;
+    __asm__ volatile ("cpuid" : "=a"(max) : "a"(0x80000000u) : "ebx", "ecx", "edx");
+    if (max < 0x80000004u || n < 2) { snprintf(out, n, "Unknown processor"); return; }
+    for (uint32_t i = 0; i < 3; i++)
+        __asm__ volatile ("cpuid" : "=a"(r[i * 4]), "=b"(r[i * 4 + 1]), "=c"(r[i * 4 + 2]), "=d"(r[i * 4 + 3])
+                          : "a"(0x80000002u + i));
+    const char *s = (const char *)r;
+    size_t k = 0, i = 0;
+    while (i < 48 && s[i] == ' ') i++;
+    for (; i < 48 && s[i] && k < n - 1; i++) out[k++] = s[i];    /* (no %.*s in the kernel printf) */
+    out[k] = 0;
 }
 
 void sys_format_date(char *buf, size_t n)

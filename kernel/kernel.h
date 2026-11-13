@@ -164,6 +164,9 @@ int  tcp_recv(int sock, void *buf, size_t max, int timeout_ms);
 void tcp_close(int sock);
 int  http_get(const char *url, void *buf, size_t max);
 int  net_command_start(const char *cmdline);            /* ping / nslookup / http / scan */
+void net_set_offline(int off);                          /* airplane mode */
+int  net_is_offline(void);
+void net_renew(void);                                   /* new DHCP request */
 int  nic_send(const uint8_t *frame, size_t len);
 void nic_poll(void);
 int  nic_link_up(void);
@@ -199,13 +202,48 @@ void devmgr_release_all(uint32_t pid);
 pci_device_t *pci_get(int index);           /* NULL past the last device */
 uint64_t irq_count(int irq_line);           /* interrupts seen on a PIC line */
 
+/* ---- Accounts, sign-in, settings (kernel/accounts.c) --------------------- */
+void        accounts_init(void);
+int         account_exists(void);
+const char *account_name(void);
+int         account_has_password(void);
+int         account_has_pin(void);
+int         account_has_voice(void);
+int         account_has_sign_in(void);
+int         account_create(const char *name, const char *password, const char *pin, const char *voice,
+                           char *err, size_t errn);
+int         account_set_name(const char *name);
+int         account_set_password(const char *password);        /* "" removes */
+int         account_set_pin(const char *pin, char *err, size_t errn);
+int         account_set_voice(const char *phrase, char *err, size_t errn);
+int         auth_check_typed(const char *secret);              /* password or PIN */
+int         auth_check_voice(const char *transcript);          /* 1 ok, 0 no, -1 paused */
+int         auth_wait_seconds(void);
+int         setting_get(const char *key, char *out, size_t n);
+int         setting_get_int(const char *key, int dflt);
+void        setting_set(const char *key, const char *value);
+void        setting_set_int(const char *key, int value);
+void        sha256(const void *data, size_t len, uint8_t out[32]);
+int         vfs_is_private(const char *path);                  /* /jarvis/system */
+void        ui_shell_voice_attempt(const char *text);
+void        ui_shell_login_click(int x, int y);
+void        ui_shell_voice_prompt(void);
+void        ui_shell_set_mouse(int speed, int swap);
+void        ui_shell_clear_lines(void);
+void        desktop_apply_settings(void);
+void        desktop_send_host_prefs(void);
+void        desktop_note_input(void);
+
 /* ---- Language model on the host, and its tools (kernel/ai_tools.c) -------- */
 int         ai_host_online(void);
 const char *ai_host_model(void);
 void        ai_host_ask(const char *text);
+void        ai_host_pref(const char *pref);
 int         ai_host_line(const char *line);         /* 1 if it was an AI line */
 int         ai_tools_pending(char *text, size_t n); /* an action awaiting Allow */
 void        ai_tools_confirm(int allow);
+int         ai_tools_ask_first(void);              /* ask before risky actions? */
+void        ai_tools_set_ask_first(int on);
 
 /* ---- Packages (kernel/pkg.c) ---------------------------------------------- */
 typedef struct {

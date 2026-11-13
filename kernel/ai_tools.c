@@ -15,10 +15,10 @@
  *                   RESULT:<id>:<text>       a tool's result ("\n" escaped)
  *
  * Every tool goes through the same kernel functions the apps use, so the AI
- * can do nothing the user could not. Destructive actions (deleting, ending
- * processes, uninstalling, overwriting files, shutting down) wait for the
- * user to press Allow in the JARVIS window. When the model is offline the
- * built-in commands keep working (see ai_host_online()).
+ * can do nothing the user could not. JARVIS has full control by default;
+ * Settings > System can make destructive actions (deleting, ending
+ * processes, uninstalling, overwriting, shutting down) wait for the user's
+ * Allow click. When the model is offline the built-in commands keep working.
  * =============================================================================
  */
 
@@ -36,6 +36,14 @@ void desktop_system_shutdown(void);
 void desktop_system_restart(void);
 
 static char g_model[48];
+
+/* Off by default: the owner gave JARVIS full control of the PC. When on,
+ * destructive actions wait for Allow in the JARVIS window. Deletions always
+ * go to the Recycle Bin, so they can be undone either way. */
+static int g_ask_first = 0;
+
+int  ai_tools_ask_first(void)       { return g_ask_first; }
+void ai_tools_set_ask_first(int on) { g_ask_first = on ? 1 : 0; }
 
 /* ==========================================================================
  * Line protocol helpers
@@ -65,6 +73,12 @@ static void send_line(const char *prefix, const char *text)
     out[n++] = '\n';
     out[n] = 0;
     voice_serial_puts(out);
+}
+
+/* Preferences the host needs: PREF:web=0/1, PREF:volume=NN, PREF:forget */
+void ai_host_pref(const char *pref)
+{
+    send_line("PREF:", pref);
 }
 
 void ai_host_ask(const char *text)
@@ -222,7 +236,8 @@ static void tool_find_files(const char *args, out_t *o)
             const char *eol = strchr(p, '\n');
             if (!eol) eol = p + strlen(p);
             const char *full = strchr(p, '/');
-            if (full && full < eol && strncmp(full, "/jarvis/models", 14) && strncmp(full, "/jarvis/trash", 13)) {
+            if (full && full < eol && strncmp(full, "/jarvis/models", 14) && strncmp(full, "/jarvis/trash", 13) &&
+                strncmp(full, "/jarvis/system", 14)) {
                 const char *leaf = full;
                 for (const char *s = full; s < eol; s++) if (*s == '/') leaf = s + 1;
                 char low[128];
@@ -395,7 +410,24 @@ static void run_tool(const char *id, const char *name, const char *args, int con
     char a[200], b[200], p1[200], p2[200], why[160];
     result[0] = 0;
 
-    if (!confirmed && needs_confirm(name, args, why, sizeof(why))) {
+    /* The account and settings folder is off limits, whatever the path. */
+    {
+        char raw[200], chk[200];
+        static const char *const keys[] = { "path", "from", "to" };
+        for (int i = 0; i < 3; i++) {
+            if (json_str(args, keys[i], raw, sizeof(raw)) && raw[0]) {
+                resolve(raw, chk, sizeof(chk));
+                if (vfs_is_private(chk)) {
+                    char head[48];
+                    snprintf(head, sizeof(head), "RESULT:%s:", id);
+                    send_line(head, "error: that is the protected system folder");
+                    return;
+                }
+            }
+        }
+    }
+
+    if (!confirmed && g_ask_first && needs_confirm(name, args, why, sizeof(why))) {
         g_pending.active = 1;
         snprintf(g_pending.id, sizeof(g_pending.id), "%s", id);
         snprintf(g_pending.name, sizeof(g_pending.name), "%s", name);
@@ -566,6 +598,12 @@ int ai_host_line(const char *line)
         memcpy(id, p, (size_t)(c1 - p)); id[c1 - p] = 0;
         memcpy(name, c1 + 1, (size_t)(c2 - c1 - 1)); name[c2 - c1 - 1] = 0;
         governor_ai_heartbeat();
+        if (!ui_shell_is_desktop()) {                       /* signed out: no actions */
+            char head[48];
+            snprintf(head, sizeof(head), "RESULT:%s:", id);
+            send_line(head, "error: the computer is locked");
+            return 1;
+        }
         if (g_pending.active) {                             /* one confirmation at a time */
             char head[48];
             snprintf(head, sizeof(head), "RESULT:%s:", id);

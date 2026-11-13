@@ -29,6 +29,7 @@
 #define E_FAULT   (uint64_t)-14
 #define E_INVAL   (uint64_t)-22
 #define E_NOSYS   (uint64_t)-38
+#define E_ACCES   (uint64_t)-13
 
 static void (*security_hook)(uint64_t nr, uint64_t *args) = NULL;
 
@@ -89,6 +90,7 @@ uint64_t syscall_handler(uint64_t nr,
 
     case 2: /* open(path, flags) — flags: 1 read, 2 write, 4 create, 8 append, 16 truncate */
         if (user_string(path, sizeof(path), a1) != 0) return E_FAULT;
+        if (vfs_is_private(path)) return E_ACCES;
         return (uint64_t)(int64_t)vfs_open(path, (uint32_t)a2);
 
     case 3: /* close(fd) */
@@ -122,10 +124,12 @@ uint64_t syscall_handler(uint64_t nr,
 
     case 83: /* mkdir(path) */
         if (user_string(path, sizeof(path), a1) != 0) return E_FAULT;
+        if (vfs_is_private(path)) return E_ACCES;
         return vfs_mkdir(path) == 0 ? 0 : E_INVAL;
 
     case 87: /* unlink(path) */
         if (user_string(path, sizeof(path), a1) != 0) return E_FAULT;
+        if (vfs_is_private(path)) return E_ACCES;
         return vfs_delete(path) == 0 ? 0 : E_NOENT;
 
     /* ---- JARVIS calls ---------------------------------------------------- */
