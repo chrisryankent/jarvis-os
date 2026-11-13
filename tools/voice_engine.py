@@ -56,6 +56,11 @@ def serve() -> int:
         print("[engine] another engine is already running; exiting", flush=True)
         return 0
 
+    # Plain resumable HTTPS downloads: progress is visible as a growing file
+    # and an interrupted download continues where it stopped.
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
+
     import torch
     import torchaudio
     from chatterbox.tts import ChatterboxTTS
