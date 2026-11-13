@@ -20,6 +20,13 @@
 
 typedef struct { int x, y, w, h; } rect_t;
 
+static int net_connected(void)
+{
+    net_info_t ni;
+    net_get_info(&ni);
+    return ni.configured;
+}
+
 static int rect_hit(const rect_t *r, int px, int py)
 {
     return ui_hit(px, py, r->x, r->y, r->w, r->h);
@@ -178,7 +185,7 @@ void taskbar_draw(void)
 
     /* ---- Network + volume ---- */
     glyph_draw(GLYPH_NET, g_tb.status.x + 6, g_tb.status.y + 12, 16,
-               g_kstate.network_ready ? T(TEXT) : T(TEXT_DIM), T(TASKBAR));
+               net_connected() ? T(TEXT) : T(TEXT_DIM), T(TASKBAR));
     glyph_draw(GLYPH_VOLUME, g_tb.status.x + 30, g_tb.status.y + 12, 16,
                g_kstate.audio_ready ? T(TEXT) : T(TEXT_DIM), T(TASKBAR));
 
@@ -431,8 +438,10 @@ void start_menu_draw(void)
                    g_kstate.speech_ready ? T(OK) : T(WARN));
         status_row(x + 36, card_y + 66, "Security", ui_shell_get_security_label(),
                    ui_shell_get_security_alert() ? T(DANGER) : T(OK));
-        status_row(x + 36 + half, card_y + 66, "Network", g_kstate.network_ready ? "Adapter up" : "Offline",
-                   g_kstate.network_ready ? T(OK) : T(TEXT_DIM));
+        net_info_t ni;
+        net_get_info(&ni);
+        status_row(x + 36 + half, card_y + 66, "Network", ni.configured ? "Connected" : ni.adapter ? "Not connected" : "No adapter",
+                   ni.configured ? T(OK) : T(TEXT_DIM));
     }
 
     /* ---- Footer: user + power ---- */

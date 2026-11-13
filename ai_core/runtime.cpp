@@ -114,48 +114,46 @@ static void fallback_reply(const char *user_input, char *out_buf, size_t out_max
     char normalized[512];
     normalize_prompt(user_input, normalized, sizeof(normalized));
 
+    /*
+     * Built-in replies, used until the language model runs. Keep them short
+     * and true: they are spoken aloud, and tools/voice_phrases.txt lists them
+     * so they can be pre-recorded in the owner's voice (make voice-render).
+     * The fallback no longer repeats what it heard: reading the transcript
+     * back made JARVIS answer its own voice in a loop.
+     */
     if (normalized[0] == '\0') {
-        copy_reply(out_buf, out_max, "I am listening.");
+        copy_reply(out_buf, out_max, "I'm listening.");
     } else if (has_phrase(normalized, "hello") ||
                has_phrase(normalized, "hi jarvis") ||
                has_phrase(normalized, "hey jarvis")) {
-        copy_reply(out_buf, out_max, "Hello. I am listening.");
+        copy_reply(out_buf, out_max, "Hello. How can I help?");
     } else if (has_phrase(normalized, "status") ||
                has_phrase(normalized, "system status") ||
                has_phrase(normalized, "how are you")) {
-        copy_reply(out_buf, out_max,
-            "System is online. Voice bridge, desktop, mouse input, audio output, and packaged models are visible.");
+        copy_reply(out_buf, out_max, "All systems are running. Details are in the task manager.");
     } else if (has_phrase(normalized, "settings")) {
-        copy_reply(out_buf, out_max,
-            "Opening Settings. Profile, voice, security, models, display, and network controls are staged.");
+        copy_reply(out_buf, out_max, "Opening Settings.");
     } else if (has_phrase(normalized, "file") || has_phrase(normalized, "files")) {
-        copy_reply(out_buf, out_max,
-            "Opening Files. The virtual file system and semantic search hooks are available.");
+        copy_reply(out_buf, out_max, "Opening Files.");
     } else if (has_phrase(normalized, "terminal") || has_phrase(normalized, "console")) {
-        copy_reply(out_buf, out_max,
-            "Opening Terminal. Debug commands and device checks are available.");
+        copy_reply(out_buf, out_max, "Opening Terminal.");
     } else if (has_phrase(normalized, "security") || has_phrase(normalized, "guard")) {
-        copy_reply(out_buf, out_max,
-            "Security center is active. Audit, network monitor, and disk encryption hooks are staged.");
+        copy_reply(out_buf, out_max, "Opening the security center.");
+    } else if (has_phrase(normalized, "network") || has_phrase(normalized, "internet")) {
+        copy_reply(out_buf, out_max, "For network details, open the terminal and type ifconfig.");
     } else if (has_phrase(normalized, "model") || has_phrase(normalized, "brain")) {
         copy_reply(out_buf, out_max,
-            "Brain, speech, voice, and wake models are visible. The next deep step is linking real llama and ONNX inference.");
+            "The language model is installed but not running yet, so I answer from my built-in commands.");
     } else if (has_phrase(normalized, "voice") || has_phrase(normalized, "microphone")) {
-        copy_reply(out_buf, out_max,
-            "Voice bridge is active. I am using host Whisper transcripts and host speech output for clearer conversation.");
+        copy_reply(out_buf, out_max, "I hear you through the microphone and answer out loud.");
     } else if (has_phrase(normalized, "cursor") || has_phrase(normalized, "mouse")) {
-        copy_reply(out_buf, out_max,
-            "The PS/2 cursor path is active. Say cursor up, cursor down, cursor left, cursor right, or click.");
+        copy_reply(out_buf, out_max, "Say cursor up, down, left or right, or say click.");
     } else if (has_phrase(normalized, "help") ||
                has_phrase(normalized, "what can you do")) {
         copy_reply(out_buf, out_max,
-            "You can ask for status, files, terminal, settings, security, models, voice, network, camera, cursor, or desktop.");
+            "You can say: open files, open terminal, open settings, status, lock, or shut down.");
     } else {
-        snprintf(out_buf, out_max,
-            "I heard: %.180s. I can help with status, files, settings, security, models, voice, and cursor commands.",
-            user_input ? user_input : "");
-        if (out_max > 0)
-            out_buf[out_max - 1] = '\0';
+        copy_reply(out_buf, out_max, "Sorry, I didn't catch that. Say help to hear what I can do.");
     }
 }
 

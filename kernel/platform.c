@@ -545,6 +545,14 @@ static const char *exception_name(uint64_t vector)
  * every one of the 256 vectors. See that file's header comment for the
  * exact register-save convention this relies on.
  */
+/* Interrupts received per PIC line (0-15), for the device manager. */
+static uint64_t g_irq_counts[16];
+
+uint64_t irq_count(int irq_line)
+{
+    return (irq_line >= 0 && irq_line < 16) ? g_irq_counts[irq_line] : 0;
+}
+
 void interrupt_dispatch(uint64_t vector, uint64_t error_code, uint64_t *frame)
 {
     if (vector < 0x20) {
@@ -630,6 +638,9 @@ void interrupt_dispatch(uint64_t vector, uint64_t error_code, uint64_t *frame)
     uint8_t fpu_raw[512 + 16];
     uint8_t *fpu_state = (uint8_t *)(((uintptr_t)fpu_raw + 15) & ~(uintptr_t)15);
     __asm__ volatile ("fxsave (%0)" : : "r"(fpu_state) : "memory");
+
+    if (vector >= 0x20 && vector < 0x30)
+        g_irq_counts[vector - 0x20]++;
 
     if (g_irq_handlers[vector])
         g_irq_handlers[vector]();

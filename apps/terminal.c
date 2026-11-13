@@ -173,6 +173,9 @@ static void cmd_help(void)
         "Programs: run <name>   (hello, counter, kernelpoke, privileged)\n"
         "Process:  ps   kill <pid>   suspend <pid>   resume <pid>\n"
         "          spawn cpu|sleeper|deadlock|memory|isolate\n"
+        "Disk:     df   sync   disks   sector <disk> <n>      Devices: devices\n"
+        "Network:  ifconfig   ping <host>   nslookup <host>   scan\n"
+        "          http <url> [file]   (plain http only; saves to data/<file>)\n"
         "System:   status   uptime   date   clear   echo <text>\n"
         "Desktop:  apps   open <app>   theme dark|light|hc   notify <text>\n"
         "JARVIS:   ask <question>\n"
@@ -246,7 +249,13 @@ static void cmd_status(void)
     snprintf(buf, sizeof(buf), "  Security   %s (lock %s)\n", ui_shell_get_security_label(),
              g_kstate.security_enabled ? "on" : "off");
     terminal_app_write(buf);
-    snprintf(buf, sizeof(buf), "  Network    %s\n", g_kstate.network_ready ? "adapter up" : "offline");
+    {
+        net_info_t ni; char ip[16];
+        net_get_info(&ni);
+        net_format_ip(ni.ip, ip, sizeof(ip));
+        snprintf(buf, sizeof(buf), "  Network    %s%s\n", !ni.adapter ? "no adapter" : !ni.link ? "cable unplugged"
+                 : !ni.configured ? "waiting for DHCP" : "connected, ", ni.configured ? ip : "");
+    }
     terminal_app_write(buf);
     snprintf(buf, sizeof(buf), "  Display    %ux%u, %d window(s)\n",
              fb_get_width(), fb_get_height(), wm_count_windows());
@@ -290,7 +299,10 @@ void terminal_app_execute_command(const char *cmd)
                                                                : "touch: failed\n");
     } else if (strcmp(verb, "rm") == 0) {
         term_resolve(rest, path, sizeof(path));
-        terminal_app_write(*rest && vfs_delete(path) == 0 ? "Deleted.\n" : "rm: not found\n");
+        if (fatfs_owns(path))
+            terminal_app_write("rm: USB drives are read-only in this version\n");
+        else
+            terminal_app_write(*rest && vfs_delete(path) == 0 ? "Deleted.\n" : "rm: not found\n");
     } else if (strcmp(verb, "mv") == 0 || strcmp(verb, "cp") == 0) {
         char a[64] = {}, to[128];
         const char *sp = strchr(rest, ' ');
@@ -328,6 +340,110 @@ void terminal_app_execute_command(const char *cmd)
         int rc = verb[0] == 'k' ? proc_kill(pid)
                : verb[0] == 's' ? proc_suspend(pid) : proc_resume(pid);
         terminal_app_write(rc == 0 ? "OK\n" : "Failed: no such process, or it is protected.\n");
+    } else if (strcmp(verb, "ifconfig") == 0 || strcmp(verb, "ipconfig") == 0) {
+        net_info_t ni;
+        char a[16], b[16];
+        net_get_info(&ni);
+        if (!ni.adapter) {
+            terminal_app_write("No network adapter.\n");
+        } else {
+            snprintf(buf, sizeof(buf), "Ethernet  %02x:%02x:%02x:%02x:%02x:%02x  cable %s\n", ni.mac[0], ni.mac[1],
+                     ni.mac[2], ni.mac[3], ni.mac[4], ni.mac[5], ni.link ? "connected" : "unplugged");
+            terminal_app_write(buf);
+            if (ni.configured) {
+                net_format_ip(ni.ip, a, sizeof(a)); net_format_ip(ni.mask, b, sizeof(b));
+                snprintf(buf, sizeof(buf), "  Address  %s   Mask %s\n", a, b); terminal_app_write(buf);
+                net_format_ip(ni.gateway, a, sizeof(a)); net_format_ip(ni.dns, b, sizeof(b));
+                snprintf(buf, sizeof(buf), "  Gateway  %s   DNS  %s\n", a, b); terminal_app_write(buf);
+            } else {
+                terminal_app_write("  No address yet (waiting for DHCP)\n");
+            }
+            snprintf(buf, sizeof(buf), "  Frames   %u received, %u sent\n", (unsigned)ni.rx_frames, (unsigned)ni.tx_frames);
+            terminal_app_write(buf);
+        }
+    } else if (strcmp(verb, "ping") == 0 || strcmp(verb, "nslookup") == 0 ||
+               strcmp(verb, "http") == 0 || strcmp(verb, "scan") == 0) {
+        if (net_command_start(cmd) != 0)
+            terminal_app_write("Another network command is still running.\n");
+    } else if (strcmp(verb, "devices") == 0) {
+        static dev_info_t devs[48];
+        static const char *const states[3] = { "working", "NO DRIVER", "NOT WORKING" };
+        int n = devmgr_list(devs, 48);
+        for (int i = 0; i < n; i++) {
+            snprintf(buf, sizeof(buf), "  %s [%s] %s%s%s\n", devs[i].name,
+                     devs[i].driver[0] ? devs[i].driver : "-", states[devs[i].state],
+                     devs[i].note[0] ? ", " : "", devs[i].note);
+            terminal_app_write(buf);
+        }
+    } else if (strcmp(verb, "crc32") == 0) {
+        /* crc32 <file>: checksum of the whole file (same as zlib / cksum -a crc32b) */
+        term_resolve(rest, path, sizeof(path));
+        long size = vfs_size(path);
+        uint8_t *data = (size > 0 && size < (64L << 20)) ?
+            (uint8_t *)(size >= (long)LARGE_ALLOC_THRESHOLD ? kmalloc_large((size_t)size + 1) : kmalloc((size_t)size + 1)) : NULL;
+        if (!*rest || vfs_is_dir(path) || !data || vfs_read_file(path, (char *)data, (size_t)size + 1) != size) {
+            terminal_app_write(size == 0 ? "crc32: file is empty\n" : "crc32: cannot read that file\n");
+        } else {
+            uint32_t crc = 0xFFFFFFFFu;
+            for (long i = 0; i < size; i++) {
+                crc ^= data[i];
+                for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1)));
+            }
+            crc = ~crc;
+            static const char hx[] = "0123456789abcdef";
+            char h[9];
+            for (int k = 0; k < 8; k++) h[k] = hx[(crc >> (28 - 4 * k)) & 15];
+            h[8] = 0;
+            snprintf(buf, sizeof(buf), "%s  %u bytes  %s\n", h, (unsigned)size, path);
+            terminal_app_write(buf);
+        }
+        if (data) { if (size >= (long)LARGE_ALLOC_THRESHOLD) kfree_large(data, (size_t)size + 1); else kfree(data); }
+    } else if (strcmp(verb, "disks") == 0) {
+        for (int i = 0; i < block_count(); i++) {
+            block_info_t b;
+            if (block_get_info(i, &b) != 0) continue;
+            snprintf(buf, sizeof(buf), "  %d  %s  %u MB  %s%s\n", i, b.name,
+                     (unsigned)(b.sectors / 2048), b.model, b.errors ? "  (has had I/O errors)" : "");
+            terminal_app_write(buf);
+        }
+        if (!block_count()) terminal_app_write("No disks.\n");
+    } else if (strcmp(verb, "sector") == 0) {
+        /* sector <disk number> <sector>: show the first 64 bytes */
+        static uint8_t sec[512];
+        uint32_t dev = 0, lba = 0;
+        const char *q = rest;
+        while (*q >= '0' && *q <= '9') dev = dev * 10 + (uint32_t)(*q++ - '0');
+        while (*q == ' ') q++;
+        while (*q >= '0' && *q <= '9') lba = lba * 10 + (uint32_t)(*q++ - '0');
+        if (!*rest || block_read((int)dev, lba, 1, sec) != 0) {
+            terminal_app_write("usage: sector <disk> <sector>   (read failed)\n");
+        } else {
+            static const char hex[] = "0123456789abcdef";
+            for (int row = 0; row < 4; row++) {
+                char *o = buf;
+                *o++ = ' '; *o++ = ' '; *o++ = hex[(row * 16) >> 4 & 15]; *o++ = '0'; *o++ = ' ';
+                for (int i = 0; i < 16; i++) {      /* (the kernel printf has no %02x) */
+                    *o++ = hex[sec[row * 16 + i] >> 4]; *o++ = hex[sec[row * 16 + i] & 15]; *o++ = ' ';
+                }
+                for (int i = 0; i < 16; i++) { uint8_t c = sec[row * 16 + i]; *o++ = (c >= 32 && c < 127) ? (char)c : '.'; }
+                *o++ = '\n'; *o = 0;
+                terminal_app_write(buf);
+            }
+        }
+    } else if (strcmp(verb, "df") == 0) {
+        diskfs_stats_t st;
+        if (diskfs_get_stats(&st) != 0) {
+            terminal_app_write("No disk mounted: files are in memory only.\n");
+        } else {
+            snprintf(buf, sizeof(buf), "%s  %s\n", st.device, st.model);
+            terminal_app_write(buf);
+            snprintf(buf, sizeof(buf), "  %u MB total, %u KB used, %d items\n",
+                     (unsigned)(st.total_bytes >> 20), (unsigned)(st.used_bytes >> 10), st.items);
+            terminal_app_write(buf);
+        }
+    } else if (strcmp(verb, "sync") == 0) {
+        snprintf(buf, sizeof(buf), "%d item(s) written to disk.\n", diskfs_sync());
+        terminal_app_write(buf);
     } else if (strcmp(verb, "run") == 0) {
         /* Programs live in /jarvis/bin unless a path is given. */
         if (strchr(rest, '/')) term_resolve(rest, path, sizeof(path));

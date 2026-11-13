@@ -84,6 +84,7 @@ typedef struct pci_device {
     uint8_t  class_code, subclass;
     uint32_t bar[6];
     uint8_t  irq;
+    uint8_t  prog_if;               /* programming interface (0x30 = xHCI) */
 } pci_device_t;
 
 /* ---- VMM flags ----------------------------------------------------------- */
@@ -141,6 +142,112 @@ int      vm_reclaim(int id, int max_pages, int force);     /* evict to swap */
 int      vm_handle_fault(int id, uint64_t addr, uint64_t error_code);
 void     vm_get_stats(vm_stats_t *out);
 int      vm_space_list(vm_space_info_t *out, int max);
+
+/* ---- Networking (drivers/nic.c, kernel/net.c) ----------------------------- */
+typedef struct {
+    int      adapter;               /* a supported network card exists */
+    int      link;                  /* cable connected                 */
+    int      configured;            /* has an address from DHCP        */
+    uint32_t ip, mask, gateway, dns;    /* host byte order: a.b.c.d = a<<24 | ... */
+    uint8_t  mac[6];
+    uint64_t rx_frames, tx_frames;
+} net_info_t;
+void net_init(void);
+void net_receive(const uint8_t *frame, size_t len);
+void net_get_info(net_info_t *out);
+void net_format_ip(uint32_t ip, char *out, size_t n);
+int  net_ping(uint32_t ip, int timeout_ms);             /* ms, or -1 */
+int  dns_resolve(const char *hostname, uint32_t *out_ip);
+int  tcp_connect(uint32_t ip, uint16_t port);           /* socket, or -1 */
+int  tcp_send(int sock, const void *data, size_t len);
+int  tcp_recv(int sock, void *buf, size_t max, int timeout_ms);
+void tcp_close(int sock);
+int  http_get(const char *url, void *buf, size_t max);
+int  net_command_start(const char *cmdline);            /* ping / nslookup / http / scan */
+int  nic_send(const uint8_t *frame, size_t len);
+void nic_poll(void);
+int  nic_link_up(void);
+void nic_get_mac(uint8_t out[6]);
+void nic_get_counters(uint64_t *rx, uint64_t *tx);
+
+/* ---- Device manager (kernel/devmgr.c) ------------------------------------- */
+enum { DEV_WORKING = 0, DEV_NO_DRIVER, DEV_FAILED };
+typedef struct {
+    int      id;
+    char     name[48];
+    char     type[12];              /* Storage, Network, Audio, ... */
+    char     location[24];          /* "PCI 0:3.0", "PS/2 port 1"   */
+    char     driver[16];            /* "" = no driver               */
+    char     note[40];
+    uint16_t vendor_id, device_id;
+    int      state;                 /* DEV_*                        */
+    int      irq;                   /* -1 = none                    */
+    uint64_t interrupts;            /* raised since boot            */
+    uint32_t owner_pid;             /* 0 = not claimed              */
+} dev_info_t;
+int  usb_device_count(void);
+int  usb_device_info(int i, char *name, size_t name_len, char *driver, size_t drv_len,
+                     uint16_t *vendor, uint16_t *product, int *port);
+void devmgr_init(void);
+int  devmgr_list(dev_info_t *out, int max);
+int  devmgr_claim(int id, uint32_t pid);
+int  devmgr_release(int id, uint32_t pid);
+void devmgr_release_all(uint32_t pid);
+pci_device_t *pci_get(int index);           /* NULL past the last device */
+uint64_t irq_count(int irq_line);           /* interrupts seen on a PIC line */
+
+/* ---- FAT volumes on USB drives, read-only (kernel/fatfs.c) ---------------- */
+void fatfs_mount_all(void);
+int  fatfs_owns(const char *path);
+int  fatfs_stat(const char *path, int *is_dir, uint32_t *size);
+int  fatfs_list(const char *path, char *buf, size_t max);
+int  fatfs_read(const char *path, uint64_t offset, void *buf, size_t len);
+int  fatfs_volume_info(int i, char *mount, size_t mlen, char *label, size_t llen, uint64_t *bytes);
+void vfs_mount_point(const char *path);
+
+/* ---- Block devices (kernel/block.c) --------------------------------------- */
+typedef struct {
+    char     name[16];              /* sd0, sd1, ... */
+    char     model[41];
+    uint64_t sectors;               /* 512 bytes each */
+    uint64_t sectors_read, sectors_written;
+    uint32_t errors;
+} block_info_t;
+int  block_register(const char *name, const char *model, uint64_t sectors,
+                    int (*read)(void *, uint64_t, uint32_t, void *),
+                    int (*write)(void *, uint64_t, uint32_t, const void *),
+                    int (*flush)(void *), void *ctx);
+int  block_count(void);
+int  block_get_info(int dev, block_info_t *out);
+int  block_read(int dev, uint64_t lba, uint32_t count, void *buf);
+int  block_write(int dev, uint64_t lba, uint32_t count, const void *buf);
+int  block_flush(int dev);
+uint64_t pmm_alloc_contiguous(uint64_t pages);
+
+/* ---- On-disk file system (kernel/diskfs.c) -------------------------------- */
+typedef struct {
+    int      mounted;
+    char     device[16];
+    char     model[41];
+    uint64_t total_bytes, used_bytes;
+    int      items;
+} diskfs_stats_t;
+void diskfs_mount(void);            /* load saved files; formats a blank disk */
+int  diskfs_sync(void);             /* write changes; returns items written   */
+int  diskfs_get_stats(diskfs_stats_t *out);
+
+typedef struct {
+    char     path[256];
+    size_t   size;
+    int      is_dir, dirty, disk_idx;
+    uint32_t gen;
+} vfs_slot_info_t;
+int      vfs_slot_max(void);
+int      vfs_slot_info(int slot, vfs_slot_info_t *out);
+int      vfs_slot_read(int slot, uint64_t offset, void *buf, size_t len, uint32_t gen);
+void     vfs_slot_synced(int slot, int disk_idx, uint32_t gen);
+int      vfs_take_deleted(int *disk_idx);
+uint8_t *vfs_restore_node(const char *path, int is_dir, size_t size, int disk_idx);
 
 /* ---- Resource governor (kernel/governor.c) -------------------------------- */
 enum { GOV_SET_PRIORITY = 1, GOV_SUSPEND, GOV_RESUME, GOV_TERMINATE, GOV_RECLAIM };

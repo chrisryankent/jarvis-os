@@ -96,8 +96,21 @@ static void draw_system(int x, int y, int w)
     info_row(x + 24, y + 112, "Uptime", buf);
     snprintf(buf, sizeof(buf), "%u MB", (unsigned)(g_kstate.model_pool_size >> 20));
     info_row(x + 24, y + 136, "AI model pool", buf);
-    info_row(x + 24, y + 160, "Audio", g_kstate.audio_ready ? "Ready" : "No device found");
-    info_row(x + 24, y + 184, "Network", g_kstate.network_ready ? "Adapter up (no DHCP yet)" : "Offline");
+    diskfs_stats_t disk;
+    if (diskfs_get_stats(&disk) == 0)
+        snprintf(buf, sizeof(buf), "%s: %u MB, %u KB used", disk.model,
+                 (unsigned)(disk.total_bytes >> 20), (unsigned)(disk.used_bytes >> 10));
+    else
+        snprintf(buf, sizeof(buf), "No disk (files are not saved)");
+    info_row(x + 24, y + 160, "Storage", buf);
+    {
+        net_info_t ni; char ip[16];
+        net_get_info(&ni);
+        net_format_ip(ni.ip, ip, sizeof(ip));
+        snprintf(buf, sizeof(buf), "%s%s", !ni.adapter ? "No adapter" : !ni.link ? "Cable unplugged"
+                 : !ni.configured ? "Waiting for an address" : "Connected, ", ni.configured ? ip : "");
+        info_row(x + 24, y + 184, "Network", buf);
+    }
 
     ui_button(x + 24,  y + 224, 110, 32, "Lock",      T(HOVER), T(TEXT));
     ui_button(x + 144, y + 224, 110, 32, "Restart",   T(HOVER), T(TEXT));

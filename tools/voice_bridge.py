@@ -10,6 +10,9 @@ microphone transcripts, separate from the COM1 debug terminal.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import http.client
+import uuid
 import array
 import collections
 import json
@@ -117,6 +120,19 @@ def host_tts_available() -> bool:
     return bool(load_voice_profile().get("tts_cmd")) or shutil.which("spd-say") is not None
 
 
+def phrase_key(text: str) -> str:
+    """Cache file name for a sentence: shared with voice_engine.py --render."""
+    return hashlib.sha1(normalize_text(text).encode()).hexdigest()[:16]
+
+
+def cached_phrase(text: str, profile: dict) -> Path | None:
+    cache = profile.get("cache_dir")
+    if not cache:
+        return None
+    path = Path(cache) / f"{phrase_key(text)}.wav"
+    return path if path.exists() else None
+
+
 def speak_with_profile(text: str, profile: dict) -> bool:
     """Speak with the configured voice engine (e.g. a voice-cloning TTS using
     the owner's recorded reference). The command comes from profile.json and
@@ -155,7 +171,12 @@ def speak_host(text: str, wait: bool = True) -> None:
         RECENT_SPOKEN.append((time.time(), normalize_text(text)))
     SPEAKING.set()
     try:
-        if speak_with_profile(text, load_voice_profile()):
+        profile = load_voice_profile()
+        cached = cached_phrase(text, profile)
+        if cached and shutil.which("pw-play"):
+            subprocess.run(["pw-play", str(cached)], check=False)   # pre-recorded, your voice
+            return
+        if speak_with_profile(text, profile):
             return
         if shutil.which("spd-say"):
             # -w: block until finished, so SPEAKING covers the whole utterance.
@@ -243,6 +264,67 @@ def find_whisper_cli(explicit: str | None) -> str | None:
         if path:
             return path
     return None
+
+
+MODEL_PREFERENCE = ("ggml-small.en.bin", "ggml-base.en.bin", "ggml-medium.en.bin")
+
+
+def pick_model(explicit: str | None) -> str | None:
+    """The given model, or the best installed one for live use: small.en
+    balances accuracy and speed on a laptop CPU; medium.en is accurate but
+    takes close to a minute per sentence there."""
+    if explicit:
+        return explicit
+    stt = Path(__file__).resolve().parent / "models" / "stt"
+    for name in MODEL_PREFERENCE:
+        if (stt / name).exists():
+            return str(stt / name)
+    return None
+
+
+class WhisperServer:
+    """whisper.cpp's server, started once and kept running, so the model is
+    loaded a single time instead of once per sentence."""
+
+    def __init__(self, exe: str, model: str, threads: int):
+        self.port = 8178
+        log = open(Path(tempfile.gettempdir()) / "jarvis-whisper.log", "ab")
+        self.proc = subprocess.Popen(
+            [exe, "-m", model, "-t", str(threads), "--host", "127.0.0.1", "--port", str(self.port),
+             "-l", "en", "-nf", "-sns", "--prompt", WHISPER_PROMPT],
+            stdout=log, stderr=log, stdin=subprocess.DEVNULL)
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                raise RuntimeError("whisper-server exited (port in use, or bad model?)")
+            try:
+                with socket.create_connection(("127.0.0.1", self.port), timeout=1):
+                    return
+            except OSError:
+                time.sleep(0.5)
+        raise RuntimeError("whisper-server did not start")
+
+    def transcribe(self, wav: Path) -> str:
+        boundary = uuid.uuid4().hex
+        fields = {"response_format": "text", "temperature": "0.0"}
+        body = b""
+        for name, value in fields.items():
+            body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n"
+                     f"{value}\r\n").encode()
+        body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n"
+                 f"Content-Type: audio/wav\r\n\r\n").encode() + wav.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=300)
+        try:
+            conn.request("POST", "/inference", body, {"Content-Type": f"multipart/form-data; boundary={boundary}"})
+            resp = conn.getresponse()
+            text = resp.read().decode("utf-8", errors="ignore")
+            return text.strip() if resp.status == 200 else ""
+        finally:
+            conn.close()
+
+    def close(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.terminate()
 
 
 def normalize_text(text: str) -> str:
@@ -417,8 +499,18 @@ def run_whisper_loop(args: argparse.Namespace, sock: socket.socket) -> None:
             "[bridge] No whisper-cli found. Build whisper.cpp or pass --whisper-cli /path/to/whisper-cli."
         )
 
-    if not Path(args.model).exists():
+    args.model = pick_model(args.model)
+    if not args.model or not Path(args.model).exists():
         raise SystemExit(f"[bridge] Whisper model not found: {args.model}")
+
+    server = None
+    server_exe = Path(whisper_cli).with_name("whisper-server")
+    if server_exe.exists():
+        try:
+            server = WhisperServer(str(server_exe), args.model, max(1, (os.cpu_count() or 4) // 2))
+            print(f"[bridge] speech recognition: {Path(args.model).name}, kept loaded", flush=True)
+        except RuntimeError as exc:
+            print(f"[bridge] whisper-server unavailable ({exc}); loading the model per sentence", flush=True)
 
     wake_words = tuple(args.wake_word or DEFAULT_WAKE_WORDS)
     require_wake = args.require_wake and not args.no_wake
@@ -455,7 +547,10 @@ def run_whisper_loop(args: argparse.Namespace, sock: socket.socket) -> None:
         with tempfile.TemporaryDirectory(prefix="jarvis-voice-") as tmp:
             wav = Path(tmp) / "utterance.wav"
             write_wav(wav, pcm)
-            transcript = transcribe_with_whisper(whisper_cli, args.model, wav)
+            started = time.time()
+            transcript = (server.transcribe(wav) if server
+                          else transcribe_with_whisper(whisper_cli, args.model, wav))
+            print(f"[bridge] heard in {time.time() - started:.1f}s: {transcript!r}", flush=True)
             transcript = clean_transcript(transcript)
             if not transcript:
                 continue
@@ -496,7 +591,8 @@ def run_stdin_loop(sock: socket.socket) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Send host STT transcripts to JARVIS OS over QEMU COM2.")
     parser.add_argument("--socket", default="/tmp/jarvis-voice.sock", help="QEMU COM2 Unix socket.")
-    parser.add_argument("--model", default="tools/models/stt/ggml-medium.en.bin", help="Whisper model path.")
+    parser.add_argument("--model", default=None,
+                        help="Whisper model path (default: best installed of small.en, base.en, medium.en).")
     parser.add_argument("--whisper-cli", help="Path to whisper.cpp whisper-cli.")
     parser.add_argument("--seconds", type=float, default=4.0, help="Longest single utterance, in seconds (minimum 12).")
     parser.add_argument("--hold", type=float, default=1.0, help="Seconds to keep the socket open after --once.")

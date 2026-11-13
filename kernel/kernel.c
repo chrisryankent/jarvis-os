@@ -106,6 +106,10 @@ void jarvis_kernel_main(void)
     interrupt_init();     /* IDT, PIC remapping, timer IRQ0 wired to AI tick */
     device_init();        /* PCI scan, AHCI, USB, NIC, audio, GPU framebuf   */
     vfs_init();           /* ramfs, model slots, user data folders */
+    devmgr_init();                 /* table of every device and its driver */
+    net_init();                    /* network process: DHCP, then ready for use */
+    diskfs_mount();                /* files saved on disk by earlier sessions */
+    fatfs_mount_all();             /* USB flash drives -> /jarvis/usb0, ... */
     usermode_install_programs();   /* bundled user programs -> /jarvis/bin */
     ui_shell_show_loading_desktop();
 

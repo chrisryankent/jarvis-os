@@ -144,3 +144,11 @@ int __isoc23_sscanf(const char *str, const char *fmt, ...)
     return count;
 }
 
+
+int memcmp(const void *a, const void *b, size_t n)
+{
+    const unsigned char *x = (const unsigned char *)a, *y = (const unsigned char *)b;
+    for (size_t i = 0; i < n; i++)
+        if (x[i] != y[i]) return (int)x[i] - (int)y[i];
+    return 0;
+}

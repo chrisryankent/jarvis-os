@@ -212,6 +212,11 @@ static uint32_t quantum_ticks_for(proc_prio_t prio)
     }
 }
 
+static uint64_t proc_stack_top(process_t *p)
+{
+    return (uint64_t)(p->stack + PROC_STACK_SIZE) & ~0xFULL;
+}
+
 static process_t *proc_by_pid(uint32_t pid)
 {
     if (pid == 0) return NULL;
@@ -304,7 +309,7 @@ static void schedule(void)
 
     /* Interrupts and system calls arriving from user mode must land on the
      * next process's own kernel stack. */
-    usermode_set_kernel_stack((uint64_t)(next->stack + PROC_STACK_SIZE));
+    usermode_set_kernel_stack(proc_stack_top(next));
 
     /* Enter the next process's address space. Kernel memory (including both
      * stacks) is mapped identically in all of them. */
@@ -414,7 +419,9 @@ uint32_t proc_spawn(const char *name, void (*fn)(void), int prio, uint32_t flags
         /* Initial frame: what context_switch_asm pops (r15, r14, r13, r12,
          * rbx, rbp) and then `ret`s into. The slot below the return address
          * keeps the stack 16-byte aligned at function entry. */
-        uint64_t *sp = (uint64_t *)(p->stack + PROC_STACK_SIZE);
+        /* The ABI needs a 16-byte aligned stack (SSE instructions fault
+         * otherwise); the stack array itself has no particular alignment. */
+        uint64_t *sp = (uint64_t *)proc_stack_top(p);
         *--sp = 0;
         *--sp = (uint64_t)proc_trampoline;
         for (int i = 0; i < 6; i++) *--sp = 0;
@@ -470,6 +477,7 @@ uint32_t kthread_current_pid(void)
 /* Release everything a dying process holds so nobody waits on it forever. */
 static void proc_release_resources(process_t *p)
 {
+    devmgr_release_all(p->pid);         /* devices it had claimed */
     if (p->vm_space) {
         vm_space_destroy(p->vm_space);  /* returns its frames and swap slots */
         p->vm_space = 0;

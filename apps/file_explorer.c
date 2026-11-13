@@ -109,7 +109,7 @@ static int fx_is_protected(const char *path)
     };
     for (size_t i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++)
         if (strcmp(path, fixed[i]) == 0) return 1;
-    return fx_under(path, "/jarvis/models");
+    return fx_under(path, "/jarvis/models") || fatfs_owns(path);   /* USB drives are read-only */
 }
 
 /* Builds dir/name; if that exists, "name (2)", "name (3)"... keeping the

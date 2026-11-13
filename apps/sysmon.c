@@ -228,6 +228,17 @@ static void mon_stat(int x, int y, int w, const char *label, const char *value)
     fb_draw_text_bold(x + 12, y + 30, value, T(TEXT));
 }
 
+static const char *net_status_text(void)
+{
+    static char buf[40];
+    net_info_t ni; char ip[16];
+    net_get_info(&ni);
+    net_format_ip(ni.ip, ip, sizeof(ip));
+    snprintf(buf, sizeof(buf), "%s%s", !ni.adapter ? "No adapter" : !ni.link ? "Cable unplugged"
+             : !ni.configured ? "Waiting for an address" : "Connected, ", ni.configured ? ip : "");
+    return buf;
+}
+
 static void mon_device(int x, int y, const char *name, int ok, const char *detail)
 {
     fb_fill_circle(x + 6, y + 8, 5, ok ? T(OK) : T(TEXT_DIM));
@@ -282,11 +293,49 @@ static void draw_overview(int x, int y, int w)
     mon_device(x + 16, dy, "Speech", g_kstate.speech_ready,
                g_kstate.speech_ready ? "Pipeline ready" : "Loading");          dy += 22;
     mon_device(x + 16, dy, "Network", g_kstate.network_ready,
-               g_kstate.network_ready ? "Adapter up, no DHCP yet" : "No adapter"); dy += 22;
+               net_status_text()); dy += 22;
     mon_device(x + 16, dy, "Audio", g_kstate.audio_ready,
                g_kstate.audio_ready ? "Ready" : "No audio controller");        dy += 22;
     mon_device(x + 16, dy, "Microphone", g_kstate.mic_ready,
                g_kstate.mic_ready ? "Capturing" : "Not available");
+}
+
+static void draw_devices(int x, int y, int w, int h)
+{
+    static dev_info_t devs[48];
+    static const char *const states[3] = { "Working", "No driver", "Not working" };
+    char buf[48];
+    int n = devmgr_list(devs, 48);
+    int c_name = x + 16, c_type = x + 250, c_drv = x + 330, c_state = x + 430;
+    int c_irq = x + w - 110;
+
+    fb_draw_text(c_name, y + 8, "Device", T(TEXT_DIM));
+    fb_draw_text(c_type, y + 8, "Type", T(TEXT_DIM));
+    fb_draw_text(c_drv, y + 8, "Driver", T(TEXT_DIM));
+    fb_draw_text(c_state, y + 8, "Status", T(TEXT_DIM));
+    fb_draw_text(c_irq, y + 8, "Interrupts", T(TEXT_DIM));
+    fb_fill_rect(x + 8, y + 30, w - 16, 1, T(BORDER));
+
+    fb_clip_t saved = fb_get_clip();
+    fb_set_clip(x, y + 32, w, h - 34);
+    int ry = y + 36;
+    for (int i = 0; i < n; i++, ry += 22) {
+        dev_info_t *d = &devs[i];
+        uint32_t col = d->state == DEV_WORKING ? T(OK) : d->state == DEV_NO_DRIVER ? T(WARN) : T(DANGER);
+
+        fb_fill_circle(c_name + 5, ry + 8, 4, col);
+        ui_text_fit(c_name + 16, ry, c_type - c_name - 24, d->name, T(TEXT));
+        fb_draw_text(c_type, ry, d->type, T(TEXT_DIM));
+        fb_draw_text(c_drv, ry, d->driver[0] ? d->driver : "-", T(TEXT_DIM));
+        if (d->owner_pid) snprintf(buf, sizeof(buf), "In use by PID %u", d->owner_pid);
+        else              snprintf(buf, sizeof(buf), "%s", states[d->state]);
+        ui_text_fit(c_state, ry, c_irq - c_state - 8, buf, d->state == DEV_WORKING ? T(TEXT) : col);
+        if (d->irq >= 0) {
+            snprintf(buf, sizeof(buf), "%u", (unsigned)d->interrupts);
+            fb_draw_text(c_irq, ry, buf, T(TEXT_DIM));
+        }
+    }
+    fb_restore_clip(saved);
 }
 
 static void draw_processes(int x, int y, int w, int h)
@@ -367,10 +416,10 @@ void sysmon_draw_callback(wm_window_t *win, uint32_t *framebuffer)
     mon_sample();
 
     /* Tabs */
-    static const char *const tabs[2] = { "Processes", "Overview" };
+    static const char *const tabs[3] = { "Processes", "Overview", "Devices" };
     fb_fill_rect(x, y, w, MON_TAB_H, T(SURFACE));
     fb_fill_rect(x, y + MON_TAB_H - 1, w, 1, T(BORDER));
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         int tx = x + 12 + i * 112;
         if (g_sysmon.tab == i) {
             fb_fill_rounded_rect(tx, y + 6, 104, 28, 5, T(HOVER));
@@ -381,8 +430,10 @@ void sysmon_draw_callback(wm_window_t *win, uint32_t *framebuffer)
 
     if (g_sysmon.tab == 0)
         draw_processes(x, y + MON_TAB_H, w, h - MON_TAB_H);
-    else
+    else if (g_sysmon.tab == 1)
         draw_overview(x, y + MON_TAB_H, w);
+    else
+        draw_devices(x, y + MON_TAB_H, w, h - MON_TAB_H);
 }
 
 void sysmon_event_callback(wm_window_t *win, wm_input_event_t *event)
@@ -396,7 +447,7 @@ void sysmon_event_callback(wm_window_t *win, wm_input_event_t *event)
     int mx = event->data.mouse.x, my = event->data.mouse.y;
 
     if (my < MON_TAB_H) {
-        for (int i = 0; i < 2; i++)
+        for (int i = 0; i < 3; i++)
             if (ui_hit(mx, my, 12 + i * 112, 6, 104, 28))
                 g_sysmon.tab = i;
         return;

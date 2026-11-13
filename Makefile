@@ -60,8 +60,27 @@ QEMU_MEM  := 2G
 # AC97: gives the guest a sound card wired to the host microphone/speakers
 # (the kernel has an AC97 capture + playback driver).
 QEMU_AUDIO ?= -audiodev pa,id=snd0 -device AC97,audiodev=snd0
-QEMU_FLAGS := -cdrom $(ISO_OUT) -m $(QEMU_MEM) -serial stdio \
-              -rtc base=localtime $(QEMU_AUDIO)
+# The machine's hard disk: a SATA drive on an AHCI controller, backed by
+# this image file. Your files in JARVIS OS live here, so it is kept outside
+# build/ and is NOT removed by `make clean`. Delete it to start with an empty
+# disk. DISK_MB only applies when the image is first created.
+DISK_IMG  := storage/disk.img
+DISK_MB   ?= 512
+QEMU_DISK := -device ahci,id=ahci \
+             -drive id=hd0,file=$(DISK_IMG),if=none,format=raw \
+             -device ide-hd,drive=hd0,bus=ahci.0
+# Window: the guest is scaled to fit the window (resize or maximise it
+# freely; Ctrl+Alt+F for full screen). The menu bar is hidden to leave room
+# for the taskbar; Ctrl+Alt+M shows it.
+QEMU_DISPLAY ?= -display gtk,zoom-to-fit=on,show-menubar=off
+# Network: QEMU's built-in router shares the host's connection (Wi-Fi or
+# cable) with the guest's Ethernet card and runs a DHCP server for it.
+QEMU_NET  := -netdev user,id=net0 -device e1000,netdev=net0
+# USB 3 controller. To give JARVIS OS a USB flash drive image:
+#   make run QEMU_USB_EXTRA="-drive id=stick,file=stick.img,if=none,format=raw -device usb-storage,drive=stick"
+QEMU_USB  := -device qemu-xhci,id=xhci $(QEMU_USB_EXTRA)
+QEMU_FLAGS := -cdrom $(ISO_OUT) -boot d -m $(QEMU_MEM) -serial stdio \
+              -rtc base=localtime $(QEMU_AUDIO) $(QEMU_DISK) $(QEMU_NET) $(QEMU_USB)
 
 # Host voice bridge: COM2 is exposed as this socket; tools/voice_bridge.py
 # records the host microphone, transcribes it with whisper.cpp and sends the
@@ -73,7 +92,7 @@ VOICE_SOCKET := /tmp/jarvis-voice.sock
 GRUB_MKRESCUE_FLAGS := --compress=xz --locales= --themes= --fonts=unicode
 GRUB_THEME_DIR := $(ISO_DIR)/boot/grub/themes/jarvis
 
-.PHONY: all clean check iso iso-models run qemu run-headless run-voice voice-enroll voice-setup FORCE
+.PHONY: all clean check iso iso-models run qemu run-headless run-voice voice-install voice-enroll voice-setup voice-render FORCE
 
 all: kernel.elf
 
@@ -93,28 +112,49 @@ desktop/desktop_init.o: $(wildcard desktop/*.c desktop/*.h apps/*.c apps/*.h \
 $(DRIVER_OBJS) $(DESKTOP_OBJS) $(WM_OBJS): kernel/kernel.h drivers/gpu.h \
                                            wm/wm.h desktop/ui.h
 
+$(DISK_IMG):
+	mkdir -p $(dir $(DISK_IMG))
+	truncate -s $(DISK_MB)M $@
+
 # Build the ISO and boot it in a QEMU window; kernel log goes to this terminal.
-run: iso
-	$(QEMU) $(QEMU_FLAGS)
+run: iso $(DISK_IMG)
+	$(QEMU) $(QEMU_FLAGS) $(QEMU_DISPLAY)
 
 qemu: run
 
 # No window: serial log only (Ctrl-C to quit).
-run-headless: iso
+run-headless: iso $(DISK_IMG)
 	$(QEMU) $(QEMU_FLAGS) -display none
 
 # Desktop + voice: starts QEMU and the host microphone bridge together, so
 # what you say is transcribed and delivered to JARVIS.
-run-voice: iso
+run-voice: iso $(DISK_IMG)
 	rm -f $(VOICE_SOCKET)
 	$(PYTHON) tools/run_qemu_voice.py --socket $(VOICE_SOCKET) -- \
-		$(QEMU) $(QEMU_FLAGS) -serial unix:$(VOICE_SOCKET),server,nowait
+		$(QEMU) $(QEMU_FLAGS) $(QEMU_DISPLAY) -serial unix:$(VOICE_SOCKET),server,nowait
 
-# Make the voice bridge speak through the voice-cloning engine installed in
-# tools/voice-venv, and load its model once (the first run downloads it).
+# Install the host-side speech software (about 4 GB, CPU-only PyTorch):
+#   tools/voice-venv   Chatterbox, which clones your voice (Python 3.14)
+#   tools/kokoro-venv  Kokoro, the live voice (needs Python 3.12, fetched by uv)
+voice-install:
+	test -x tools/voice-venv/bin/python || $(PYTHON) -m venv tools/voice-venv
+	tools/voice-venv/bin/pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+	tools/voice-venv/bin/pip install chatterbox-tts uv
+	tools/voice-venv/bin/uv python install 3.12
+	test -x tools/kokoro-venv/bin/python || tools/voice-venv/bin/uv venv --python 3.12 tools/kokoro-venv
+	VIRTUAL_ENV=tools/kokoro-venv tools/voice-venv/bin/uv pip install torch --index-url https://download.pytorch.org/whl/cpu
+	VIRTUAL_ENV=tools/kokoro-venv tools/voice-venv/bin/uv pip install kokoro==0.9.4 soundfile pip
+
+# Live voice: Kokoro (natural speech, a second or two per sentence on a CPU).
 voice-setup:
-	tools/voice-venv/bin/python tools/voice_engine.py --configure
-	tools/voice-venv/bin/python tools/voice_engine.py --warm
+	tools/kokoro-venv/bin/python tools/kokoro_server.py --configure
+	tools/kokoro-venv/bin/python tools/kokoro_server.py --warm
+
+# Record JARVIS's fixed sentences in YOUR cloned voice (Chatterbox). Very slow
+# on a CPU (a few minutes per sentence, so run it once, e.g. overnight);
+# finished sentences are kept, so it can be stopped and resumed.
+voice-render:
+	tools/voice-venv/bin/python tools/voice_engine.py --render tools/voice_phrases.txt
 
 # Record your own voice for JARVIS to speak with (writes tools/voice/).
 voice-enroll:

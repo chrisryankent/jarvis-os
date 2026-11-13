@@ -36,7 +36,7 @@ def terminate(proc: subprocess.Popen[bytes] | None) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Start QEMU and JARVIS host voice bridge together.")
     parser.add_argument("--socket", default="/tmp/jarvis-voice.sock")
-    parser.add_argument("--model", default="tools/models/stt/ggml-medium.en.bin")
+    parser.add_argument("--model", default=None, help="Whisper model (default: best installed)")
     parser.add_argument("--whisper-cli", default="tools/vendor/whisper.cpp/build/bin/whisper-cli")
     parser.add_argument("--bridge-timeout", type=float, default=20.0)
     parser.add_argument("--bridge-arg", action="append", default=[])
@@ -58,8 +58,7 @@ def main() -> int:
                 "tools/voice_bridge.py",
                 "--socket",
                 args.socket,
-                "--model",
-                args.model,
+                *(["--model", args.model] if args.model else []),
                 "--whisper-cli",
                 args.whisper_cli,
                 *args.bridge_arg,

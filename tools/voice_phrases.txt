@@ -1,0 +1,19 @@
+# Sentences JARVIS speaks word for word. `make voice-render` records each one
+# in the owner's cloned voice once (slow on a CPU: minutes per line); the
+# voice bridge then plays those recordings instantly instead of synthesising.
+# Keep in sync with fallback_reply() in ai_core/runtime.cpp.
+JARVIS ready. Say a command.
+I'm listening.
+Hello. How can I help?
+All systems are running. Details are in the task manager.
+Opening Settings.
+Opening Files.
+Opening Terminal.
+Opening the security center.
+For network details, open the terminal and type ifconfig.
+The language model is installed but not running yet, so I answer from my built-in commands.
+I hear you through the microphone and answer out loud.
+Say cursor up, down, left or right, or say click.
+You can say: open files, open terminal, open settings, status, lock, or shut down.
+Sorry, I didn't catch that. Say help to hear what I can do.
+Shutting down. Goodbye.

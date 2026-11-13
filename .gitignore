@@ -101,3 +101,5 @@ __pycache__/
 tools/voice/
 tools/voice-venv/
 user/*.elf
+storage/
+tools/kokoro-venv/

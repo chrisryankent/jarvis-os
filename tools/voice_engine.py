@@ -10,7 +10,7 @@ that stays loaded; each request is one JSON line over a Unix socket.
   voice_engine.py --text T --out F [--ref R]  synthesise T into WAV file F,
                                               in the voice of reference R
   voice_engine.py --stop                      shut the server down
-  voice_engine.py --configure                 make the voice bridge use this engine
+  voice_engine.py --render FILE               record each line of FILE in your voice (cache)
 
 Without --ref (or if the file does not exist yet) the engine's built-in voice
 is used. Run with the interpreter in tools/voice-venv.
@@ -48,6 +48,56 @@ def server_lock(blocking_probe: bool = False):
         f.close()
         return True
     return f
+
+
+def save_wav(path: str, wav, rate: int) -> None:
+    """Write a 16-bit mono WAV (torchaudio.save needs the separate torchcodec)."""
+    import wave as wavmod
+    samples = wav.detach().cpu().reshape(-1).clamp(-1, 1).mul(32767).short().numpy()
+    with wavmod.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(samples.astype("<i2").tobytes())
+
+
+def render(phrases_file: str, ref: str) -> int:
+    """Record every phrase in the owner's cloned voice into the cache the
+    voice bridge plays from. Slow on a CPU (minutes per sentence); phrases
+    already rendered are skipped, so it can be stopped and resumed."""
+    import hashlib
+    import re
+    import torch
+    from chatterbox.tts import ChatterboxTTS
+
+    def key(text: str) -> str:                       # same as voice_bridge.phrase_key
+        t = re.sub(r"[^a-z0-9]+", " ", text.lower().replace("'", ""))
+        return hashlib.sha1(" ".join(t.split()).encode()).hexdigest()[:16]
+
+    if not ref or not os.path.exists(ref):
+        print("No voice recording found: run `make voice-enroll` first.", file=sys.stderr)
+        return 1
+    cache = LOG.parent / "cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    phrases = [l.strip() for l in open(phrases_file, encoding="utf-8")
+               if l.strip() and not l.lstrip().startswith("#")]
+    todo = [p for p in phrases if not (cache / f"{key(p)}.wav").exists()]
+    print(f"{len(phrases) - len(todo)} of {len(phrases)} phrases already recorded.", flush=True)
+    if not todo:
+        return 0
+
+    torch.set_num_threads(max(1, (os.cpu_count() or 4) - 1))
+    print("Loading the voice model...", flush=True)
+    model = ChatterboxTTS.from_pretrained(device="cpu")
+    for n, text in enumerate(todo, 1):
+        started = time.time()
+        with torch.inference_mode():
+            wav = model.generate(text, audio_prompt_path=ref)
+        out = cache / f"{key(text)}.wav"
+        save_wav(str(out) + ".tmp", wav, model.sr)
+        os.replace(str(out) + ".tmp", out)          # never leave a half-written clip
+        print(f"[{n}/{len(todo)}] {time.time() - started:.0f}s  {text}", flush=True)
+    return 0
 
 
 def serve() -> int:
@@ -93,7 +143,7 @@ def serve() -> int:
                 started = time.time()
                 with torch.inference_mode():
                     wav = model.generate(req["text"], **kwargs)
-                torchaudio.save(req["out"], wav, model.sr)
+                save_wav(req["out"], wav, model.sr)
                 print(f"[engine] {len(req['text'])} chars in {time.time() - started:.1f}s", flush=True)
                 conn.sendall(b"ok\n")
             except Exception as exc:            # report, keep serving
@@ -138,30 +188,13 @@ def ensure_server(wait: float) -> bool:
     return False
 
 
-def configure() -> int:
-    """Point tools/voice/profile.json at this engine (keeps any recorded voice)."""
-    profile_path = LOG.parent / "profile.json"
-    profile_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        profile = json.loads(profile_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        profile = {}
-    me = [sys.executable, str(Path(__file__).resolve())]
-    profile["tts_cmd"] = me + ["--text", "{text}", "--ref", "{ref}", "--out", "{out}"]
-    profile["warm_cmd"] = me + ["--warm"]
-    profile.setdefault("reference_wav", "")
-    profile.setdefault("reference_text", "")
-    profile_path.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
-    print(f"voice engine configured in {profile_path}")
-    return 0
-
-
 def main() -> int:
     p = argparse.ArgumentParser(description="JARVIS voice engine")
     p.add_argument("--serve", action="store_true")
     p.add_argument("--warm", action="store_true")
     p.add_argument("--stop", action="store_true")
-    p.add_argument("--configure", action="store_true")
+    p.add_argument("--render", metavar="PHRASES_FILE",
+                   help="record each line of this file in your voice, into the phrase cache")
     p.add_argument("--text")
     p.add_argument("--ref", default="")
     p.add_argument("--out")
@@ -171,8 +204,8 @@ def main() -> int:
 
     if args.serve:
         return serve()
-    if args.configure:
-        return configure()
+    if args.render:
+        return render(args.render, args.ref or str(LOG.parent / "reference.wav"))
     if args.stop:
         try:
             request({"cmd": "stop"}, 5)

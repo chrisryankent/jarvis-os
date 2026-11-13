@@ -49,7 +49,7 @@ void security_draw_callback(wm_window_t *win, uint32_t *framebuffer)
              "Audit hook installed; every system call is checked", T(OK));
     cy += 62;
     sec_card(x + 16, cy, cw, "Network monitor",
-             g_kstate.network_ready ? "Watching packets on the network adapter"
+             g_kstate.network_ready ? "Every incoming IP packet passes the security filter"
                                     : "No network adapter found",
              g_kstate.network_ready ? T(OK) : T(TEXT_DIM));
     cy += 62;

@@ -95,6 +95,7 @@ static void pci_probe(uint8_t bus, uint8_t dev, uint8_t fn)
     d->class_code= pci_read8 (bus, dev, fn, PCI_CLASS_CODE);
     d->subclass  = pci_read8 (bus, dev, fn, PCI_SUBCLASS);
     d->irq       = pci_read8 (bus, dev, fn, PCI_INTERRUPT_LINE);
+    d->prog_if   = pci_read8 (bus, dev, fn, 0x09);
 
     /* Read BARs */
     for (int i = 0; i < 6; i++)
@@ -151,4 +152,9 @@ pci_device_t *pci_find_class(uint8_t class_code, uint8_t subclass)
             return &pci_devices_full[i];
     }
     return NULL;
+}
+
+pci_device_t *pci_get(int index)
+{
+    return (index >= 0 && index < pci_count_full) ? &pci_devices_full[index] : NULL;
 }

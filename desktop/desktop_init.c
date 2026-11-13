@@ -171,7 +171,7 @@ void desktop_system_open_app(const char *app)
     if (idx >= 0) {
         desktop_app_launch(idx);
     } else if (word_ieq(app, "browser", 7) || word_ieq(app, "web", 3)) {
-        notification_show("Browser", "Not available yet: the network stack has no DHCP/TCP.",
+        notification_show("Browser", "No web browser yet. In Terminal, 'http <url>' fetches plain http pages.",
                           NOTIF_WARNING, 5000);
     } else {
         terminal_printf("[DESKTOP] Unknown app: %s\n", app);
@@ -222,12 +222,14 @@ static void power_screen(const char *text)
 void desktop_system_shutdown(void)
 {
     power_screen("Shutting down...");
+    diskfs_sync();          /* nothing unsaved is lost */
     sys_poweroff();
 }
 
 void desktop_system_restart(void)
 {
     power_screen("Restarting...");
+    diskfs_sync();          /* nothing unsaved is lost */
     sys_reboot();
 }
 
@@ -277,6 +279,13 @@ void desktop_system_render(void)
     /* Scheduler events raised inside other processes (they must not touch
      * the UI themselves) are shown from here, on the desktop process. */
     governor_tick();        /* resource policy: AI advice or built-in rules */
+
+    /* Save changed files to disk every two seconds. */
+    static uint64_t last_sync;
+    if (now - last_sync >= 200) {
+        last_sync = now;
+        diskfs_sync();
+    }
 
     /* Output printed by user programs appears in the Terminal. */
     static char prog_out[512];

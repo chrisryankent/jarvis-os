@@ -167,6 +167,12 @@ uint64_t syscall_handler(uint64_t nr,
         return len;
     }
 
+    case 510: /* device_claim(id): exclusive use of a device */
+        return devmgr_claim((int)a1, kthread_current_pid()) == 0 ? 0 : (uint64_t)-16;   /* EBUSY */
+
+    case 511: /* device_release(id) */
+        return devmgr_release((int)a1, kthread_current_pid()) == 0 ? 0 : E_INVAL;
+
     default:
         /* fork, execve, mmap and the rest are not implemented; say so
          * rather than pretending they worked. */
