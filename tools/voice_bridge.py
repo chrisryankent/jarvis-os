@@ -61,6 +61,8 @@ VOICE_PROFILE = Path(__file__).resolve().parent / "voice" / "profile.json"
 # JARVIS is talking (and for a moment after) the microphone is ignored, and
 # anything transcribed that matches what was just said is dropped. Without
 # this the bridge heard JARVIS's own voice and answered it, forever.
+SEND_LOCK = threading.Lock()          # the brain and the bridge share the socket
+BRAIN = None                          # (GuestLink, ask queue) when the language model runs
 SPEAKING = threading.Event()
 SPOKEN_LOCK = threading.Lock()
 RECENT_SPOKEN: collections.deque = collections.deque(maxlen=6)   # (time, normalized text)
@@ -93,7 +95,8 @@ def send_voice(sock: socket.socket, text: str) -> None:
     if not text:
         return
     try:
-        sock.sendall(f"VOICE:{text}\n".encode("utf-8"))
+        with SEND_LOCK:
+            sock.sendall(f"VOICE:{text}\n".encode("utf-8"))
         try:
             print(f"[bridge] sent: {text}", flush=True)
         except (BlockingIOError, BrokenPipeError):
@@ -103,7 +106,8 @@ def send_voice(sock: socket.socket, text: str) -> None:
 
 
 def send_ready(sock: socket.socket, verbose: bool = True) -> None:
-    sock.sendall(b"BRIDGE:READY\n")
+    with SEND_LOCK:
+        sock.sendall(b"BRIDGE:READY\n")
     if verbose:
         print("[bridge] guest handshake sent", flush=True)
 
@@ -126,40 +130,76 @@ def phrase_key(text: str) -> str:
 
 
 def cached_phrase(text: str, profile: dict) -> Path | None:
-    cache = profile.get("cache_dir")
-    if not cache:
-        return None
-    path = Path(cache) / f"{phrase_key(text)}.wav"
-    return path if path.exists() else None
+    """A pre-recorded clip of exactly this sentence: in your own voice first
+    (cache_dir, `make voice-render`), else in the live voice (live_cache_dir,
+    `make voice-setup`)."""
+    for key in ("cache_dir", "live_cache_dir"):
+        cache = profile.get(key)
+        if cache:
+            path = Path(cache) / f"{phrase_key(text)}.wav"
+            if path.exists():
+                return path
+    return None
+
+
+def split_sentences(text: str) -> list[str]:
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
+    return [p for p in parts if p]
+
+
+def synthesize(text: str, profile: dict, out: Path) -> bool:
+    """Run the configured voice engine (profile.json "tts_cmd"); it writes a WAV."""
+    template = profile.get("tts_cmd")
+    if not template:
+        return False
+    values = {
+        "text": text,
+        "out": str(out),
+        "ref": str(profile.get("reference_wav", "")),
+        "ref_text": str(profile.get("reference_text", "")),
+    }
+    try:
+        cmd = [part.format(**values) for part in template]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+    except (OSError, subprocess.SubprocessError, KeyError, IndexError) as exc:
+        print(f"[bridge] voice engine failed ({exc}); using system voice", flush=True)
+        return False
+    return out.exists()
 
 
 def speak_with_profile(text: str, profile: dict) -> bool:
-    """Speak with the configured voice engine (e.g. a voice-cloning TTS using
-    the owner's recorded reference). The command comes from profile.json and
-    must write a WAV file; it is played with pw-play. Returns False on any
-    failure so the caller can fall back to the system voice."""
-    template = profile.get("tts_cmd")
-    if not template or not shutil.which("pw-play"):
+    """Speak through the voice engine, one sentence at a time: the next
+    sentence is synthesised while the current one plays, so a long reply
+    starts after the first sentence instead of after the whole text.
+    Returns False if nothing could be synthesised (caller falls back)."""
+    if not profile.get("tts_cmd") or not shutil.which("pw-play"):
         return False
+    sentences = split_sentences(text) or [text]
     with tempfile.TemporaryDirectory(prefix="jarvis-tts-") as tmp:
-        out = Path(tmp) / "say.wav"
-        values = {
-            "text": text,
-            "out": str(out),
-            "ref": str(profile.get("reference_wav", "")),
-            "ref_text": str(profile.get("reference_text", "")),
-        }
-        try:
-            cmd = [part.format(**values) for part in template]
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=300)
-        except (OSError, subprocess.SubprocessError, KeyError, IndexError) as exc:
-            print(f"[bridge] voice engine failed ({exc}); using system voice", flush=True)
-            return False
-        if not out.exists():
-            return False
-        subprocess.run(["pw-play", str(out)], check=False)
-        return True
+        clips: list[Path | None] = [None] * len(sentences)
+        ready = [threading.Event() for _ in sentences]
+
+        def produce() -> None:
+            for i, sentence in enumerate(sentences):
+                cached = cached_phrase(sentence, profile)
+                if cached:
+                    clips[i] = cached
+                else:
+                    out = Path(tmp) / f"s{i}.wav"
+                    clips[i] = out if synthesize(sentence, profile, out) else None
+                ready[i].set()
+
+        worker = threading.Thread(target=produce, daemon=True)
+        worker.start()
+        spoke = False
+        for i in range(len(sentences)):
+            ready[i].wait()
+            if clips[i] is None:
+                break
+            subprocess.run(["pw-play", str(clips[i])], check=False)
+            spoke = True
+        worker.join(timeout=1)
+        return spoke
 
 
 def speak_host(text: str, wait: bool = True) -> None:
@@ -222,6 +262,14 @@ def guest_reader(sock: socket.socket, args: argparse.Namespace, stop: threading.
             line, buf = buf.split("\n", 1)
             line = line.strip()
             if not line:
+                continue
+            if line.startswith("ASK:") and BRAIN:
+                text = line[4:].strip().replace("\\n", " ")
+                print(f"[bridge] asking the brain: {text}", flush=True)
+                BRAIN[1].put(text)
+                continue
+            if line.startswith("RESULT:") and BRAIN:
+                BRAIN[0].deliver(line)
                 continue
             if line.startswith("SAY:"):
                 text = line[4:].strip()
@@ -609,6 +657,8 @@ def main() -> int:
     parser.add_argument("--require-wake", action="store_true", help="Require a wake word before forwarding transcripts.")
     parser.add_argument("--no-wake", action="store_true", help="Forward every non-noise transcript. This is the default.")
     parser.add_argument("--stdin", action="store_true", help="Inject typed transcripts for bridge testing.")
+    parser.add_argument("--no-brain", action="store_true", help="Do not run the language model (built-in replies only).")
+    parser.add_argument("--brain-model", help="GGUF model for the brain (default: tools/models/brain/model.gguf).")
     parser.add_argument("--once", help="Inject one transcript and exit.")
     args = parser.parse_args()
 
@@ -618,6 +668,14 @@ def main() -> int:
 
     sock = connect_socket(args.socket)
     print(f"[bridge] connected: {args.socket}", flush=True)
+    global BRAIN
+    if not args.no_brain:
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import jarvis_brain
+            BRAIN = jarvis_brain.start_for_bridge(sock, SEND_LOCK, args.brain_model)
+        except Exception as exc:
+            print(f"[bridge] brain not started: {exc}", flush=True)
     stop_reader = threading.Event()
     reader = threading.Thread(target=guest_reader, args=(sock, args, stop_reader), daemon=True)
     reader.start()

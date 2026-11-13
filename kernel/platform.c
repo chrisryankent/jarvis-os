@@ -142,6 +142,11 @@ static int kvsnprintf(char *buf, size_t size, const char *fmt, va_list ap)
     return (int)(out - buf);
 }
 
+int vsnprintf(char *buf, size_t size, const char *fmt, va_list ap)
+{
+    return kvsnprintf(buf, size, fmt, ap);
+}
+
 int snprintf(char *buf, size_t size, const char *fmt, ...)
 {
     va_list ap;

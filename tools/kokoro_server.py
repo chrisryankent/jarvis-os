@@ -153,12 +153,34 @@ def configure(voice: str) -> int:
     except (OSError, ValueError):
         profile = {}
     me = [sys.executable, str(Path(__file__).resolve())]
-    profile["tts_cmd"] = me + ["--voice", voice, "--text", "{text}", "--out", "{out}"]
+    profile["tts_cmd"] = me + ["--voice", voice, "--no-wait", "--text", "{text}", "--out", "{out}"]
     profile["warm_cmd"] = me + ["--voice", voice, "--warm"]
     profile["live_voice"] = f"kokoro:{voice}"
     profile["cache_dir"] = str(ROOT / "voice" / "cache")
+    profile["live_cache_dir"] = str(ROOT / "voice" / "cache-live")
     PROFILE.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
     print(f"Live voice set to Kokoro '{voice}' in {PROFILE}")
+    return 0
+
+
+def render(phrases_file: str, voice: str) -> int:
+    """Pre-record JARVIS's fixed sentences in the live voice so they play
+    instantly (tools/voice/cache-live). Same cache key as the voice bridge."""
+    import hashlib
+    import re
+    cache = ROOT / "voice" / "cache-live"
+    cache.mkdir(parents=True, exist_ok=True)
+    phrases = [l.strip() for l in open(phrases_file, encoding="utf-8") if l.strip() and not l.lstrip().startswith("#")]
+    if not ensure_server(voice, 300):
+        print(f"Kokoro did not start; see {LOG}", file=sys.stderr)
+        return 1
+    done = 0
+    for text in phrases:
+        t = re.sub(r"[^a-z0-9]+", " ", text.lower().replace("'", ""))
+        out = cache / f"{hashlib.sha1(' '.join(t.split()).encode()).hexdigest()[:16]}.wav"
+        if not out.exists() and request({"text": text, "out": str(out)}, 120) == "ok":
+            done += 1
+    print(f"{done} phrase(s) recorded, {len(phrases)} in total, in {cache}")
     return 0
 
 
@@ -168,9 +190,12 @@ def main() -> int:
     p.add_argument("--warm", action="store_true")
     p.add_argument("--stop", action="store_true")
     p.add_argument("--configure", action="store_true")
+    p.add_argument("--render", metavar="PHRASES_FILE")
     p.add_argument("--voice", default=DEFAULT_VOICE)
     p.add_argument("--text")
     p.add_argument("--out")
+    p.add_argument("--no-wait", action="store_true",
+                   help="if the model is still loading, fail at once (caller uses another voice)")
     args = p.parse_args()
 
     if not (MODEL_DIR / "voices" / f"{args.voice}.pt").exists():
@@ -179,13 +204,15 @@ def main() -> int:
         return serve(args.voice)
     if args.configure:
         return configure(args.voice)
+    if args.render:
+        return render(args.render, args.voice)
     if args.stop:
         try:
             request({"cmd": "stop"}, 5)
         except OSError:
             pass
         return 0
-    if not ensure_server(args.voice, 300):
+    if not ensure_server(args.voice, 2 if args.no_wait else 300):
         print(f"Kokoro did not start; see {LOG}", file=sys.stderr)
         return 1
     if args.warm:

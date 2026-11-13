@@ -152,6 +152,7 @@ voice-install:
 voice-setup:
 	tools/kokoro-venv/bin/python tools/kokoro_server.py --configure
 	tools/kokoro-venv/bin/python tools/kokoro_server.py --warm
+	tools/kokoro-venv/bin/python tools/kokoro_server.py --render tools/voice_phrases.txt
 
 # Record JARVIS's fixed sentences in YOUR cloned voice (Chatterbox). Very slow
 # on a CPU (a few minutes per sentence, so run it once, e.g. overnight);

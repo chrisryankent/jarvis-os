@@ -58,6 +58,13 @@ void assistant_draw_callback(wm_window_t *win, uint32_t *framebuffer)
     icon_draw(ICON_JARVIS, x + 14, y + 12, 40);
     fb_draw_text_bold(x + 66, y + 14, "JARVIS", T(TEXT));
     fb_draw_text(x + 66, y + 34, ui_shell_get_status(), T(ACCENT));
+    {
+        char brain[64];
+        if (ai_host_online()) snprintf(brain, sizeof(brain), "AI: %s", ai_host_model());
+        else snprintf(brain, sizeof(brain), "AI offline: built-in commands");
+        ui_text_fit(x + 66 + fb_text_width(ui_shell_get_status()) + 16, y + 34,
+                    w - 66 - fb_text_width(ui_shell_get_status()) - 16 - 160, brain, T(TEXT_DIM));
+    }
 
     int mx = x + w - 150;
     if (mx > x + 190) {
@@ -131,12 +138,39 @@ void assistant_draw_callback(wm_window_t *win, uint32_t *framebuffer)
         fb_draw_text(x + 22, iy + 10, "Ask JARVIS anything...", T(TEXT_DIM));
     }
     ui_button(x + w - 12 - send_w, iy, send_w, 36, "Send", T(ACCENT), T(ACCENT_TEXT));
+
+    /* ---- An action waiting for the user's permission ---- */
+    char ask[160];
+    if (ai_tools_pending(ask, sizeof(ask))) {
+        int pw = w - 40 < 380 ? w - 40 : 380, ph = 130;
+        int px = x + (w - pw) / 2, py = y + (h - ph) / 2;
+        fb_blend_rect(x, y, w, h, 0x00000000, 110);
+        fb_fill_rounded_rect(px, py, pw, ph, 8, T(WARN));
+        fb_fill_rounded_rect(px + 2, py + 2, pw - 4, ph - 4, 7, T(MENU));
+        fb_draw_text_bold(px + 16, py + 14, "Permission needed", T(TEXT));
+        ui_text_fit(px + 16, py + 40, pw - 32, ask, T(TEXT));
+        ui_button(px + pw - 196, py + ph - 44, 90, 30, "Allow", T(ACCENT), T(ACCENT_TEXT));
+        ui_button(px + pw - 98, py + ph - 44, 82, 30, "Deny", T(HOVER), T(TEXT));
+    }
 }
 
 void assistant_event_callback(wm_window_t *win, wm_input_event_t *event)
 {
     int x, y, w, h;
     wm_get_client(win, &x, &y, &w, &h);
+
+    char ask[160];
+    if (ai_tools_pending(ask, sizeof(ask))) {           /* Allow / Deny prompt is modal */
+        int pw = w - 40 < 380 ? w - 40 : 380, ph = 130, px = (w - pw) / 2, py = (h - ph) / 2;
+        if (event->type == IE_MOUSE_DOWN && event->data.mouse.button == 1) {
+            int mx = event->data.mouse.x, my = event->data.mouse.y;
+            if (ui_hit(mx, my, px + pw - 196, py + ph - 44, 90, 30)) ai_tools_confirm(1);
+            else if (ui_hit(mx, my, px + pw - 98, py + ph - 44, 82, 30)) ai_tools_confirm(0);
+        } else if (event->type == IE_KEY_DOWN && event->data.keyboard.key == WM_KEY_ESC) {
+            ai_tools_confirm(0);
+        }
+        return;
+    }
 
     if (event->type == IE_TEXT_INPUT) {
         char ch = event->data.text.ch;

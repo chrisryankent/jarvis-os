@@ -294,8 +294,13 @@ static void ipc_dispatch(ipc_message_t *msg)
         /* Speech engine decoded audio — forward to LLM brain */
         ui_shell_set_status("THINKING");
         ui_shell_add_transcript((const char *)msg->payload);
-        kernel_try_voice_command((const char *)msg->payload);
-        ai_core_infer((const char *)msg->payload, msg->payload_len);
+        /* Simple commands ("open terminal") stay instant and work offline.
+         * Anything else goes to the language model when it is running;
+         * without it, the built-in replies answer. */
+        if (kernel_try_voice_command((const char *)msg->payload) || !ai_host_online())
+            ai_core_infer((const char *)msg->payload, msg->payload_len);
+        else
+            ai_host_ask((const char *)msg->payload);
         break;
 
     case IPC_AI_RESPONSE:
@@ -777,6 +782,9 @@ static void kernel_handle_voice_serial_line(const char *line)
 {
     const char *text;
     const char *trimmed = skip_spaces(line);
+
+    if (ai_host_line(trimmed))          /* language model: replies and tool calls */
+        return;
 
     if (strcmp(trimmed, "BRIDGE:READY") == 0 ||
         strcmp(trimmed, "VOICE_BRIDGE_READY") == 0 ||

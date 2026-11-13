@@ -199,6 +199,14 @@ void devmgr_release_all(uint32_t pid);
 pci_device_t *pci_get(int index);           /* NULL past the last device */
 uint64_t irq_count(int irq_line);           /* interrupts seen on a PIC line */
 
+/* ---- Language model on the host, and its tools (kernel/ai_tools.c) -------- */
+int         ai_host_online(void);
+const char *ai_host_model(void);
+void        ai_host_ask(const char *text);
+int         ai_host_line(const char *line);         /* 1 if it was an AI line */
+int         ai_tools_pending(char *text, size_t n); /* an action awaiting Allow */
+void        ai_tools_confirm(int allow);
+
 /* ---- Packages (kernel/pkg.c) ---------------------------------------------- */
 typedef struct {
     char     name[32], title[48], version[16], publisher[48], description[128], exec[64];
