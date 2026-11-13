@@ -64,6 +64,11 @@ typedef enum {
     ICON_TRASH,
     ICON_CHART,         /* system monitor */
     ICON_START,
+    ICON_DRIVE,         /* internal disk */
+    ICON_USB,           /* removable USB drive */
+    ICON_PACKAGE,       /* installable .jpk package */
+    ICON_PROGRAM,       /* runnable program */
+    ICON_STORE,         /* Apps (package manager) */
 } icon_id_t;
 
 typedef enum {
@@ -79,6 +84,9 @@ typedef enum {
     GLYPH_BACK,
     GLYPH_UP,
     GLYPH_REFRESH,
+    GLYPH_FORWARD,
+    GLYPH_GRID,         /* large icons view */
+    GLYPH_LIST,         /* details view */
 } glyph_id_t;
 
 /* Full-colour app icon in a size x size box. */

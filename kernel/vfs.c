@@ -405,6 +405,12 @@ void vfs_mount_point(const char *path)
         if (!vfs_mounts[i][0]) { strncpy(vfs_mounts[i], path, sizeof(vfs_mounts[i]) - 1); return; }
 }
 
+void vfs_unmount_point(const char *path)
+{
+    for (int i = 0; i < 4; i++)
+        if (!strcmp(vfs_mounts[i], path)) vfs_mounts[i][0] = 0;
+}
+
 /* 1 if path is on a read-only mounted volume (writes must be refused). */
 static int vfs_on_mount(const char *path)
 {

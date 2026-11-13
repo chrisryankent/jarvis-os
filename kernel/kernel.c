@@ -110,6 +110,7 @@ void jarvis_kernel_main(void)
     net_init();                    /* network process: DHCP, then ready for use */
     diskfs_mount();                /* files saved on disk by earlier sessions */
     fatfs_mount_all();             /* USB flash drives -> /jarvis/usb0, ... */
+    usb_start_hotplug();           /* notice drives plugged in / removed later */
     usermode_install_programs();   /* bundled user programs -> /jarvis/bin */
     ui_shell_show_loading_desktop();
 

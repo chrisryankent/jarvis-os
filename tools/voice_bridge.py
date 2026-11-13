@@ -266,13 +266,15 @@ def find_whisper_cli(explicit: str | None) -> str | None:
     return None
 
 
-MODEL_PREFERENCE = ("ggml-small.en.bin", "ggml-base.en.bin", "ggml-medium.en.bin")
+# Measured on a 4-core laptop CPU (i5-8250U), model kept loaded:
+#   base.en  ~2 s per sentence, exact on commands
+#   medium.en ~55 s per sentence (too slow for conversation)
+MODEL_PREFERENCE = ("ggml-base.en.bin", "ggml-small.en.bin", "ggml-medium.en.bin")
 
 
 def pick_model(explicit: str | None) -> str | None:
-    """The given model, or the best installed one for live use: small.en
-    balances accuracy and speed on a laptop CPU; medium.en is accurate but
-    takes close to a minute per sentence there."""
+    """The given model, or the best installed one for live use (fastest
+    first: on a laptop CPU only base.en answers quickly enough to talk to)."""
     if explicit:
         return explicit
     stt = Path(__file__).resolve().parent / "models" / "stt"
@@ -592,7 +594,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Send host STT transcripts to JARVIS OS over QEMU COM2.")
     parser.add_argument("--socket", default="/tmp/jarvis-voice.sock", help="QEMU COM2 Unix socket.")
     parser.add_argument("--model", default=None,
-                        help="Whisper model path (default: best installed of small.en, base.en, medium.en).")
+                        help="Whisper model path (default: base.en, else small.en, else medium.en).")
     parser.add_argument("--whisper-cli", help="Path to whisper.cpp whisper-cli.")
     parser.add_argument("--seconds", type=float, default=4.0, help="Longest single utterance, in seconds (minimum 12).")
     parser.add_argument("--hold", type=float, default=1.0, help="Seconds to keep the socket open after --once.")

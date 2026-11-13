@@ -40,6 +40,7 @@ typedef struct {
     uint32_t root_cluster;          /* FAT32 */
     uint32_t clusters;
     uint64_t total_bytes;
+    uint64_t free_bytes;
 } fat_vol_t;
 
 typedef struct {
@@ -309,13 +310,53 @@ int fatfs_read(const char *path, uint64_t offset, void *buf, size_t len)
     return (int)done;
 }
 
-int fatfs_volume_info(int i, char *mount, size_t mlen, char *label, size_t llen, uint64_t *bytes)
+/* Every place files can live, for "This PC": the JARVIS disk, then each
+ * USB drive (readable or not). */
+int storage_list(drive_info_t *out, int max)
 {
-    if (i < 0 || i >= FAT_MAX_VOLS || !g_vols[i].used) return -1;
-    snprintf(mount, mlen, "%s", g_vols[i].mount);
-    snprintf(label, llen, "%s", g_vols[i].label);
-    *bytes = g_vols[i].total_bytes;
-    return 0;
+    int n = 0;
+    diskfs_stats_t ds;
+
+    if (n < max) {
+        drive_info_t *d = &out[n++];
+        memset(d, 0, sizeof(*d));
+        snprintf(d->mount, sizeof(d->mount), "/jarvis");
+        if (diskfs_get_stats(&ds) == 0) {
+            snprintf(d->name, sizeof(d->name), "Local Disk");
+            snprintf(d->fs, sizeof(d->fs), "JARVISFS");
+            snprintf(d->device, sizeof(d->device), "%s", ds.device);
+            d->total = ds.total_bytes;
+            d->free = ds.total_bytes - ds.used_bytes;
+        } else {
+            snprintf(d->name, sizeof(d->name), "Memory (not saved)");
+            snprintf(d->fs, sizeof(d->fs), "RAM");
+        }
+    }
+
+    for (int dev = 0; dev < block_count() && n < max; dev++) {
+        block_info_t info;
+        if (block_get_info(dev, &info) != 0 || strncmp(info.name, "usb", 3) != 0) continue;
+        drive_info_t *d = &out[n++];
+        memset(d, 0, sizeof(*d));
+        d->removable = 1;
+        snprintf(d->device, sizeof(d->device), "%s", info.name);
+        d->total = info.sectors * 512;
+        fat_vol_t *v = NULL;
+        for (int i = 0; i < FAT_MAX_VOLS; i++)
+            if (g_vols[i].used && g_vols[i].dev == dev) v = &g_vols[i];
+        if (v) {
+            snprintf(d->name, sizeof(d->name), "%s", v->label[0] ? v->label : "USB Drive");
+            snprintf(d->mount, sizeof(d->mount), "%s", v->mount);
+            snprintf(d->fs, sizeof(d->fs), "%s", v->fat32 ? "FAT32" : "FAT16");
+            d->total = v->total_bytes;
+            d->free = v->free_bytes;
+            d->read_only = 1;
+        } else {
+            snprintf(d->name, sizeof(d->name), "USB Drive");
+            snprintf(d->fs, sizeof(d->fs), "Unsupported");
+        }
+    }
+    return n;
 }
 
 /* ---- Mounting ------------------------------------------------------------ */
@@ -351,46 +392,99 @@ static int try_volume(int dev, uint64_t start, const char *mount)
     snprintf(v.mount, sizeof(v.mount), "%s", mount);
     v.used = 1;
 
+    /* Free space: FAT32 keeps a count in its FSInfo sector; otherwise count
+     * the free entries in the allocation table. */
+    uint32_t free_clusters = 0xFFFFFFFF;
+    if (v.fat32 && le16(b + 48) && block_read(dev, start + le16(b + 48), 1, g_sec) == 0 &&
+        le32(g_sec) == 0x41615252 && le32(g_sec + 484) == 0x61417272)
+        free_clusters = le32(g_sec + 488);
+    if (free_clusters == 0xFFFFFFFF || free_clusters > v.clusters) {
+        static uint8_t chunk[64 * 512];
+        uint32_t per = v.fat32 ? 128 : 256, counted = 0;
+        free_clusters = 0;
+        for (uint32_t sec = 0; sec < fatsz && counted < v.clusters + 2; sec += 64) {
+            uint32_t n = fatsz - sec < 64 ? fatsz - sec : 64;
+            if (block_read(dev, v.fat_start + sec, n, chunk) != 0) break;
+            for (uint32_t k = 0; k < n * per && counted < v.clusters + 2; k++, counted++) {
+                uint32_t val = v.fat32 ? le32(chunk + k * 4) & 0x0FFFFFFF : le16(chunk + k * 2);
+                if (counted >= 2 && val == 0) free_clusters++;
+            }
+        }
+    }
+    v.free_bytes = (uint64_t)free_clusters * spc * 512;
+
     for (int i = 0; i < FAT_MAX_VOLS; i++)
         if (!g_vols[i].used) { g_vols[i] = v; return 0; }
     return -1;
 }
 
-void fatfs_mount_all(void)
+/* Mount the FAT volume on one block device (a USB drive). 0 on success. */
+int fatfs_mount_dev(int dev)
 {
-    g_lock = kmutex_create("fatfs");
-    int n = 0;
+    block_info_t info;
+    uint8_t mbr[512];
+    if (g_lock < 0) g_lock = kmutex_create("fatfs");
+    if (block_get_info(dev, &info) != 0 || block_read(dev, 0, 1, mbr) != 0) return -1;
 
-    for (int dev = 0; dev < block_count() && n < FAT_MAX_VOLS; dev++) {
-        block_info_t info;
-        if (block_get_info(dev, &info) != 0 || strncmp(info.name, "usb", 3) != 0) continue;
-
-        char mount[16];
-        snprintf(mount, sizeof(mount), "/jarvis/%s", info.name);
-        uint8_t mbr[512];
-        if (block_read(dev, 0, 1, mbr) != 0) continue;
-
-        int rc = try_volume(dev, 0, mount);                 /* whole drive is one volume */
-        if (rc == -1 && mbr[510] == 0x55 && mbr[511] == 0xAA) {
-            for (int p = 0; p < 4 && rc != 0; p++) {        /* first FAT partition */
-                const uint8_t *e = mbr + 446 + p * 16;
-                uint8_t type = e[4];
-                if (type == 0x07) {
-                    terminal_printf("[FAT] %s: exFAT/NTFS partition (not supported yet)\n", info.name);
-                    rc = -3;
-                } else if (type == 0x04 || type == 0x06 || type == 0x0E || type == 0x0B || type == 0x0C) {
-                    rc = try_volume(dev, le32(e + 8), mount);
-                }
+    char mount[16];
+    snprintf(mount, sizeof(mount), "/jarvis/%s", info.name);
+    kmutex_lock(g_lock);
+    int rc = try_volume(dev, 0, mount);                     /* whole drive is one volume */
+    if (rc == -1 && mbr[510] == 0x55 && mbr[511] == 0xAA) {
+        for (int p = 0; p < 4 && rc != 0; p++) {            /* first FAT partition */
+            const uint8_t *e = mbr + 446 + p * 16;
+            uint8_t type = e[4];
+            if (type == 0x07) {
+                terminal_printf("[FAT] %s: exFAT/NTFS partition (not supported yet)\n", info.name);
+                rc = -3;
+            } else if (type == 0x04 || type == 0x06 || type == 0x0E || type == 0x0B || type == 0x0C) {
+                rc = try_volume(dev, le32(e + 8), mount);
             }
         }
-        if (rc == 0) {
-            fat_vol_t *v = &g_vols[n++];
-            vfs_mount_point(mount);
-            terminal_printf("[FAT] %s: %s volume%s%s, %u MB, mounted at %s (read-only)\n", info.name,
-                v->fat32 ? "FAT32" : "FAT16", v->label[0] ? " " : "", v->label,
-                (unsigned)(v->total_bytes >> 20), mount);
-        } else if (rc == -1 || rc == -2) {
-            terminal_printf("[FAT] %s: no FAT file system found\n", info.name);
-        }
+    }
+    kmutex_unlock(g_lock);
+
+    char msg[96];
+    if (rc == 0) {
+        fat_vol_t *v = NULL;
+        for (int i = 0; i < FAT_MAX_VOLS; i++)
+            if (g_vols[i].used && g_vols[i].dev == dev) v = &g_vols[i];
+        vfs_mount_point(mount);
+        terminal_printf("[FAT] %s: %s volume%s%s, %u MB (%u MB free), mounted at %s (read-only)\n",
+            info.name, v->fat32 ? "FAT32" : "FAT16", v->label[0] ? " " : "", v->label,
+            (unsigned)(v->total_bytes >> 20), (unsigned)(v->free_bytes >> 20), mount);
+        snprintf(msg, sizeof(msg), "USB drive connected: %s", v->label[0] ? v->label : info.model);
+    } else {
+        terminal_printf("[FAT] %s: no readable FAT file system\n", info.name);
+        snprintf(msg, sizeof(msg), "USB drive connected, but its format is not supported (%s)", info.name);
+    }
+    if (g_kstate.uptime_ticks > 1000)               /* not for drives present at boot */
+        scheduler_post_event(msg);
+    g_storage_generation++;
+    return rc == 0 ? 0 : -1;
+}
+
+void fatfs_unmount_dev(int dev)
+{
+    if (g_lock < 0) return;
+    kmutex_lock(g_lock);
+    for (int i = 0; i < FAT_MAX_VOLS; i++) {
+        if (!g_vols[i].used || g_vols[i].dev != dev) continue;
+        vfs_unmount_point(g_vols[i].mount);
+        terminal_printf("[FAT] %s unmounted\n", g_vols[i].mount);
+        g_vols[i].used = 0;
+    }
+    g_fatsec_dev = -1;
+    kmutex_unlock(g_lock);
+    g_storage_generation++;
+}
+
+void fatfs_mount_all(void)
+{
+    if (g_lock < 0) g_lock = kmutex_create("fatfs");
+    for (int dev = 0; dev < block_count(); dev++) {
+        block_info_t info;
+        if (block_get_info(dev, &info) == 0 && strncmp(info.name, "usb", 3) == 0)
+            fatfs_mount_dev(dev);
     }
 }

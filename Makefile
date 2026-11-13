@@ -79,8 +79,11 @@ QEMU_NET  := -netdev user,id=net0 -device e1000,netdev=net0
 # USB 3 controller. To give JARVIS OS a USB flash drive image:
 #   make run QEMU_USB_EXTRA="-drive id=stick,file=stick.img,if=none,format=raw -device usb-storage,drive=stick"
 QEMU_USB  := -device qemu-xhci,id=xhci $(QEMU_USB_EXTRA)
+# Control socket used by tools/usb_stick.py to plug USB drives in and out.
+QEMU_MONITOR := -monitor unix:/tmp/jarvis-qemu-monitor-$(shell id -u).sock,server,nowait
 QEMU_FLAGS := -cdrom $(ISO_OUT) -boot d -m $(QEMU_MEM) -serial stdio \
-              -rtc base=localtime $(QEMU_AUDIO) $(QEMU_DISK) $(QEMU_NET) $(QEMU_USB)
+              -rtc base=localtime $(QEMU_AUDIO) $(QEMU_DISK) $(QEMU_NET) $(QEMU_USB) \
+              $(QEMU_MONITOR)
 
 # Host voice bridge: COM2 is exposed as this socket; tools/voice_bridge.py
 # records the host microphone, transcribes it with whisper.cpp and sends the
@@ -92,7 +95,7 @@ VOICE_SOCKET := /tmp/jarvis-voice.sock
 GRUB_MKRESCUE_FLAGS := --compress=xz --locales= --themes= --fonts=unicode
 GRUB_THEME_DIR := $(ISO_DIR)/boot/grub/themes/jarvis
 
-.PHONY: all clean check iso iso-models run qemu run-headless run-voice voice-install voice-enroll voice-setup voice-render FORCE
+.PHONY: all clean check iso iso-models run qemu run-headless run-voice voice-install voice-enroll voice-setup voice-render usb-list usb-attach usb-image usb-detach FORCE
 
 all: kernel.elf
 
@@ -155,6 +158,20 @@ voice-setup:
 # finished sentences are kept, so it can be stopped and resumed.
 voice-render:
 	tools/voice-venv/bin/python tools/voice_engine.py --render tools/voice_phrases.txt
+
+# USB drives for the running VM (see tools/usb_stick.py):
+#   make usb-list                 drives connected to this computer
+#   make usb-attach DEV=vid:pid   plug one into JARVIS OS
+#   make usb-image IMG=file.img   plug in a disk image as a USB drive
+#   make usb-detach               unplug it again
+usb-list:
+	@$(PYTHON) tools/usb_stick.py list
+usb-attach:
+	@$(PYTHON) tools/usb_stick.py attach $(DEV)
+usb-image:
+	@$(PYTHON) tools/usb_stick.py image $(IMG)
+usb-detach:
+	@$(PYTHON) tools/usb_stick.py detach
 
 # Record your own voice for JARVIS to speak with (writes tools/voice/).
 voice-enroll:

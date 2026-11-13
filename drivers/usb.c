@@ -14,9 +14,12 @@
  *
  * Other devices (keyboards, Bluetooth adapters, phones, cameras) are
  * identified and listed in the device manager, but have no driver yet.
- * Devices behind an external USB hub, and devices plugged in after boot,
- * are not detected. Everything is polled; the controller's interrupts are
- * not used.
+ *
+ * Plugging in and unplugging: a kernel process ("usb") checks the root-hub
+ * ports twice a second; new devices are set up, removed ones are torn down
+ * and their drives disappear from the file manager. Devices behind an
+ * external USB hub are not detected. Everything is polled; the controller's
+ * interrupts are not used. One mutex serialises all controller access.
  *
  * Follows the xHCI 1.2 and USB Mass Storage Bulk-Only 1.0 specifications.
  * =============================================================================
@@ -57,6 +60,7 @@ typedef struct {
 
 typedef struct {
     int      used;
+    int      block_dev;         /* registered block device, -1 = none */
     int      slot;
     int      port;              /* root-hub port, 1-based */
     int      speed;             /* 1 full, 2 low, 3 high, 4 super */
@@ -86,6 +90,8 @@ static int       g_max_ports;
 static usb_dev_t g_devs[USB_MAX_DEVS];
 static int       g_dev_count = 0;
 static int       usb_ready = 0;
+static int       g_lock = -1;
+static uint8_t   g_port_tries[256];  /* failed set-up attempts per port */
 
 /* ---- Small helpers ------------------------------------------------------- */
 static uint32_t rd32(volatile uint8_t *base, uint32_t off) { return *(volatile uint32_t *)(base + off); }
@@ -102,6 +108,13 @@ static void *dma_alloc(uint32_t pages)
     if (!p || p + pages * 4096ULL > 0x100000000ULL) return NULL;
     memset((void *)p, 0, pages * 4096ULL);
     return (void *)p;
+}
+
+static void dma_free(void *p, uint32_t pages)
+{
+    if (!p) return;
+    for (uint32_t i = 0; i < pages; i++)
+        pmm_free_frame((uint64_t)(uintptr_t)p + i * 4096ULL);
 }
 
 static void delay_ms(uint32_t ms)
@@ -235,16 +248,21 @@ static int scsi(usb_dev_t *d, const uint8_t *cdb, int cdb_len, int in, void *dat
 
 static int msc_rw(usb_dev_t *d, int write, uint64_t lba, uint32_t count, uint8_t *buf)
 {
-    while (count) {
+    if (g_lock >= 0) kmutex_lock(g_lock);
+    int rc = 0;
+    while (count && rc == 0) {
         uint32_t n = count > MSC_BUF / 512 ? MSC_BUF / 512 : count;
         uint8_t cdb[10] = { write ? 0x2A : 0x28, 0,
                             (uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
                             0, (uint8_t)(n >> 8), (uint8_t)n, 0 };
-        if (lba + n > 0xFFFFFFFFULL || scsi(d, cdb, 10, !write, buf, n * 512) != 0)
-            return -1;
+        if (!d->used || lba + n > 0xFFFFFFFFULL || scsi(d, cdb, 10, !write, buf, n * 512) != 0) {
+            rc = -1;
+            break;
+        }
         buf += n * 512; lba += n; count -= n;
     }
-    return 0;
+    if (g_lock >= 0) kmutex_unlock(g_lock);
+    return rc;
 }
 
 static int msc_read(void *c, uint64_t lba, uint32_t count, void *buf)
@@ -323,11 +341,21 @@ static void msc_attach(usb_dev_t *d, uint8_t ep_in, uint16_t mps_in, uint8_t ep_
     }
     d->blocks = (uint64_t)last + 1;
 
-    static int msc_count = 0;
+    /* lowest free usbN name, so a re-plugged stick gets its old name back */
     char name[8] = "usb0";
-    name[3] = (char)('0' + msc_count++);
+    for (int n = 0; n < 10; n++) {
+        name[3] = (char)('0' + n);
+        int taken = 0;
+        for (int i = 0; i < USB_MAX_DEVS; i++) {
+            block_info_t bi;
+            if (g_devs[i].used && g_devs[i].block_dev >= 0 &&
+                block_get_info(g_devs[i].block_dev, &bi) == 0 && !strcmp(bi.name, name))
+                taken = 1;
+        }
+        if (!taken) break;
+    }
     strncpy(d->driver, "usb-storage", sizeof(d->driver) - 1);
-    block_register(name, d->name, d->blocks, msc_read, msc_write, NULL, d);
+    d->block_dev = block_register(name, d->name, d->blocks, msc_read, msc_write, NULL, d);
     terminal_printf("[USB] %s: %s, %llu MB\n", name, d->name, (unsigned long long)(d->blocks / 2048));
 }
 
@@ -349,21 +377,38 @@ static const char *class_name(uint8_t cls, uint8_t sub, uint8_t proto)
     }
 }
 
-static void enumerate_port(int port, int speed)
+static void device_free(usb_dev_t *d)
 {
-    if (g_dev_count >= USB_MAX_DEVS) return;
-    usb_dev_t *d = &g_devs[g_dev_count];
+    dma_free(d->out_ctx, 1);
+    dma_free(d->in_ctx, 2);
+    dma_free(d->buf, MSC_BUF / 4096);
+    dma_free(d->ep0.trbs, 1);
+    dma_free(d->bulk_in.trbs, 1);
+    dma_free(d->bulk_out.trbs, 1);
     memset(d, 0, sizeof(*d));
+    d->block_dev = -1;
+}
+
+/* Returns 1 if a device was set up on the port. */
+static int enumerate_port(int port, int speed)
+{
+    usb_dev_t *d = NULL;
+    for (int i = 0; i < USB_MAX_DEVS; i++)
+        if (!g_devs[i].used && !g_devs[i].slot) { d = &g_devs[i]; break; }
+    if (!d) return 0;
+    memset(d, 0, sizeof(*d));
+    d->block_dev = -1;
+    if (d - g_devs >= g_dev_count) g_dev_count = (int)(d - g_devs) + 1;
     trb_t ev;
 
-    if (command(0, TRB_ENABLE_SLOT << 10, &ev) != CC_SUCCESS) return;
+    if (command(0, TRB_ENABLE_SLOT << 10, &ev) != CC_SUCCESS) return 0;
     d->slot = (int)(ev.control >> 24);
     d->port = port;
     d->speed = speed;
     d->out_ctx = (uint8_t *)dma_alloc(1);
     d->in_ctx = (uint8_t *)dma_alloc(2);
     d->buf = (uint8_t *)dma_alloc(MSC_BUF / 4096);
-    if (!d->out_ctx || !d->in_ctx || !d->buf || ring_init(&d->ep0)) return;
+    if (!d->out_ctx || !d->in_ctx || !d->buf || ring_init(&d->ep0)) goto fail;
     g_dcbaa[d->slot] = (uint64_t)(uintptr_t)d->out_ctx;
 
     uint16_t mps0 = speed == 4 ? 512 : speed == 3 ? 64 : 8;
@@ -380,20 +425,20 @@ static void enumerate_port(int port, int speed)
     if (command((uint64_t)(uintptr_t)d->in_ctx, (TRB_ADDRESS_DEV << 10) | ((uint32_t)d->slot << 24), NULL)
         != CC_SUCCESS) {
         terminal_printf("[USB] Port %d: device did not accept an address\n", port);
-        return;
+        goto fail;
     }
 
     uint8_t desc[18];
-    if (control(d, 0x80, 6, 0x0100, 0, desc, 18) != 0) return;
+    if (control(d, 0x80, 6, 0x0100, 0, desc, 18) != 0) goto fail;
     d->vendor = (uint16_t)(desc[8] | (desc[9] << 8));
     d->product = (uint16_t)(desc[10] | (desc[11] << 8));
     d->dev_class = desc[4]; d->dev_subclass = desc[5]; d->dev_protocol = desc[6];
 
     uint8_t cfg[512];
-    if (control(d, 0x80, 6, 0x0200, 0, cfg, 9) != 0) return;
+    if (control(d, 0x80, 6, 0x0200, 0, cfg, 9) != 0) goto fail;
     uint16_t total = (uint16_t)(cfg[2] | (cfg[3] << 8));
     if (total > sizeof(cfg)) total = sizeof(cfg);
-    if (control(d, 0x80, 6, 0x0200, 0, cfg, total) != 0) return;
+    if (control(d, 0x80, 6, 0x0200, 0, cfg, total) != 0) goto fail;
 
     /* First interface decides what the device is; note bulk endpoints. */
     int iface_seen = 0, is_msc = 0;
@@ -415,13 +460,33 @@ static void enumerate_port(int port, int speed)
 
     snprintf(d->name, sizeof(d->name), "%s", class_name(d->dev_class, d->dev_subclass, d->dev_protocol));
     d->used = 1;
-    g_dev_count++;
     terminal_printf("[USB] Port %d: %s (%04x:%04x)\n", port, d->name, d->vendor, d->product);
 
     if (control(d, 0x00, 9, cfg[5], 0, NULL, 0) != 0)       /* SET_CONFIGURATION */
-        return;
+        return 1;
     if (is_msc && ep_in && ep_out)
         msc_attach(d, ep_in, mps_in, ep_out, mps_out);
+    return 1;
+
+fail:
+    if (d->slot) {
+        g_dcbaa[d->slot] = 0;
+        command(0, (10u << 10) | ((uint32_t)d->slot << 24), NULL);     /* DISABLE_SLOT */
+    }
+    device_free(d);
+    return 0;
+}
+
+/* The device on a port was unplugged. Returns its block device or -1. */
+static int detach(usb_dev_t *d)
+{
+    int dev = d->block_dev;
+    terminal_printf("[USB] Port %d: %s removed\n", d->port, d->name);
+    if (dev >= 0) block_remove(dev);
+    g_dcbaa[d->slot] = 0;
+    command(0, (10u << 10) | ((uint32_t)d->slot << 24), NULL);         /* DISABLE_SLOT */
+    device_free(d);
+    return dev;
 }
 
 /* ---- Controller bring-up ------------------------------------------------- */
@@ -434,6 +499,92 @@ static int wait32(volatile uint8_t *base, uint32_t off, uint32_t mask, uint32_t 
 }
 
 #define PORT_RO_RWS  ((1u << 0) | (1u << 3) | (0xFu << 10) | (1u << 30) | (0xFu << 5) | (1u << 9) | (3u << 14) | (7u << 25))
+
+static usb_dev_t *device_on_port(int port)
+{
+    for (int i = 0; i < USB_MAX_DEVS; i++)
+        if (g_devs[i].used && g_devs[i].port == port) return &g_devs[i];
+    return NULL;
+}
+
+/* Enable the port if needed and set up the device on it. Returns 1 if a
+ * device is now working there. */
+static int port_bringup(int p)
+{
+    uint32_t off = 0x400 + (uint32_t)(p - 1) * 0x10;
+    uint32_t sc = rd32(g_op, off);
+    if (!(sc & 1)) return 0;                                /* nothing connected */
+
+    if (!(sc & 2) && ((sc >> 5) & 15) != 5) {               /* USB 2 (not USB 3 RxDetect): reset */
+        wr32(g_op, off, (sc & PORT_RO_RWS) | (1u << 4));
+        if (wait32(g_op, off, 1u << 21, 1u << 21, 500)) return 0;
+        delay_ms(20);
+    }
+    sc = rd32(g_op, off);
+    wr32(g_op, off, (sc & PORT_RO_RWS) | (0x7Fu << 17));    /* clear change bits */
+    if (!(sc & 2)) return 0;                                /* not enabled (yet) */
+    return enumerate_port(p, (int)((sc >> 10) & 15));
+}
+
+/* Consume pending events (port changes etc.) so the event ring never fills. */
+static void drain_events(void)
+{
+    for (int n = 0; n < RING_TRBS; n++) {
+        trb_t *e = &g_evt[g_evt_index];
+        if ((e->control & 1) != g_evt_cycle) break;
+        if (++g_evt_index == RING_TRBS) { g_evt_index = 0; g_evt_cycle ^= 1; }
+        wr64(g_rt, 0x20 + 0x18, (uint64_t)(uintptr_t)&g_evt[g_evt_index] | (1u << 3));
+    }
+}
+
+static int usb_device_count(void);
+
+static void usb_hotplug_process(void)
+{
+    for (;;) {
+        kthread_sleep(50);
+        int added[USB_MAX_DEVS], removed[USB_MAX_DEVS], na = 0, nr = 0;
+
+        kmutex_lock(g_lock);
+        drain_events();
+        for (int p = 1; p <= g_max_ports && p < 256; p++) {
+            uint32_t off = 0x400 + (uint32_t)(p - 1) * 0x10;
+            uint32_t sc = rd32(g_op, off);
+            usb_dev_t *d = device_on_port(p);
+
+            if (!(sc & 1)) {                                /* empty */
+                g_port_tries[p] = 0;
+                if (d) {
+                    int dev = detach(d);
+                    if (dev >= 0) removed[nr++] = dev;
+                }
+                if (sc & (0x7Fu << 17)) wr32(g_op, off, (sc & PORT_RO_RWS) | (0x7Fu << 17));
+                continue;
+            }
+            if (d || g_port_tries[p] >= 3) continue;        /* already set up / gave up */
+
+            if (port_bringup(p)) {
+                d = device_on_port(p);
+                if (d && d->block_dev >= 0) added[na++] = d->block_dev;
+                else if (d) g_storage_generation++;          /* device manager refresh */
+            } else {
+                g_port_tries[p]++;
+            }
+        }
+        kmutex_unlock(g_lock);
+
+        /* File systems are mounted outside the USB lock: they read through it. */
+        for (int i = 0; i < nr; i++) fatfs_unmount_dev(removed[i]);
+        for (int i = 0; i < na; i++) fatfs_mount_dev(added[i]);
+        if (nr) scheduler_post_event("USB drive removed");
+    }
+}
+
+void usb_start_hotplug(void)
+{
+    if (usb_ready)
+        proc_spawn("usb", usb_hotplug_process, PRIO_SYSTEM, 0);
+}
 
 void usb_init(void)
 {
@@ -520,39 +671,38 @@ void usb_init(void)
     g_kstate.usb_ready = 1;
     terminal_printf("[USB] xHCI controller running, %d ports\n", g_max_ports);
 
+    for (int i = 0; i < USB_MAX_DEVS; i++) g_devs[i].block_dev = -1;
+    g_lock = kmutex_create("usb");
     delay_ms(100);                                          /* let ports settle */
-    for (int p = 1; p <= g_max_ports; p++) {
-        uint32_t off = 0x400 + (uint32_t)(p - 1) * 0x10;
-        uint32_t sc = rd32(g_op, off);
-        if (!(sc & 1)) continue;                            /* nothing connected */
-
-        if (!(sc & 2)) {                                    /* USB 2: reset to enable */
-            wr32(g_op, off, (sc & PORT_RO_RWS) | (1u << 4));
-            if (wait32(g_op, off, 1u << 21, 1u << 21, 500)) continue;
-            delay_ms(20);
-        }
-        sc = rd32(g_op, off);
-        wr32(g_op, off, (sc & PORT_RO_RWS) | (0x7Fu << 17));  /* clear change bits */
-        if (!(sc & 2)) continue;
-        enumerate_port(p, (int)((sc >> 10) & 15));
-    }
-    terminal_printf("[USB] %d device(s) found\n", g_dev_count);
+    for (int p = 1; p <= g_max_ports; p++)
+        port_bringup(p);
+    terminal_printf("[USB] %d device(s) found\n", usb_device_count());
 }
 
 int usb_is_ready(void)    { return usb_ready; }
 int camera_is_ready(void) { return 0; }
 
-/* For the device manager. */
-int usb_device_count(void) { return g_dev_count; }
+/* For the device manager: devices currently connected. */
+static int usb_device_count(void)
+{
+    int n = 0;
+    for (int i = 0; i < USB_MAX_DEVS; i++) if (g_devs[i].used) n++;
+    return n;
+}
 
-int usb_device_info(int i, char *name, size_t name_len, char *driver, size_t drv_len,
+int usb_device_total(void) { return usb_device_count(); }
+
+int usb_device_info(int nth, char *name, size_t name_len, char *driver, size_t drv_len,
                     uint16_t *vendor, uint16_t *product, int *port)
 {
-    if (i < 0 || i >= g_dev_count) return -1;
-    snprintf(name, name_len, "%s", g_devs[i].name);
-    snprintf(driver, drv_len, "%s", g_devs[i].driver);
-    *vendor = g_devs[i].vendor;
-    *product = g_devs[i].product;
-    *port = g_devs[i].port;
-    return 0;
+    for (int i = 0; i < USB_MAX_DEVS; i++) {
+        if (!g_devs[i].used || nth--) continue;
+        snprintf(name, name_len, "%s", g_devs[i].name);
+        snprintf(driver, drv_len, "%s", g_devs[i].driver);
+        *vendor = g_devs[i].vendor;
+        *product = g_devs[i].product;
+        *port = g_devs[i].port;
+        return 0;
+    }
+    return -1;
 }

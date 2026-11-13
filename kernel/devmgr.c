@@ -124,7 +124,7 @@ void devmgr_init(void)
     }
 
     /* Devices found on the USB ports */
-    for (int i = 0; i < usb_device_count(); i++) {
+    for (int i = 0; i < usb_device_total(); i++) {
         char drv[16];
         uint16_t vid, pid;
         int port;
@@ -146,13 +146,20 @@ void devmgr_init(void)
     int unbound = 0;
     for (int i = 0; i < g_dev_count; i++)
         if (!g_devs[i].info.driver[0]) unbound++;
-    terminal_printf("[DEV] Device manager: %d device(s), %d without a driver\n",
-        g_dev_count, unbound);
+    static int logged = 0;
+    if (!logged++)
+        terminal_printf("[DEV] Device manager: %d device(s), %d without a driver\n",
+            g_dev_count, unbound);
 }
 
 /* Fills out[] with current device status; returns the number of devices. */
 int devmgr_list(dev_info_t *out, int max)
 {
+    static uint32_t seen_generation;
+    if (seen_generation != g_storage_generation) {      /* something was plugged in or out */
+        seen_generation = g_storage_generation;
+        devmgr_init();
+    }
     int n = 0;
     for (int i = 0; i < g_dev_count && n < max; i++) {
         dev_entry_t *d = &g_devs[i];

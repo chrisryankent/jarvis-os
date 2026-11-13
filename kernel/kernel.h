@@ -185,7 +185,10 @@ typedef struct {
     uint64_t interrupts;            /* raised since boot            */
     uint32_t owner_pid;             /* 0 = not claimed              */
 } dev_info_t;
-int  usb_device_count(void);
+int  usb_device_total(void);                 /* currently connected */
+void usb_start_hotplug(void);
+int  fatfs_mount_dev(int dev);
+void fatfs_unmount_dev(int dev);
 int  usb_device_info(int i, char *name, size_t name_len, char *driver, size_t drv_len,
                      uint16_t *vendor, uint16_t *product, int *port);
 void devmgr_init(void);
@@ -202,8 +205,18 @@ int  fatfs_owns(const char *path);
 int  fatfs_stat(const char *path, int *is_dir, uint32_t *size);
 int  fatfs_list(const char *path, char *buf, size_t max);
 int  fatfs_read(const char *path, uint64_t offset, void *buf, size_t len);
-int  fatfs_volume_info(int i, char *mount, size_t mlen, char *label, size_t llen, uint64_t *bytes);
 void vfs_mount_point(const char *path);
+void vfs_unmount_point(const char *path);
+
+typedef struct {
+    char     name[48];              /* "Local Disk", volume label, "USB Drive" */
+    char     mount[32];             /* folder it appears as; "" if unreadable  */
+    char     device[16];            /* sd0, usb0, ...                          */
+    char     fs[12];                /* JARVISFS, FAT32, Unsupported, ...       */
+    int      removable, read_only;
+    uint64_t total, free;           /* bytes */
+} drive_info_t;
+int storage_list(drive_info_t *out, int max);
 
 /* ---- Block devices (kernel/block.c) --------------------------------------- */
 typedef struct {
@@ -217,7 +230,9 @@ int  block_register(const char *name, const char *model, uint64_t sectors,
                     int (*read)(void *, uint64_t, uint32_t, void *),
                     int (*write)(void *, uint64_t, uint32_t, const void *),
                     int (*flush)(void *), void *ctx);
-int  block_count(void);
+int  block_count(void);             /* slots; removed ones fail block_get_info */
+void block_remove(int dev);
+extern volatile uint32_t g_storage_generation;
 int  block_get_info(int dev, block_info_t *out);
 int  block_read(int dev, uint64_t lba, uint32_t count, void *buf);
 int  block_write(int dev, uint64_t lba, uint32_t count, const void *buf);

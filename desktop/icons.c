@@ -140,6 +140,43 @@ void icon_draw(icon_id_t icon, int x, int y, int size)
         ic_rr(&c, 7, 20, 10, 2, 1, 0x009AA7B0);
         break;
 
+    case ICON_DRIVE:
+        ic_rr(&c, 2, 8, 20, 10, 2, 0x007A8892);
+        ic_rr(&c, 3, 9, 18, 6, 1, 0x00B8C4CC);
+        ic_rect(&c, 5, 16, 14, 1, 0x00505A60);
+        ic_circle(&c, 18, 12, 1, 0x0040D080);
+        break;
+
+    case ICON_USB:
+        ic_rr(&c, 6, 2, 12, 7, 1, 0x009AA7B0);
+        ic_rect(&c, 8, 4, 2, 2, 0x00404850);
+        ic_rect(&c, 14, 4, 2, 2, 0x00404850);
+        ic_rr(&c, 4, 9, 16, 13, 3, 0x002F6FD0);
+        ic_rect(&c, 9, 13, 6, 1, 0x00FFFFFF);
+        ic_rect(&c, 11, 11, 2, 5, 0x00FFFFFF);
+        break;
+
+    case ICON_PACKAGE:
+        ic_rr(&c, 3, 6, 18, 15, 2, 0x00C8904A);
+        ic_rect(&c, 3, 6, 18, 4, 0x00A8743A);
+        ic_rect(&c, 10, 6, 4, 15, 0x00E8C890);
+        break;
+
+    case ICON_PROGRAM:
+        ic_rr(&c, 2, 3, 20, 18, 3, 0x003A7BD5);
+        ic_rect(&c, 2, 3, 20, 4, 0x002A5BA5);
+        ic_rr(&c, 6, 10, 12, 8, 1, 0x00E8F2FF);
+        break;
+
+    case ICON_STORE:
+        ic_rr(&c, 3, 7, 18, 15, 3, 0x002F6FD0);
+        ic_ring(&c, 12, 7, 5, 3, 0x002F6FD0);
+        ic_rect(&c, 7, 11, 4, 4, 0x00F25022);
+        ic_rect(&c, 13, 11, 4, 4, 0x007FBA00);
+        ic_rect(&c, 7, 16, 4, 4, 0x0000A4EF);
+        ic_rect(&c, 13, 16, 4, 4, 0x00FFB900);
+        break;
+
     case ICON_TRASH:
         ic_rect(&c, 9, 2, 6, 2, 0x008896A0);
         ic_rr(&c, 4, 4, 16, 3, 1, 0x00B8C4CC);
@@ -238,6 +275,24 @@ void glyph_draw(glyph_id_t glyph, int x, int y, int size, uint32_t fg, uint32_t 
         ic_line(&c, 4, 12, 20, 12, fg);
         ic_line(&c, 4, 12, 10, 6, fg);
         ic_line(&c, 4, 12, 10, 18, fg);
+        break;
+
+    case GLYPH_FORWARD:
+        ic_line(&c, 4, 12, 20, 12, fg);
+        ic_line(&c, 20, 12, 14, 6, fg);
+        ic_line(&c, 20, 12, 14, 18, fg);
+        break;
+
+    case GLYPH_GRID:
+        ic_rect(&c, 4, 4, 7, 7, fg);  ic_rect(&c, 13, 4, 7, 7, fg);
+        ic_rect(&c, 4, 13, 7, 7, fg); ic_rect(&c, 13, 13, 7, 7, fg);
+        break;
+
+    case GLYPH_LIST:
+        for (int r = 0; r < 4; r++) {
+            ic_rect(&c, 4, 5 + r * 4, 3, 2, fg);
+            ic_rect(&c, 9, 5 + r * 4, 11, 2, fg);
+        }
         break;
 
     case GLYPH_UP:
