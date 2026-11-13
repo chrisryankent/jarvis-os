@@ -96,3 +96,8 @@ __pycache__/
 .claude/settings.local.json
 .agents/
 .codex/
+
+# Personal voice recordings (biometric data: never commit)
+tools/voice/
+tools/voice-venv/
+user/*.elf

@@ -38,7 +38,16 @@ INPUT_OBJS :=
 AI_OBJS := ai_core/runtime.o
 SECURITY_OBJS := security/security.o
 SPEECH_OBJS := speech/speech_engine.o
-EXTRA_OBJS := kernel/syscall_entry.o
+EXTRA_OBJS := kernel/syscall_entry.o user/programs.o
+
+# User-mode programs (ring 3). Built as static ELF files and bundled into
+# the kernel image, which installs them in /jarvis/bin at boot.
+USER_PROGS  := hello counter kernelpoke privileged
+USER_ELFS   := $(USER_PROGS:%=user/%.elf)
+USER_CFLAGS := -std=c17 -ffreestanding -nostdlib -static -fno-pic -no-pie \
+               -mcmodel=large -mgeneral-regs-only -fno-stack-protector -O2 \
+               -Wall -Wextra -U_FORTIFY_SOURCE -Wl,-T,user/user.ld \
+               -Wl,--build-id=none -Wl,-z,max-page-size=4096
 OBJS := $(BOOT_OBJS) $(DRIVER_OBJS) $(DESKTOP_OBJS) $(WM_OBJS) \
         $(INPUT_OBJS) $(AI_OBJS) $(SECURITY_OBJS) $(SPEECH_OBJS) \
         $(EXTRA_OBJS)
@@ -48,13 +57,23 @@ QEMU      := qemu-system-x86_64
 # default 128 MB is not enough.
 QEMU_MEM  := 2G
 # -rtc base=localtime: the taskbar clock shows your local time, not UTC.
-QEMU_FLAGS := -cdrom $(ISO_OUT) -m $(QEMU_MEM) -serial stdio -rtc base=localtime
+# AC97: gives the guest a sound card wired to the host microphone/speakers
+# (the kernel has an AC97 capture + playback driver).
+QEMU_AUDIO ?= -audiodev pa,id=snd0 -device AC97,audiodev=snd0
+QEMU_FLAGS := -cdrom $(ISO_OUT) -m $(QEMU_MEM) -serial stdio \
+              -rtc base=localtime $(QEMU_AUDIO)
 
-# Keep the ISO small (about 5 MB instead of 25 MB): compress GRUB and leave
-# out its locales, fonts and themes, none of which the boot menu needs.
-GRUB_MKRESCUE_FLAGS := --compress=xz --locales= --fonts= --themes=
+# Host voice bridge: COM2 is exposed as this socket; tools/voice_bridge.py
+# records the host microphone, transcribes it with whisper.cpp and sends the
+# text to the guest.
+VOICE_SOCKET := /tmp/jarvis-voice.sock
 
-.PHONY: all clean check iso iso-models run qemu run-headless FORCE
+# Keep the ISO small: compress GRUB and ship only what the themed boot menu
+# needs (the unicode font; no locales or stock themes).
+GRUB_MKRESCUE_FLAGS := --compress=xz --locales= --themes= --fonts=unicode
+GRUB_THEME_DIR := $(ISO_DIR)/boot/grub/themes/jarvis
+
+.PHONY: all clean check iso iso-models run qemu run-headless run-voice voice-enroll voice-setup FORCE
 
 all: kernel.elf
 
@@ -80,9 +99,26 @@ run: iso
 
 qemu: run
 
-# No window: serial log only (Ctrl-A then X to quit).
+# No window: serial log only (Ctrl-C to quit).
 run-headless: iso
 	$(QEMU) $(QEMU_FLAGS) -display none
+
+# Desktop + voice: starts QEMU and the host microphone bridge together, so
+# what you say is transcribed and delivered to JARVIS.
+run-voice: iso
+	rm -f $(VOICE_SOCKET)
+	$(PYTHON) tools/run_qemu_voice.py --socket $(VOICE_SOCKET) -- \
+		$(QEMU) $(QEMU_FLAGS) -serial unix:$(VOICE_SOCKET),server,nowait
+
+# Make the voice bridge speak through the voice-cloning engine installed in
+# tools/voice-venv, and load its model once (the first run downloads it).
+voice-setup:
+	tools/voice-venv/bin/python tools/voice_engine.py --configure
+	tools/voice-venv/bin/python tools/voice_engine.py --warm
+
+# Record your own voice for JARVIS to speak with (writes tools/voice/).
+voice-enroll:
+	$(PYTHON) tools/record_voice.py
 
 kernel.elf: $(KERNEL_CORE) $(OBJS)
 	$(LD) $(LDFLAGS) $(KERNEL_CORE) $(OBJS) -o $@
@@ -96,6 +132,12 @@ $(DRIVER_OBJS) $(DESKTOP_OBJS) $(WM_OBJS) $(INPUT_OBJS): %.o: %.c
 $(AI_OBJS) $(SECURITY_OBJS) $(SPEECH_OBJS): %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+user/%.elf: user/%.c user/crt0.S user/jarvis.h user/user.ld
+	$(CC) $(USER_CFLAGS) user/crt0.S $< -o $@
+
+user/programs.o: user/programs.S $(USER_ELFS)
+	$(CC) -c user/programs.S -o $@
+
 kernel/syscall_entry.o: kernel/syscall_entry.S
 	$(AS) $(ASFLAGS) $< -o $@
 
@@ -107,6 +149,8 @@ iso: kernel.elf
 	rm -rf $(ISO_DIR)
 	mkdir -p $(ISO_DIR)/boot/grub build
 	cp configs/grub.cfg $(ISO_DIR)/boot/grub/grub.cfg
+	mkdir -p $(GRUB_THEME_DIR)
+	cp configs/grub-theme/theme.txt configs/grub-theme/*.png $(GRUB_THEME_DIR)/
 	cp kernel.elf $(ISO_DIR)/boot/kernel.elf
 	if command -v grub-mkrescue >/dev/null 2>&1; then \
 		rm -f $(ISO_OUT); \
@@ -120,6 +164,8 @@ iso-models: kernel.elf
 	$(PYTHON) scripts/sync_models.py
 	mkdir -p $(ISO_DIR)/boot/grub build
 	cp configs/grub.cfg $(ISO_DIR)/boot/grub/grub.cfg
+	mkdir -p $(GRUB_THEME_DIR)
+	cp configs/grub-theme/theme.txt configs/grub-theme/*.png $(GRUB_THEME_DIR)/
 	cp kernel.elf $(ISO_DIR)/boot/kernel.elf
 	if command -v grub-mkrescue >/dev/null 2>&1; then \
 		rm -f $(ISO_OUT); \
@@ -130,6 +176,6 @@ iso-models: kernel.elf
 	fi
 
 clean:
-	rm -f kernel.elf $(OBJS)
+	rm -f kernel.elf $(OBJS) $(USER_ELFS)
 	$(MAKE) -C kernel clean
 	rm -rf $(ISO_DIR) build

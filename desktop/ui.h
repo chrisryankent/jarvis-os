@@ -165,6 +165,25 @@ void desktop_draw(void);
 int  desktop_handle_click(int x, int y);
 const char *desktop_get_icon_target(int index);
 void desktop_wallpaper_invalidate(void);
+int  desktop_icon_at(int x, int y);
+void desktop_files_changed(void);             /* Desktop folder contents changed */
+int  desktop_rename_active(void);
+void desktop_rename_input(uint32_t key, char ch);
+void desktop_rename_finish(int commit);
+void desktop_delete_selected(void);
+
+/* ---- Popup menu (desktop/desktop.c) -------------------------------------- */
+typedef struct {
+    const char *label;
+    int id;                     /* passed to the callback when chosen */
+    int disabled;               /* shown greyed out, not clickable    */
+    int separator_before;
+} ui_menu_item_t;
+typedef void (*ui_menu_cb)(int id, void *ctx);
+
+/* Opens a popup menu at screen position (x,y). Items are copied. */
+void ui_menu_open(int x, int y, const ui_menu_item_t *items, int count,
+                  ui_menu_cb callback, void *ctx);
 int  desktop_context_is_open(void);
 void desktop_context_open(int x, int y);
 void desktop_context_close(void);

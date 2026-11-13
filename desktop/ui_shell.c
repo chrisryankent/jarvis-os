@@ -103,23 +103,9 @@ static void draw_loading(void)
 
     int progress = 15 + (g_ui.line_count * 12) % 80;
     ui_progress(cx - 120, cy + 50, 240, 6, progress, 0x00203040, T(ACCENT));
-    ui_text_center(0, cy + 72, W, g_ui.status, 0x00C0D0E0);
-}
-
-static void draw_setup(void)
-{
-    int W = (int)fb_get_width(), H = (int)fb_get_height();
-    int pw = 520, ph = 220;
-    int x = (W - pw) / 2, y = (H - ph) / 2;
-
-    draw_backdrop();
-    fb_blend_rounded_rect(x + 2, y + 6, pw, ph, 10, 0x00000000, 80);
-    fb_fill_rounded_rect(x, y, pw, ph, 10, T(MENU));
-    icon_draw(ICON_JARVIS, x + 28, y + 28, 40);
-    fb_draw_text_scaled(x + 84, y + 30, "Welcome", T(TEXT), 2);
-    fb_draw_text_bold(x + 28, y + 96, g_ui.setup_title, T(ACCENT));
-    ui_text_fit(x + 28, y + 122, pw - 56, g_ui.setup_detail, T(TEXT_DIM));
-    ui_progress(x + 28, y + 170, pw - 56, 6, 75, T(HOVER), T(ACCENT));
+    ui_text_center(0, cy + 72, W,
+                   g_ui.mode == UI_MODE_SETUP ? g_ui.setup_title : g_ui.status,
+                   0x00C0D0E0);
 }
 
 static void draw_lock(void)
@@ -161,8 +147,8 @@ void ui_shell_render_fullscreen(void)
     ui_shell_ensure_init();
 
     switch (g_ui.mode) {
-    case UI_MODE_LOADING: draw_loading(); break;
-    case UI_MODE_SETUP:   draw_setup();   break;
+    case UI_MODE_LOADING:
+    case UI_MODE_SETUP:   draw_loading(); break;
     case UI_MODE_LOCK:    draw_lock();    break;
     default: return;
     }

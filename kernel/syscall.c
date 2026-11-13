@@ -1,18 +1,17 @@
 /*
  * =============================================================================
- * JARVIS AI OS — Syscall Handler  (kernel/syscall.c)
+ * JARVIS AI OS — System calls (kernel/syscall.c)
  * Language: C17
  *
- * Uses x86_64 SYSCALL/SYSRET fast-path (MSR_LSTAR).
- * Every syscall is intercepted by the security audit hook BEFORE
- * it reaches the real implementation.
+ * The only way a user-mode program can ask the kernel for anything. Entered
+ * through the SYSCALL instruction (kernel/syscall_entry.S).
  *
- * Syscall table mirrors a subset of Linux (for app compatibility).
- * AI-specific syscalls start at number 500:
- *   500 — jarvis_speak(text, len)         ask JARVIS to say something
- *   501 — jarvis_ask(prompt, resp, max)   query the AI brain
- *   502 — jarvis_task(cmd, len)           run a voice command
- *   503 — jarvis_status(buf, max)         get OS status JSON
+ * Numbers follow Linux x86-64 where an equivalent exists; JARVIS-specific
+ * calls start at 500. Every pointer a program passes is checked against the
+ * program's own address space before the kernel touches it, so a program
+ * cannot trick the kernel into reading or writing memory it does not own.
+ *
+ * Errors are returned as negative errno values, as on Linux.
  * =============================================================================
  */
 
@@ -20,13 +19,17 @@
 #include <stdio.h>
 #include <string.h>
 
-/* ---- MSR numbers --------------------------------------------------------- */
 #define MSR_EFER    0xC0000080
 #define MSR_STAR    0xC0000081
 #define MSR_LSTAR   0xC0000082
 #define MSR_FMASK   0xC0000084
 
-/* ---- Syscall hook -------------------------------------------------------- */
+#define E_NOENT   (uint64_t)-2
+#define E_BADF    (uint64_t)-9
+#define E_FAULT   (uint64_t)-14
+#define E_INVAL   (uint64_t)-22
+#define E_NOSYS   (uint64_t)-38
+
 static void (*security_hook)(uint64_t nr, uint64_t *args) = NULL;
 
 void syscall_set_hook(void (*hook)(uint64_t, uint64_t *))
@@ -34,185 +37,154 @@ void syscall_set_hook(void (*hook)(uint64_t, uint64_t *))
     security_hook = hook;
 }
 
-/* ---- Write to MSR -------------------------------------------------------- */
 static void wrmsr(uint32_t msr, uint64_t val)
 {
-    uint32_t lo = (uint32_t)(val & 0xFFFFFFFF);
-    uint32_t hi = (uint32_t)(val >> 32);
-    __asm__ volatile ("wrmsr" :: "c"(msr), "a"(lo), "d"(hi));
+    __asm__ volatile ("wrmsr" :: "c"(msr), "a"((uint32_t)val), "d"((uint32_t)(val >> 32)));
 }
 
-/* ---- Syscall entry (called from ASM stub in syscall_entry.asm) ----------- */
-/*
- * Registers on entry (Linux x86_64 ABI):
- *   rax = syscall number
- *   rdi = arg1, rsi = arg2, rdx = arg3, r10 = arg4, r8 = arg5, r9 = arg6
- * Return value in rax.
- */
+/* ---- User memory access -------------------------------------------------- */
+static int user_ok(uint64_t addr, uint64_t len, int write)
+{
+    return vm_user_range_ok(proc_current_space(), addr, len, write);
+}
+
+/* Copy a NUL-terminated string from the program. Returns 0, or -1 if any
+ * part of it lies outside the program's memory or it is too long. */
+static int user_string(char *dst, size_t max, uint64_t src)
+{
+    for (size_t i = 0; i < max; i++) {
+        if ((i == 0 || ((src + i) & 0xFFF) == 0) && !user_ok(src + i, 1, 0))
+            return -1;
+        dst[i] = *(const char *)(src + i);
+        if (!dst[i]) return 0;
+    }
+    return -1;
+}
+
+/* ---- Dispatcher ---------------------------------------------------------- */
 uint64_t syscall_handler(uint64_t nr,
                           uint64_t a1, uint64_t a2, uint64_t a3,
                           uint64_t a4, uint64_t a5, uint64_t a6)
 {
     uint64_t args[6] = { a1, a2, a3, a4, a5, a6 };
+    char path[160];
 
-    /* Security audit FIRST — before any work is done */
     if (security_hook)
         security_hook(nr, args);
 
-    /* Dispatch */
     switch (nr) {
-    /* ---- Standard Linux-compatible syscalls ----------------------------- */
-    case 0: /* read */
-        return (uint64_t)vfs_read((int)a1, (void *)a2, (size_t)a3);
+    case 0: /* read(fd, buf, len) */
+        if (!user_ok(a2, a3, 1)) return E_FAULT;
+        if (a1 == 0) return 0;                      /* no keyboard input yet */
+        return (uint64_t)(int64_t)vfs_read((int)a1, (void *)a2, (size_t)a3);
 
-    case 1: /* write */
-        return (uint64_t)vfs_write((int)a1, (const void *)a2, (size_t)a3);
+    case 1: /* write(fd, buf, len) */
+        if (!user_ok(a2, a3, 0)) return E_FAULT;
+        if (a1 == 1 || a1 == 2) {                   /* stdout / stderr */
+            user_console_write((const char *)a2, (size_t)a3);
+            return a3;
+        }
+        if (a1 < 3) return E_BADF;
+        return (uint64_t)(int64_t)vfs_write((int)a1, (const void *)a2, (size_t)a3);
 
-    case 2: /* open */
-        return (uint64_t)vfs_open((const char *)a1, (uint32_t)a2);
+    case 2: /* open(path, flags) — flags: 1 read, 2 write, 4 create, 8 append, 16 truncate */
+        if (user_string(path, sizeof(path), a1) != 0) return E_FAULT;
+        return (uint64_t)(int64_t)vfs_open(path, (uint32_t)a2);
 
-    case 3: /* close */
+    case 3: /* close(fd) */
+        if (a1 < 3) return E_BADF;
         vfs_close((int)a1);
         return 0;
 
-    case 12: /* brk — heap management */
-        return (uint64_t)kmalloc((size_t)a1); /* stub */
+    case 12: /* brk(addr) */
+        return user_brk(a1);
 
-    case 60: /* exit */
-        terminal_printf("[SYSCALL] Process exited: code %llu\n", a1);
-        kthread_exit(a1); /* never returns */
+    case 24: /* sched_yield() */
+        kthread_yield();
         return 0;
 
-    case 83: /* mkdir */
-        return (uint64_t)vfs_mkdir((const char *)a1);
-
-    case 85: /* creat */
+    case 35: /* nanosleep(const struct timespec *req, rem) */
     {
-        const char *path = (const char *)a1;
-        int fd = vfs_create_file(path);
-        if (fd < 0)
-            return (uint64_t)-1;
-        return (uint64_t)vfs_open(path, 0x02 | 0x04 | 0x10);
+        if (!user_ok(a1, 16, 0)) return E_FAULT;
+        const uint64_t *ts = (const uint64_t *)a1;
+        uint64_t ticks = ts[0] * 100 + ts[1] / 10000000ULL;
+        kthread_sleep(ticks ? (uint32_t)ticks : 1);
+        return 0;
     }
 
-    case 57: /* fork */
-        /* AI OS discourages fork — suggest async task instead */
-        terminal_puts("[SYSCALL] fork() — redirecting to kthread\n");
-        return 0; /* stub */
-
-    case 59: /* execve */
-        return 0; /* stub — full ELF loader needed */
-
-    case 39: /* getpid */
+    case 39: /* getpid() */
         return (uint64_t)kthread_current_pid();
 
-    case 158: /* arch_prctl */
+    case 60:  /* exit(code) */
+    case 231: /* exit_group(code) */
+        kthread_exit(a1);                           /* never returns */
         return 0;
 
-    case 231: /* exit_group */
-        kthread_exit(a1); /* never returns */
-        return 0;
+    case 83: /* mkdir(path) */
+        if (user_string(path, sizeof(path), a1) != 0) return E_FAULT;
+        return vfs_mkdir(path) == 0 ? 0 : E_INVAL;
 
-    /* ---- JARVIS AI syscalls (500–599) ---------------------------------- */
+    case 87: /* unlink(path) */
+        if (user_string(path, sizeof(path), a1) != 0) return E_FAULT;
+        return vfs_delete(path) == 0 ? 0 : E_NOENT;
 
-    case 500: /* jarvis_speak(text_ptr, len) */
+    /* ---- JARVIS calls ---------------------------------------------------- */
+    case 500: /* jarvis_speak(text, len) */
     {
-        const char *text = (const char *)a1;
-        size_t       len  = (size_t)a2;
+        char text[256];
+        size_t len = a2 < sizeof(text) - 1 ? (size_t)a2 : sizeof(text) - 1;
+        if (!user_ok(a1, len, 0)) return E_FAULT;
+        memcpy(text, (const void *)a1, len);
+        text[len] = '\0';
         tts_speak(text, len);
         return 0;
     }
 
-    case 501: /* jarvis_ask(prompt_ptr, resp_ptr, resp_max) */
+    case 502: /* jarvis_task(command): same route as a spoken command */
     {
-        const char *prompt   = (const char *)a1;
-        char       *resp_buf = (char *)a2;
-        size_t      max      = (size_t)a3;
-
-        /* Send to AI brain, block until response (max 30 s) */
-        ipc_message_t req = {};
-        req.type = IPC_AI_REQUEST;
-        size_t plen = strlen(prompt);
-        if (plen >= sizeof(req.payload)) plen = sizeof(req.payload) - 1;
-        memcpy(req.payload, prompt, plen);
-        req.payload_len = plen;
-        ipc_send(&req);
-
-        /* Wait for AI response (poll with timeout) */
-        uint64_t deadline = g_kstate.uptime_ticks + 3000; /* 30 s @ 100 Hz */
-        while (g_kstate.uptime_ticks < deadline) {
-            if (ipc_has_message(IPC_AI_RESPONSE)) {
-                ipc_message_t resp = ipc_recv_next();
-                size_t rlen = resp.payload_len;
-                if (rlen >= max) rlen = max - 1;
-                memcpy(resp_buf, resp.payload, rlen);
-                resp_buf[rlen] = '\0';
-                return 0;
-            }
-            __asm__ volatile ("pause");
-        }
-        strncpy(resp_buf, "[timeout]", max);
-        return -1;
-    }
-
-    case 502: /* jarvis_task(cmd_ptr, len) */
-    {
-        const char *cmd = (const char *)a1;
-        task_executor_run(cmd);
+        static ipc_message_t msg;
+        char cmd[200];
+        if (user_string(cmd, sizeof(cmd), a1) != 0) return E_FAULT;
+        memset(&msg, 0, sizeof(msg));
+        msg.type = IPC_VOICE_INPUT;
+        msg.payload_len = strlen(cmd);
+        memcpy(msg.payload, cmd, msg.payload_len);
+        ipc_send(&msg);
         return 0;
     }
 
-    case 503: /* jarvis_status(buf_ptr, max) */
+    case 503: /* jarvis_status(buf, max) */
     {
-        char   *buf = (char *)a1;
-        size_t  max = (size_t)a2;
-        snprintf(buf, max,
-            "{\"uptime\":%llu,\"ai_ready\":%d,\"speech_ready\":%d,"
-            "\"model_pool_mb\":%llu}",
+        char status[160];
+        int n = snprintf(status, sizeof(status),
+            "{\"uptime\":%llu,\"ai_ready\":%d,\"speech_ready\":%d,\"ai_managing\":%d}",
             (unsigned long long)(g_kstate.uptime_ticks / 100),
-            g_kstate.ai_ready,
-            g_kstate.speech_ready,
-            (unsigned long long)(g_kstate.model_pool_size / (1024ULL * 1024)));
-        return 0;
+            g_kstate.ai_ready, g_kstate.speech_ready, governor_ai_online());
+        if (a2 == 0 || !user_ok(a1, a2, 1)) return E_FAULT;
+        size_t len = (size_t)n < a2 - 1 ? (size_t)n : (size_t)a2 - 1;
+        memcpy((void *)a1, status, len);
+        ((char *)a1)[len] = '\0';
+        return len;
     }
 
     default:
-        terminal_printf("[SYSCALL] Unhandled: %llu\n", nr);
-        return (uint64_t)-1;
+        /* fork, execve, mmap and the rest are not implemented; say so
+         * rather than pretending they worked. */
+        return E_NOSYS;
     }
 }
 
-/* ---- Install SYSCALL handler via LSTAR MSR ------------------------------- */
-/*
- * The actual ASM entry stub must:
- *   1. swapgs             (switch to kernel GS)
- *   2. Save user RSP, load kernel RSP
- *   3. Save all registers
- *   4. call syscall_handler(rax, rdi, rsi, rdx, r10, r8, r9)
- *   5. Restore registers
- *   6. sysretq
- * This is defined in kernel/syscall_entry.asm.
- */
-extern void syscall_entry_stub(void); /* defined in ASM */
+extern void syscall_entry_stub(void);
 
 void syscall_init(void)
 {
-    terminal_puts("[SYSCALL] Installing syscall handler\n");
+    uint32_t lo, hi;
+    __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(MSR_EFER));
+    wrmsr(MSR_EFER, (((uint64_t)hi << 32) | lo) | 1);       /* enable SYSCALL */
 
-    /* Enable SYSCALL/SYSRET in EFER */
-    uint32_t efer_lo, efer_hi;
-    __asm__ volatile ("rdmsr" : "=a"(efer_lo), "=d"(efer_hi) : "c"(MSR_EFER));
-    efer_lo |= 1; /* SCE — System Call Extensions */
-    wrmsr(MSR_EFER, ((uint64_t)efer_hi << 32) | efer_lo);
-
-    /* STAR: kernel CS = 0x08, user CS = 0x18 */
-    wrmsr(MSR_STAR, ((uint64_t)0x0018000800000000ULL));
-
-    /* LSTAR: entry point for SYSCALL */
+    /* SYSCALL loads cs=0x08, ss=0x10. SYSRET loads ss=0x10+8 (0x18) and
+     * cs=0x10+16 (0x20), both at privilege level 3. */
+    wrmsr(MSR_STAR, (0x0010ULL << 48) | (0x0008ULL << 32));
     wrmsr(MSR_LSTAR, (uint64_t)syscall_entry_stub);
-
-    /* FMASK: clear IF on syscall entry (disable interrupts momentarily) */
-    wrmsr(MSR_FMASK, (1 << 9)); /* bit 9 = IF */
-
-    terminal_puts("[SYSCALL] Ready\n");
+    wrmsr(MSR_FMASK, 0x200 | 0x400);        /* enter with interrupts off, DF clear */
 }

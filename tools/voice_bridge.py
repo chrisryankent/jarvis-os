@@ -10,6 +10,11 @@ microphone transcripts, separate from the COM1 debug terminal.
 from __future__ import annotations
 
 import argparse
+import array
+import collections
+import json
+import math
+import os
 import re
 import select
 import shutil
@@ -20,6 +25,7 @@ import sys
 import tempfile
 import threading
 import time
+import wave
 from pathlib import Path
 
 DEFAULT_WAKE_WORDS = ("jarvis", "hey jarvis", "javis", "gavis", "travis")
@@ -41,6 +47,22 @@ NOISE_TERMS = (
     "inaudible",
     "blank audio",
 )
+# Phrases whisper invents for silence or faint noise.
+HALLUCINATIONS = (
+    "thank you", "thanks for watching", "thank you for watching", "you", "bye",
+    "so", "okay", "the end", "i m sorry", "thanks",
+)
+VOICE_PROFILE = Path(__file__).resolve().parent / "voice" / "profile.json"
+
+# Half-duplex state shared between the speaking and listening threads: while
+# JARVIS is talking (and for a moment after) the microphone is ignored, and
+# anything transcribed that matches what was just said is dropped. Without
+# this the bridge heard JARVIS's own voice and answered it, forever.
+SPEAKING = threading.Event()
+SPOKEN_LOCK = threading.Lock()
+RECENT_SPOKEN: collections.deque = collections.deque(maxlen=6)   # (time, normalized text)
+LAST_SPEECH_END = [0.0]
+
 SELF_AUDIO_TERMS = (
     "jarvis ready",
     "jarvis is ready",
@@ -83,8 +105,45 @@ def send_ready(sock: socket.socket, verbose: bool = True) -> None:
         print("[bridge] guest handshake sent", flush=True)
 
 
+def load_voice_profile() -> dict:
+    """tools/voice/profile.json, written by tools/record_voice.py."""
+    try:
+        return json.loads(VOICE_PROFILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
 def host_tts_available() -> bool:
-    return shutil.which("spd-say") is not None
+    return bool(load_voice_profile().get("tts_cmd")) or shutil.which("spd-say") is not None
+
+
+def speak_with_profile(text: str, profile: dict) -> bool:
+    """Speak with the configured voice engine (e.g. a voice-cloning TTS using
+    the owner's recorded reference). The command comes from profile.json and
+    must write a WAV file; it is played with pw-play. Returns False on any
+    failure so the caller can fall back to the system voice."""
+    template = profile.get("tts_cmd")
+    if not template or not shutil.which("pw-play"):
+        return False
+    with tempfile.TemporaryDirectory(prefix="jarvis-tts-") as tmp:
+        out = Path(tmp) / "say.wav"
+        values = {
+            "text": text,
+            "out": str(out),
+            "ref": str(profile.get("reference_wav", "")),
+            "ref_text": str(profile.get("reference_text", "")),
+        }
+        try:
+            cmd = [part.format(**values) for part in template]
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=300)
+        except (OSError, subprocess.SubprocessError, KeyError, IndexError) as exc:
+            print(f"[bridge] voice engine failed ({exc}); using system voice", flush=True)
+            return False
+        if not out.exists():
+            return False
+        subprocess.run(["pw-play", str(out)], check=False)
+        return True
 
 
 def speak_host(text: str, wait: bool = True) -> None:
@@ -92,15 +151,36 @@ def speak_host(text: str, wait: bool = True) -> None:
     if not text:
         return
 
-    if shutil.which("spd-say"):
-        cmd = ["spd-say"]
-        if wait:
-            cmd.append("-w")
-        cmd.append(text)
-        subprocess.run(cmd, check=False)
-        return
+    with SPOKEN_LOCK:
+        RECENT_SPOKEN.append((time.time(), normalize_text(text)))
+    SPEAKING.set()
+    try:
+        if speak_with_profile(text, load_voice_profile()):
+            return
+        if shutil.which("spd-say"):
+            # -w: block until finished, so SPEAKING covers the whole utterance.
+            subprocess.run(["spd-say", "-w", "-r", "-15", "-t", "male1", text], check=False)
+            return
+        print(f"[bridge] host TTS unavailable, would say: {text}", flush=True)
+    finally:
+        LAST_SPEECH_END[0] = time.time()
+        SPEAKING.clear()
 
-    print(f"[bridge] host TTS unavailable, would say: {text}", flush=True)
+
+def is_echo_of_speech(text: str, window: float = 20.0) -> bool:
+    """True if the transcript is (mostly) something JARVIS itself just said."""
+    words = normalize_text(text).split()
+    if not words:
+        return False
+    now = time.time()
+    with SPOKEN_LOCK:
+        recent = [spoken for when, spoken in RECENT_SPOKEN if now - when <= window]
+    for spoken in recent:
+        spoken_words = set(spoken.split())
+        hits = sum(1 for w in words if w in spoken_words)
+        if hits / len(words) >= 0.6:
+            return True
+    return False
 
 
 def guest_reader(sock: socket.socket, args: argparse.Namespace, stop: threading.Event) -> None:
@@ -183,6 +263,10 @@ def is_noise_or_self_audio(text: str) -> bool:
 
     if any(term in normalized for term in SELF_AUDIO_TERMS):
         return True
+    if normalized in HALLUCINATIONS or normalized.startswith("i heard"):
+        return True
+    if is_echo_of_speech(text):
+        return True
 
     bracketed = text.strip().startswith(("(", "[")) and text.strip().endswith((")", "]"))
     if bracketed and any(term in normalized for term in NOISE_TERMS):
@@ -209,43 +293,112 @@ def wake_command(text: str, wake_words: tuple[str, ...]) -> tuple[bool, str]:
     return False, ""
 
 
-def record_with_pw_record(path: Path, seconds: float, target: str | None = None) -> None:
-    cmd = [
-        "pw-record",
-        "--rate",
-        "16000",
-        "--channels",
-        "1",
-        "--format",
-        "s16",
-        str(path),
-    ]
+FRAME_MS = 30
+FRAME_SAMPLES = 16000 * FRAME_MS // 1000
+FRAME_BYTES = FRAME_SAMPLES * 2
+
+
+def frame_rms(frame: bytes) -> float:
+    samples = array.array("h")
+    samples.frombytes(frame)
+    if not samples:
+        return 0.0
+    return math.sqrt(sum(v * v for v in samples) / len(samples))
+
+
+def listen_utterances(target: str | None, max_seconds: float):
+    """Yield one complete spoken utterance at a time as 16 kHz mono PCM.
+
+    The microphone is read continuously and cut where the speaker pauses,
+    instead of in fixed 4-second blocks that chopped sentences in half and
+    sent pure silence to whisper (which then invented text for it).
+    """
+    cmd = ["pw-record", "--rate", "16000", "--channels", "1", "--format", "s16", "--raw", "-"]
     if target:
         cmd[1:1] = ["--target", target]
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    noise = 150.0                                   # running background level
+    preroll: collections.deque = collections.deque(maxlen=10)   # 0.3 s before speech
+    voiced: list[bytes] = []
+    loud_run = 0
+    quiet_run = 0
+    in_speech = False
+    end_quiet = int(800 / FRAME_MS)                 # 0.8 s pause ends an utterance
+    max_frames = int(max_seconds * 1000 / FRAME_MS)
+
     try:
-        time.sleep(seconds)
+        while True:
+            frame = proc.stdout.read(FRAME_BYTES)
+            if len(frame) < FRAME_BYTES:
+                return
+
+            # Deaf while JARVIS is speaking, and briefly after (room echo).
+            if SPEAKING.is_set() or time.time() - LAST_SPEECH_END[0] < 0.7:
+                voiced.clear(); preroll.clear()
+                in_speech = False; loud_run = quiet_run = 0
+                continue
+
+            level = frame_rms(frame)
+            threshold = max(350.0, noise * 3.0)
+            loud = level > threshold
+
+            if not in_speech:
+                preroll.append(frame)
+                if loud:
+                    loud_run += 1
+                else:
+                    loud_run = 0
+                    noise = noise * 0.95 + level * 0.05
+                if loud_run >= 4:                   # 120 ms of sound = speech started
+                    in_speech = True
+                    voiced = list(preroll)
+                    quiet_run = 0
+                continue
+
+            voiced.append(frame)
+            quiet_run = 0 if loud else quiet_run + 1
+            if quiet_run >= end_quiet or len(voiced) >= max_frames:
+                speech_frames = len(voiced) - quiet_run
+                pcm = b"".join(voiced)
+                voiced = []; preroll.clear()
+                in_speech = False; loud_run = quiet_run = 0
+                if speech_frames * FRAME_MS >= 350:     # ignore clicks and coughs
+                    yield pcm
     finally:
-        proc.send_signal(signal.SIGINT)
+        proc.terminate()
         try:
             proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
             proc.kill()
-            proc.wait(timeout=2)
+
+
+def write_wav(path: Path, pcm: bytes) -> None:
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(pcm)
+
+
+WHISPER_PROMPT = ("Jarvis, open terminal. Open files. Open settings. Show status. "
+                  "Lock the computer. What can you do? Shut down.")
 
 
 def transcribe_with_whisper(whisper_cli: str, model: str, wav: Path) -> str:
     out_prefix = wav.with_suffix("")
     cmd = [
         whisper_cli,
-        "-m",
-        model,
-        "-f",
-        str(wav),
-        "-nt",
+        "-m", model,
+        "-f", str(wav),
+        "-l", "en",
+        "-t", str(min(8, os.cpu_count() or 4)),
+        "-nt",                      # no timestamps
+        "-sns",                     # no "(music)" / "[noise]" tokens
+        "-nf",                      # no temperature fallback: fewer inventions
+        "--prompt", WHISPER_PROMPT, # bias towards the commands JARVIS knows
         "-otxt",
-        "-of",
-        str(out_prefix),
+        "-of", str(out_prefix),
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     txt_path = out_prefix.with_suffix(".txt")
@@ -273,10 +426,18 @@ def run_whisper_loop(args: argparse.Namespace, sock: socket.socket) -> None:
     wake_deadline = 0.0
     startup_deadline = time.time() + args.startup_listen
 
+    # Load the voice engine now so the first reply is not delayed by it.
+    warm = load_voice_profile().get("warm_cmd")
+    if warm and not args.no_host_tts:
+        print("[bridge] loading your voice engine in the background...", flush=True)
+        subprocess.Popen(warm, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL)
+
     print("[bridge] listening with host microphone.", flush=True)
     if not args.no_host_tts:
         if host_tts_available():
-            print("[bridge] host TTS ready via spd-say", flush=True)
+            engine = "your recorded voice profile" if load_voice_profile().get("tts_cmd") else "spd-say (system voice)"
+            print(f"[bridge] host TTS ready via {engine}", flush=True)
         else:
             print("[bridge] host TTS missing: install speech-dispatcher/espeak for real speech", flush=True)
     if require_wake:
@@ -285,7 +446,7 @@ def run_whisper_loop(args: argparse.Namespace, sock: socket.socket) -> None:
         print("[bridge] wake mode: say 'Jarvis' before a command.", flush=True)
     else:
         print("[bridge] conversation mode: forwarding speech after noise filtering.", flush=True)
-    while True:
+    for pcm in listen_utterances(args.target, max(args.seconds, 12.0)):
         now = time.time()
         if awaiting_command and now > wake_deadline:
             awaiting_command = False
@@ -293,10 +454,14 @@ def run_whisper_loop(args: argparse.Namespace, sock: socket.socket) -> None:
 
         with tempfile.TemporaryDirectory(prefix="jarvis-voice-") as tmp:
             wav = Path(tmp) / "utterance.wav"
-            record_with_pw_record(wav, args.seconds, args.target)
+            write_wav(wav, pcm)
             transcript = transcribe_with_whisper(whisper_cli, args.model, wav)
             transcript = clean_transcript(transcript)
             if not transcript:
+                continue
+            # JARVIS started talking while this was being transcribed: what
+            # was captured may include the start of its own reply.
+            if SPEAKING.is_set():
                 continue
             if is_noise_or_self_audio(transcript):
                 print(f"[bridge] ignored noise/self audio: {transcript}", flush=True)
@@ -333,7 +498,7 @@ def main() -> int:
     parser.add_argument("--socket", default="/tmp/jarvis-voice.sock", help="QEMU COM2 Unix socket.")
     parser.add_argument("--model", default="tools/models/stt/ggml-medium.en.bin", help="Whisper model path.")
     parser.add_argument("--whisper-cli", help="Path to whisper.cpp whisper-cli.")
-    parser.add_argument("--seconds", type=float, default=4.0, help="Seconds to record per utterance.")
+    parser.add_argument("--seconds", type=float, default=4.0, help="Longest single utterance, in seconds (minimum 12).")
     parser.add_argument("--hold", type=float, default=1.0, help="Seconds to keep the socket open after --once.")
     parser.add_argument("--target", help="PipeWire target/source name for pw-record.")
     parser.add_argument("--list-sources", action="store_true", help="Show PipeWire devices and exit.")

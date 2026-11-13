@@ -68,6 +68,8 @@ isr_common_stub:
      * right above it at rsp+16*8. */
     mov rdi, [rsp + 15*8]    /* arg1 = vector_num   */
     mov rsi, [rsp + 16*8]    /* arg2 = error_code   */
+    mov rdx, rsp             /* arg3 = saved frame: 15 registers, vector,
+                                error code, then rip/cs/rflags/rsp/ss */
 
     mov rax, ds
     push rax

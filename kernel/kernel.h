@@ -99,6 +99,92 @@ void    pmm_reserve_range(uint64_t base, uint64_t len);
 uint64_t pmm_alloc_contiguous(uint64_t pages);
 void    vmm_init(uint64_t model_pool_phys);
 void   *vmm_map_range(uint64_t phys, uint64_t size, uint32_t flags);
+
+/* ---- Virtual memory (kernel/vmm.c) --------------------------------------- */
+#define VM_WRITE  0x1
+#define VM_USER   0x2
+#define VM_EXEC   0x4
+#define VM_USER_BASE 0x0000008000000000ULL   /* start of per-process memory */
+
+#define VM_FAULT_BAD_ADDRESS (-1)   /* nothing is supposed to be there */
+#define VM_FAULT_READ_ONLY   (-2)   /* write to a read-only page       */
+#define VM_FAULT_NO_EXECUTE  (-3)
+#define VM_FAULT_PROTECTION  (-4)
+#define VM_FAULT_NO_MEMORY   (-5)
+
+typedef struct {
+    uint32_t spaces;                /* live address spaces                */
+    uint32_t table_frames;          /* frames used by page tables         */
+    uint32_t swapped_pages;         /* pages currently in the swap store  */
+    uint32_t swap_slots_used;
+    uint64_t swap_bytes;            /* RAM the swap store occupies        */
+    uint64_t demand_faults;         /* first-touch page allocations       */
+    uint64_t swap_ins, swap_outs;
+    uint64_t protection_faults;
+} vm_stats_t;
+
+typedef struct {
+    int      id;
+    uint32_t owner_pid;
+    uint32_t resident_pages, swapped_pages, faults;
+} vm_space_info_t;
+
+uint64_t vmm_kernel_cr3(void);
+int      vm_space_create(uint32_t owner_pid);
+void     vm_space_destroy(int id);
+uint64_t vm_space_cr3(int id);
+int      vm_region_add(int id, uint64_t start, uint32_t pages, uint32_t flags, const char *name);
+int      vm_map_page(int id, uint64_t virt, uint64_t phys, uint32_t flags);
+int      vm_unmap_page(int id, uint64_t virt, int free_frame);
+int      vm_protect(int id, uint64_t virt, uint32_t pages, uint32_t flags);
+int      vm_reclaim(int id, int max_pages, int force);     /* evict to swap */
+int      vm_handle_fault(int id, uint64_t addr, uint64_t error_code);
+void     vm_get_stats(vm_stats_t *out);
+int      vm_space_list(vm_space_info_t *out, int max);
+
+/* ---- Resource governor (kernel/governor.c) -------------------------------- */
+enum { GOV_SET_PRIORITY = 1, GOV_SUSPEND, GOV_RESUME, GOV_TERMINATE, GOV_RECLAIM };
+typedef struct {
+    int      ai_online;             /* AI heartbeat seen in the last 5 s */
+    uint32_t ai_actions, ai_refused;
+    uint32_t builtin_actions;
+    uint32_t pages_reclaimed;
+} governor_stats_t;
+void governor_tick(void);
+void governor_ai_heartbeat(void);
+int  governor_ai_advise(int action, uint32_t pid, int value);
+int  governor_ai_online(void);
+void governor_get_stats(governor_stats_t *out);
+
+/* Physical memory and kernel heap status */
+uint64_t pmm_alloc_frame(void);
+void     pmm_free_frame(uint64_t phys);
+void     pmm_get_stats(uint64_t *total_frames, uint64_t *free_frames);
+void     heap_get_stats(uint64_t *used_bytes, uint64_t *free_bytes, uint64_t *total_bytes);
+
+int      vm_user_range_ok(int id, uint64_t addr, uint64_t len, int write);
+
+/* ---- Dual-mode operation (kernel/usermode.c, kernel/syscall.c) ------------ */
+#define PROC_FLAG_USER 0x4      /* runs in user mode (ring 3) */
+void     usermode_init(void);
+void     usermode_set_kernel_stack(uint64_t top);
+void     usermode_install_programs(void);
+uint32_t user_exec(const char *path);          /* run a program; returns PID or 0 */
+int      user_is_program(const char *path);
+uint64_t user_brk(uint64_t want);
+void     user_console_write(const char *buf, size_t len);
+size_t   user_console_read(char *buf, size_t max);
+void     syscall_init(void);
+void     proc_mark_user(void);
+int      proc_exists(uint32_t pid);
+
+/* Process <-> address space */
+int      proc_use_space(int space_id);      /* current process switches to it */
+int      proc_current_space(void);
+int      proc_current_is_system(void);
+const char *proc_current_name(void);
+void     proc_fault_exit(const char *reason);   /* kill the current process; never returns */
+void     scheduler_post_event(const char *text);
 void   *kmalloc(size_t size);
 void    kfree(void *ptr);
 
@@ -119,7 +205,7 @@ void    cli(void);
  * CPU exception (vector < 0x20) it prints diagnostics instead of silently
  * triple-faulting.
  */
-void    interrupt_dispatch(uint64_t vector, uint64_t error_code);
+void    interrupt_dispatch(uint64_t vector, uint64_t error_code, uint64_t *frame);
 
 /* Interrupt handlers */
 void    irq0_timer_handler(void);
@@ -156,7 +242,50 @@ void    input_mouse_release(int x, int y, int button);
  * source of truth and do not redefine it elsewhere.
  */
 typedef enum { PRIO_REALTIME=0, PRIO_AI=1, PRIO_SYSTEM=2, PRIO_USER=3 } proc_prio_t;
-typedef enum { PROC_RUNNING=0, PROC_READY=1, PROC_BLOCKED=2, PROC_ZOMBIE=3 } proc_state_t;
+typedef enum { PROC_RUNNING=0, PROC_READY=1, PROC_BLOCKED=2, PROC_ZOMBIE=3,
+               PROC_SLEEPING=4 } proc_state_t;
+
+#define PROC_FLAG_SYSTEM   0x1   /* cannot be killed or suspended (desktop)    */
+#define PROC_FLAG_SERVICE  0x2   /* run cooperatively by the main loop; listed
+                                    in the process table but never switched to */
+
+typedef struct {
+    uint32_t pid;
+    char     name[32];
+    int      state;             /* proc_state_t */
+    int      priority;          /* proc_prio_t  */
+    uint32_t flags;
+    int      suspended;
+    uint64_t cpu_ticks;         /* 10 ms each   */
+    uint64_t start_tick;
+    char     waiting_on[24];    /* what a blocked process waits for */
+} proc_info_t;
+
+void     scheduler_init(void);
+void     scheduler_tick(void);              /* from the timer interrupt */
+void     scheduler_wake_main(void);
+void     scheduler_stats(uint64_t *idle_ticks, uint64_t *switches);
+int      scheduler_take_event(char *buf, size_t n);
+uint32_t proc_spawn(const char *name, void (*fn)(void), int prio, uint32_t flags);
+int      proc_kill(uint32_t pid);
+int      proc_suspend(uint32_t pid);
+int      proc_resume(uint32_t pid);
+int      proc_set_priority(uint32_t pid, int prio);
+int      proc_list(proc_info_t *out, int max);
+void     kthread_sleep(uint32_t ticks);     /* 1 tick = 10 ms */
+
+/* Synchronisation */
+int      kmutex_create(const char *name);
+void     kmutex_destroy(int id);
+int      kmutex_lock(int id);               /* 0 ok, -2 refused: would deadlock */
+int      kmutex_unlock(int id);
+int      ksem_create(const char *name, int initial);
+int      ksem_wait(int id);
+int      ksem_signal(int id);
+
+/* Per-process mailboxes */
+int      proc_send(uint32_t to_pid, uint64_t value);
+int      proc_recv(uint32_t *from_pid, uint64_t *value);
 
 void    kthread_create(const char *name, void (*fn)(void), int prio, size_t stack);
 void   *scheduler_pick_next(void);
@@ -322,6 +451,14 @@ void    vfs_seed_packaged_models(void);
 int     vfs_read_file(const char *path, char *buf, size_t max);
 int     vfs_list(const char *prefix, char *buf, size_t max);
 void    vfs_append(const char *path, const char *data, size_t len);
+int     vfs_exists(const char *path);
+int     vfs_is_dir(const char *path);
+long    vfs_size(const char *path);
+int     vfs_count_children(const char *path);
+int     vfs_delete(const char *path);                       /* recursive */
+int     vfs_rename(const char *from, const char *to);       /* move      */
+int     vfs_copy(const char *from, const char *to);         /* recursive */
+int     vfs_write_file(const char *path, const void *data, size_t len);
 void    ai_filesystem_search(const char *query);
 
 /* System */

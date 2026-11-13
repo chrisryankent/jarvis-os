@@ -18,7 +18,7 @@ CFLAGS  := -std=c17 -ffreestanding -fno-stack-protector -fno-pic \
 ASFLAGS := --64
 
 C_SRCS  := kernel.c ipc_sched_pmm.c libc_stub.c model_manifest.c \
-           platform.c syscall.c vfs.c font8x16.c
+           platform.c syscall.c vfs.c font8x16.c vmm.c governor.c usermode.c
 S_SRCS  := context_switch.S interrupts.S
 
 C_OBJS  := $(C_SRCS:.c=.o)

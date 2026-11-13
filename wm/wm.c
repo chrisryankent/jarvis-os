@@ -481,7 +481,7 @@ int wm_handle_mouse_move(int x, int y)
     return 0;
 }
 
-#define WM_DOUBLE_CLICK_TICKS 40    /* 400 ms at 100 Hz */
+#define WM_DOUBLE_CLICK_TICKS 50    /* 500 ms at 100 Hz */
 #define WM_DOUBLE_CLICK_DIST  6
 
 int wm_handle_mouse_click(int x, int y, int button)

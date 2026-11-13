@@ -12,6 +12,24 @@
 
 #include "kernel.h"
 #include <string.h>
+#include <stddef.h>
+#include <stdio.h>
+
+/* "Interrupts off" is the kernel lock on this single-CPU system. These save
+ * and restore the previous state, so they nest safely (unlike cli()/sti()). */
+static inline uint64_t irq_save(void)
+{
+    uint64_t flags;
+    __asm__ volatile ("pushfq; pop %0; cli" : "=r"(flags) : : "memory");
+    return flags;
+}
+
+static inline void irq_restore(uint64_t flags)
+{
+    if (flags & 0x200)
+        __asm__ volatile ("sti");
+}
+
 
 /* ============================================================================
  * 1. IPC RING BUFFER
@@ -46,7 +64,7 @@ static void ipc_drop_type_front(uint8_t type, uint32_t ring_idx)
 
 void ipc_send(ipc_message_t *msg)
 {
-    cli(); /* disable interrupts during write */
+    uint64_t irqf = irq_save();
 
     uint32_t next = (ipc_head + 1) % IPC_RING_SIZE;
     if (next == ipc_tail) {
@@ -64,7 +82,7 @@ void ipc_send(ipc_message_t *msg)
     }
 
     ipc_head = next;
-    sti();
+    irq_restore(irqf);
 }
 
 ipc_message_t ipc_recv_next(void)
@@ -114,229 +132,334 @@ ipc_message_t ipc_recv_type(uint8_t type)
 }
 
 /* ============================================================================
- * 2. AI-AWARE PROCESS SCHEDULER
- * Multi-Level Feedback Queue (MLFQ) with 4 priority classes.
- * AI inference tasks run at PRIO_AI; speech is PRIO_REALTIME.
+ * 2. PROCESS MANAGEMENT
  *
- * Rules:
- *   - A process at a higher priority always preempts lower ones.
- *   - AI inference preempts all USER processes (prevents stutter).
- *   - REALTIME (speech) never waits behind a lower-priority process.
- *   - Processes are promoted if they yield before their quantum expires.
- *   - Processes are demoted if they use their full quantum (CPU hogs).
+ * Preemptive, priority-based round-robin scheduler for kernel threads.
  *
- * proc_prio_t / proc_state_t now live in kernel.h (see the comment there) —
- * this used to be a file-local typedef, which is why kernel.c could not see
- * PRIO_AI/PRIO_REALTIME and failed to compile.
+ *   creation      kthread_create() / proc_spawn()
+ *   termination   kthread_exit() (self), proc_kill() (another process)
+ *   scheduling    scheduler_tick() from the 100 Hz timer: the highest
+ *                 priority READY process runs; equal priorities take turns
+ *   suspension    proc_suspend() / proc_resume()
+ *   sleeping      kthread_sleep()
+ *   sync          kmutex_* and ksem_* (blocking, with wait queues)
+ *   IPC           proc_send() / proc_recv() per-process mailboxes (plus the
+ *                 system-wide typed message ring in section 1)
+ *   deadlock      kmutex_lock() walks the wait-for chain and refuses a lock
+ *                 that would close a cycle
+ *
+ * The kernel main loop (desktop) is process 1. When nothing is runnable the
+ * scheduler halts the CPU until the next interrupt.
+ *
+ * Locking: single CPU, so "interrupts off" is the kernel lock. Every entry
+ * point saves the interrupt flag, disables interrupts, and restores it.
  * ============================================================================ */
+#define MAX_PROCESSES   64
+#define PROC_STACK_SIZE 65536
+#define MAILBOX_SIZE    8
+#define MAX_MUTEXES     32
+#define MAX_SEMAPHORES  32
 
-#define MAX_PROCESSES  256
-#define QUANTUM_MS     10    /* length of one PIT tick / one scheduling unit */
+typedef struct process {
+    uint32_t       pid;             /* 0 = slot free */
+    proc_prio_t    priority;
+    proc_state_t   state;
+    uint32_t       flags;           /* PROC_FLAG_* */
+    char           name[32];
+    uint64_t       rsp;             /* saved stack pointer */
+    void         (*entry)(void);
+    uint64_t       cpu_ticks;
+    uint64_t       start_tick;
+    uint32_t       quantum_rem;
+    uint64_t       wake_tick;       /* PROC_SLEEPING: when to wake */
+    int            suspended;       /* held off the CPU until resumed */
+    proc_state_t   state_before_suspend;
+    int            wait_kind;       /* PROC_WAIT_* while PROC_BLOCKED */
+    int            wait_id;         /* mutex / semaphore index */
+    int            vm_space;        /* address space id, 0 = kernel's */
+    uint64_t       cr3;             /* its page table, 0 = kernel's   */
+    struct { uint32_t from; uint64_t value; } mailbox[MAILBOX_SIZE];
+    int            mail_head, mail_count;
+    uint8_t        stack[PROC_STACK_SIZE];
+} process_t;
 
-/*
- * How many ticks each priority class gets before being forced to rotate.
- * This is what makes the scheduler an actual *feedback* queue instead of a
- * flat round-robin: an AI inference thread gets a 40 ms uninterrupted slice
- * (long enough to make real progress on a forward pass) while a USER task
- * gets bumped every 10 ms. A higher-priority thread becoming ready still
- * preempts immediately regardless of how much slice is left (see below).
- */
+enum { PROC_WAIT_NONE = 0, PROC_WAIT_MUTEX, PROC_WAIT_SEM, PROC_WAIT_MAIL };
+
+typedef struct { int used; char name[24]; uint32_t owner; } kmutex_t;
+typedef struct { int used; char name[24]; int count; } ksem_t;
+
+static process_t  proc_pool[MAX_PROCESSES];
+static process_t *current_proc = NULL;
+static uint32_t   next_pid = 1;
+static int        sched_ready = 0;      /* scheduler_init() has run          */
+static int        sched_idle = 0;       /* CPU is halted waiting for work    */
+static uint64_t   sched_idle_ticks = 0;
+static uint64_t   sched_switches = 0;
+static kmutex_t   mutexes[MAX_MUTEXES];
+static ksem_t     semaphores[MAX_SEMAPHORES];
+#define SCHED_EVENTS 8
+static char       sched_events[SCHED_EVENTS][96];   /* notable events for the UI */
+static int        sched_event_head = 0, sched_event_count = 0;
+
+extern void context_switch_asm(uint64_t *save_rsp_here, uint64_t *load_rsp_from);
+
 static uint32_t quantum_ticks_for(proc_prio_t prio)
 {
     switch (prio) {
-    case PRIO_REALTIME: return 1;
-    case PRIO_AI:        return 4;
-    case PRIO_SYSTEM:    return 2;
-    default:             return 1; /* PRIO_USER */
+    case PRIO_AI:     return 4;     /* long slices for inference */
+    case PRIO_SYSTEM: return 2;
+    default:          return 1;
     }
 }
 
-typedef struct process {
-    uint32_t       pid;
-    proc_prio_t    priority;
-    proc_state_t   state;
-    char           name[64];
-    uint64_t       rsp;            /* saved kernel stack pointer */
-    uint64_t       rip;            /* saved instruction pointer  */
-    uint64_t       cr3;            /* page table base, 0 = shares kernel tables */
-    uint8_t        stack[65536];   /* 64 KB kernel stack         */
-    uint64_t       cpu_time_ms;
-    uint32_t       quantum_rem;    /* remaining quantum ticks    */
-    uint64_t       wake_tick;      /* for sleeping processes     */
-    struct process *next;
-} process_t;
-
-static process_t  proc_pool[MAX_PROCESSES];
-static process_t *run_queues[4] = {}; /* one per priority */
-static process_t *current_proc  = NULL;
-static uint32_t   next_pid      = 1;
-
-/*
- * Real ASM register-save/restore — see context_switch.S. Takes plain
- * pointers to the two rsp *fields* (not whole process_t structs), so the
- * assembly never needs to know process_t's layout/offsets, which keeps it
- * robust against this struct changing shape later.
- */
-extern void context_switch_asm(uint64_t *save_rsp_here, uint64_t *load_rsp_from);
-
-/*
- * "Boot context" — represents whatever was running before the scheduler
- * ever ran a kthread (i.e. jarvis_kernel_main()/kernel_desktop_loop() on the
- * original boot stack). Without this, the very first context_switch() call
- * is given from=NULL, which the NULL-guard below turns into a silent no-op
- * — meaning the very first kernel thread is marked "current" in bookkeeping
- * but its registers/rip are never actually loaded, so it never runs a
- * single instruction. This mirrors the standard "scheduler context" trick
- * used by most teaching kernels (e.g. xv6): we don't need a real stack
- * buffer for it, because we're capturing whatever rsp already *is* at the
- * moment of the first real switch, not building a fresh frame for it.
- */
-static process_t boot_proc;
-static int        boot_proc_ready = 0;
-
-static void boot_proc_init(void)
+static process_t *proc_by_pid(uint32_t pid)
 {
-    memset(&boot_proc, 0, sizeof(boot_proc));
-    strncpy(boot_proc.name, "boot/idle", sizeof(boot_proc.name) - 1);
-    boot_proc.priority = PRIO_SYSTEM;
-    boot_proc.state    = PROC_RUNNING;
-    boot_proc.quantum_rem = quantum_ticks_for(PRIO_SYSTEM);
-    boot_proc_ready = 1;
-    current_proc = &boot_proc;
-}
-
-/* Allocate a process slot. Threads that have called kthread_exit() set
- * pid = 0 on the way out specifically so this can reclaim their slot —
- * previously nothing ever did that, so the 256-thread pool was a one-way
- * ratchet that could never be reused. */
-static process_t *proc_alloc(void)
-{
-    for (int i = 0; i < MAX_PROCESSES; i++) {
-        if (proc_pool[i].pid == 0) {
-            return &proc_pool[i];
-        }
-    }
+    if (pid == 0) return NULL;
+    for (int i = 0; i < MAX_PROCESSES; i++)
+        if (proc_pool[i].pid == pid) return &proc_pool[i];
     return NULL;
 }
 
-/* Enqueue a process into its priority run queue */
-static void enqueue(process_t *p)
+static void sched_note(const char *text)
 {
-    p->next = NULL;
-    process_t **q = &run_queues[p->priority];
-    if (!*q) {
-        *q = p;
-    } else {
-        process_t *tail = *q;
-        while (tail->next) tail = tail->next;
-        tail->next = p;
-    }
+    int slot = (sched_event_head + sched_event_count) % SCHED_EVENTS;
+    if (sched_event_count == SCHED_EVENTS)          /* full: drop the oldest */
+        sched_event_head = (sched_event_head + 1) % SCHED_EVENTS;
+    else
+        sched_event_count++;
+    strncpy(sched_events[slot], text, sizeof(sched_events[0]) - 1);
+    sched_events[slot][sizeof(sched_events[0]) - 1] = '\0';
 }
 
-/* Dequeue the head of a priority queue */
-static process_t *dequeue(int prio)
+/* Queue a message for the desktop to show (callable from any process). */
+void scheduler_post_event(const char *text)
 {
-    if (!run_queues[prio]) return NULL;
-    process_t *p  = run_queues[prio];
-    run_queues[prio] = p->next;
-    p->next = NULL;
-    return p;
+    uint64_t irq = irq_save();
+    sched_note(text);
+    irq_restore(irq);
+    terminal_printf("[EVENT] %s\n", text);
 }
 
-/* Context switch — saves current registers/RSP, loads next, switches CR3
- * if (and only if) the destination actually uses its own address space.
- * `from` or `to` being NULL is a no-op (used at very early boot before
- * boot_proc_init() has run). Writing 0 into CR3 unconditionally — which a
- * naive "full" implementation of the old TODO comment would do, since
- * kernel threads start with cr3=0 — would immediately triple-fault real
- * hardware, so the switch is conditional. */
+/* Legacy entry point kept for callers that only need the low-level swap. */
 void context_switch(void *from_void, void *to_void)
 {
     process_t *from = (process_t *)from_void;
     process_t *to   = (process_t *)to_void;
     if (!from || !to || from == to) return;
-
-    if (to->cr3 != 0) {
-        uint64_t current_cr3;
-        __asm__ volatile ("mov %%cr3, %0" : "=r"(current_cr3));
-        if (current_cr3 != to->cr3)
-            __asm__ volatile ("mov %0, %%cr3" :: "r"(to->cr3) : "memory");
-    }
-
-    /* The actual register save/restore + stack swap. This call does not
-     * return into "from"'s caller until something later switches back into
-     * "from" — exactly like every other kernel's context switch. */
     context_switch_asm(&from->rsp, &to->rsp);
 }
 
-/* Create a kernel thread */
-void kthread_create(const char *name, void (*fn)(void),
-                    int prio, size_t stack_size)
+/* ---- Core: pick the next process and switch to it ------------------------
+ * Must be called with interrupts disabled. Returns when the calling process
+ * is next given the CPU.
+ */
+static process_t *sched_pick(void)
 {
-    (void)stack_size;
+    process_t *best = NULL;
+    int start = current_proc ? (int)(current_proc - proc_pool) + 1 : 0;
 
-    /* kthread_create() runs after interrupt_init() has already called
-     * sti(), so the timer IRQ can fire mid-enqueue and corrupt the run
-     * queue linked list out from under us if we don't guard it. */
-    cli();
+    for (int n = 0; n < MAX_PROCESSES; n++) {
+        process_t *p = &proc_pool[(start + n) % MAX_PROCESSES];
+        if (p->pid == 0 || p->suspended || (p->flags & PROC_FLAG_SERVICE))
+            continue;
+        if (p->state == PROC_SLEEPING && p->wake_tick <= g_kstate.uptime_ticks)
+            p->state = PROC_READY;
+        if (p->state != PROC_READY)
+            continue;
+        if (!best || p->priority < best->priority)
+            best = p;       /* first found at the best priority = round robin */
+    }
+    return best;
+}
 
-    process_t *p = proc_alloc();
-    if (!p) {
-        sti();
-        terminal_printf("[SCHED] Cannot create thread: %s (pool full)\n", name);
+static void schedule(void)
+{
+    process_t *prev = current_proc;
+    process_t *next;
+
+    if (!sched_ready || !prev)
+        return;
+
+    if (prev->state == PROC_RUNNING)
+        prev->state = PROC_READY;
+
+    /* Nothing runnable: idle with interrupts on until something is. */
+    while ((next = sched_pick()) == NULL) {
+        sched_idle = 1;
+        __asm__ volatile ("sti; hlt; cli");
+        sched_idle = 0;
+    }
+
+    next->state = PROC_RUNNING;
+    next->quantum_rem = quantum_ticks_for(next->priority);
+    if (next == prev)
+        return;
+
+    /* A finished process's slot becomes reusable once we leave its stack. */
+    if (prev->state == PROC_ZOMBIE)
+        prev->pid = 0;
+
+    current_proc = next;
+    sched_switches++;
+
+    /* Interrupts and system calls arriving from user mode must land on the
+     * next process's own kernel stack. */
+    usermode_set_kernel_stack((uint64_t)(next->stack + PROC_STACK_SIZE));
+
+    /* Enter the next process's address space. Kernel memory (including both
+     * stacks) is mapped identically in all of them. */
+    uint64_t want = next->cr3 ? next->cr3 : vmm_kernel_cr3();
+    uint64_t have;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(have));
+    if (want && (have & ~0xFFFULL) != want)
+        __asm__ volatile ("mov %0, %%cr3" : : "r"(want) : "memory");
+
+    context_switch_asm(&prev->rsp, &next->rsp);
+}
+
+/* Timer interrupt, 100 Hz. Interrupts are off and the PIC has already been
+ * acknowledged (see interrupt_dispatch), so switching away here is safe. */
+void scheduler_tick(void)
+{
+    if (!sched_ready || !current_proc)
+        return;
+
+    if (sched_idle) {               /* interrupted the idle halt: just account */
+        sched_idle_ticks++;
         return;
     }
 
-    p->pid        = next_pid++;
-    p->priority   = (proc_prio_t)prio;
-    p->state      = PROC_READY;
-    p->quantum_rem= quantum_ticks_for((proc_prio_t)prio);
-    p->cpu_time_ms= 0;
-    p->wake_tick  = 0;
-    strncpy(p->name, name, sizeof(p->name) - 1);
+    current_proc->cpu_ticks++;
 
-    /*
-     * Build the initial stack frame so the FIRST time context_switch_asm
-     * switches into this thread, the pop sequence it executes (r15, r14,
-     * r13, r12, rbx, rbp, then `ret`) lands exactly on `fn`. The previous
-     * version only pushed the return address and nothing else, so the
-     * very first "restore 6 registers" in a correct context switch would
-     * have popped six bytes of garbage off the top of a fresh stack before
-     * ever reaching fn — this layout has to mirror context_switch_asm's
-     * push order exactly (see context_switch.S).
-     */
-    uint64_t *sp = (uint64_t *)(p->stack + sizeof(p->stack));
-    *--sp = (uint64_t)fn;   /* return address, popped last by `ret` */
-    *--sp = 0;              /* rbp */
-    *--sp = 0;              /* rbx */
-    *--sp = 0;              /* r12 */
-    *--sp = 0;              /* r13 */
-    *--sp = 0;              /* r14 */
-    *--sp = 0;              /* r15  <- rsp ends up here */
-    p->rsp = (uint64_t)sp;
-    p->rip = (uint64_t)fn;
-    p->cr3 = 0; /* kernel threads share kernel page tables */
+    int preempt = 0;
+    if (current_proc->quantum_rem > 0)
+        current_proc->quantum_rem--;
+    if (current_proc->quantum_rem == 0)
+        preempt = 1;
 
-    enqueue(p);
-    sti();
-    terminal_printf("[SCHED] Thread created: %s (PID %u, prio %d)\n",
-        name, p->pid, prio);
+    /* A more important process that is ready (or due to wake) runs now. */
+    for (int i = 0; i < MAX_PROCESSES && !preempt; i++) {
+        process_t *p = &proc_pool[i];
+        if (p->pid == 0 || p->suspended || (p->flags & PROC_FLAG_SERVICE)) continue;
+        int ready = p->state == PROC_READY ||
+                    (p->state == PROC_SLEEPING && p->wake_tick <= g_kstate.uptime_ticks);
+        if (ready && p->priority < current_proc->priority)
+            preempt = 1;
+    }
+
+    if (preempt)
+        schedule();
 }
 
-/* Voluntary yield — promotes the caller one priority level (reward for
- * giving back the CPU before its slice ran out) and forces a reschedule
- * on the next tick. Not wired to any syscall yet; exposed via kernel.h so
- * a future blocking syscall (disk wait, IPC wait, etc.) has a correct
- * primitive to call instead of busy-spinning at full priority. */
+/* First code a new process runs: enable interrupts, run the body, exit. */
+static void proc_trampoline(void)
+{
+    __asm__ volatile ("sti");
+    if (current_proc && current_proc->entry)
+        current_proc->entry();
+    kthread_exit(0);
+}
+
+void scheduler_init(void)
+{
+    memset(proc_pool, 0, sizeof(proc_pool));
+    memset(mutexes, 0, sizeof(mutexes));
+    memset(semaphores, 0, sizeof(semaphores));
+
+    /* The code that is running right now (kernel main / desktop loop on the
+     * boot stack) becomes process 1. Its stack pointer is captured the first
+     * time it is switched out. */
+    process_t *p = &proc_pool[0];
+    p->pid = next_pid++;
+    p->priority = PRIO_SYSTEM;
+    p->state = PROC_RUNNING;
+    p->flags = PROC_FLAG_SYSTEM;
+    p->quantum_rem = quantum_ticks_for(PRIO_SYSTEM);
+    strncpy(p->name, "desktop", sizeof(p->name) - 1);
+
+    current_proc = p;
+    sched_ready = 1;
+    terminal_puts("[SCHED] Preemptive scheduler online (process 1: desktop)\n");
+}
+
+/* ---- Creation ------------------------------------------------------------ */
+uint32_t proc_spawn(const char *name, void (*fn)(void), int prio, uint32_t flags)
+{
+    uint64_t irq = irq_save();
+    process_t *p = NULL;
+
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        if (proc_pool[i].pid == 0) { p = &proc_pool[i]; break; }
+    }
+    if (!p) {
+        irq_restore(irq);
+        terminal_printf("[SCHED] Cannot create process %s: table full\n", name);
+        return 0;
+    }
+
+    /* everything except the (large) stack */
+    memset(p, 0, offsetof(process_t, stack));
+    p->pid = next_pid++;
+    p->priority = (proc_prio_t)prio;
+    p->flags = flags;
+    p->entry = fn;
+    p->start_tick = g_kstate.uptime_ticks;
+    p->quantum_rem = quantum_ticks_for(p->priority);
+    strncpy(p->name, name, sizeof(p->name) - 1);
+
+    if (flags & PROC_FLAG_SERVICE) {
+        /* Serviced cooperatively from the main loop: listed, never switched to. */
+        p->state = PROC_READY;
+    } else {
+        /* Initial frame: what context_switch_asm pops (r15, r14, r13, r12,
+         * rbx, rbp) and then `ret`s into. The slot below the return address
+         * keeps the stack 16-byte aligned at function entry. */
+        uint64_t *sp = (uint64_t *)(p->stack + PROC_STACK_SIZE);
+        *--sp = 0;
+        *--sp = (uint64_t)proc_trampoline;
+        for (int i = 0; i < 6; i++) *--sp = 0;
+        p->rsp = (uint64_t)sp;
+        p->state = PROC_READY;
+    }
+
+    uint32_t pid = p->pid;
+    irq_restore(irq);
+    terminal_printf("[SCHED] Process created: %s (PID %u, prio %d)\n", name, pid, prio);
+    return pid;
+}
+
+void kthread_create(const char *name, void (*fn)(void), int prio, size_t stack_size)
+{
+    (void)stack_size;
+    proc_spawn(name, fn, prio, 0);
+}
+
+/* ---- Yield / sleep / exit ------------------------------------------------ */
 void kthread_yield(void)
 {
-    cli();
-    if (current_proc && current_proc != &boot_proc) {
-        if (current_proc->priority > PRIO_REALTIME)
-            current_proc->priority = (proc_prio_t)(current_proc->priority - 1);
-        current_proc->quantum_rem = 0; /* exhausted on purpose -> reschedule */
+    uint64_t irq = irq_save();
+    schedule();
+    irq_restore(irq);
+}
+
+void kthread_sleep(uint32_t ticks)
+{
+    if (!sched_ready || !current_proc) {
+        __asm__ volatile ("hlt");
+        return;
     }
-    sti();
+    uint64_t irq = irq_save();
+    current_proc->wake_tick = g_kstate.uptime_ticks + ticks;
+    current_proc->state = PROC_SLEEPING;
+    schedule();
+    irq_restore(irq);
+}
+
+/* Wake process 1 early (keyboard / mouse input should not wait for a tick). */
+void scheduler_wake_main(void)
+{
+    if (sched_ready && proc_pool[0].state == PROC_SLEEPING)
+        proc_pool[0].wake_tick = 0;
 }
 
 uint32_t kthread_current_pid(void)
@@ -344,114 +467,425 @@ uint32_t kthread_current_pid(void)
     return current_proc ? current_proc->pid : 0;
 }
 
-/* Terminate the calling kernel thread. Marks it a reapable zombie (pid=0,
- * so proc_alloc() can reuse the slot) and immediately gives up the CPU
- * forever — this never returns. Previously there was no exit path at all:
- * a finished thread function simply falling off the end of fn() would
- * return into garbage (the popped-but-never-pushed return address below
- * the initial frame), so every kthread body needs to end by calling this. */
-void kthread_exit(uint64_t exit_code)
+/* Release everything a dying process holds so nobody waits on it forever. */
+static void proc_release_resources(process_t *p)
 {
-    cli();
-    if (current_proc && current_proc != &boot_proc) {
-        terminal_printf("[SCHED] Thread exited: %s (PID %u, code %llu)\n",
-            current_proc->name, current_proc->pid, exit_code);
-        current_proc->state = PROC_ZOMBIE;
-        current_proc->pid   = 0; /* reclaim slot */
+    if (p->vm_space) {
+        vm_space_destroy(p->vm_space);  /* returns its frames and swap slots */
+        p->vm_space = 0;
+        p->cr3 = 0;
     }
-    sti();
 
-    for (;;) {
-        scheduler_pick_next();
-        cpu_relax();
+    for (int m = 0; m < MAX_MUTEXES; m++) {
+        if (!mutexes[m].used || mutexes[m].owner != p->pid) continue;
+        mutexes[m].owner = 0;
+        for (int i = 0; i < MAX_PROCESSES; i++) {
+            process_t *w = &proc_pool[i];
+            if (w->pid && w->state == PROC_BLOCKED &&
+                w->wait_kind == PROC_WAIT_MUTEX && w->wait_id == m)
+                w->state = PROC_READY;
+        }
     }
 }
 
+void kthread_exit(uint64_t exit_code)
+{
+    __asm__ volatile ("cli");
+    if (current_proc && !(current_proc->flags & PROC_FLAG_SYSTEM)) {
+        terminal_printf("[SCHED] Process exited: %s (PID %u, code %llu)\n",
+            current_proc->name, current_proc->pid, exit_code);
+        proc_release_resources(current_proc);
+        current_proc->state = PROC_ZOMBIE;
+    }
+    for (;;)
+        schedule();         /* never returns for a zombie */
+}
+
+/* ---- Address spaces ------------------------------------------------------ */
+/* The calling process starts running in the given address space. */
+int proc_use_space(int space_id)
+{
+    uint64_t cr3 = vm_space_cr3(space_id);
+    if (!cr3 || !current_proc) return -1;
+
+    uint64_t irq = irq_save();
+    current_proc->vm_space = space_id;
+    current_proc->cr3 = cr3;
+    __asm__ volatile ("mov %0, %%cr3" : : "r"(cr3) : "memory");
+    irq_restore(irq);
+    return 0;
+}
+
+void proc_mark_user(void)
+{
+    if (current_proc) current_proc->flags |= PROC_FLAG_USER;
+}
+
+int proc_exists(uint32_t pid)
+{
+    return proc_by_pid(pid) != NULL;
+}
+
+int proc_current_space(void)
+{
+    return current_proc ? current_proc->vm_space : 0;
+}
+
+int proc_current_is_system(void)
+{
+    return !sched_ready || !current_proc || (current_proc->flags & PROC_FLAG_SYSTEM);
+}
+
+const char *proc_current_name(void)
+{
+    return current_proc ? current_proc->name : "kernel";
+}
+
+/* A process did something illegal (bad memory access, divide by zero...).
+ * Only that process dies; the rest of the system carries on. Called from
+ * the exception handler with interrupts off; never returns. */
+void proc_fault_exit(const char *reason)
+{
+    __asm__ volatile ("cli");
+    terminal_printf("[FAULT] %s\n", reason);
+    sched_note(reason);
+    proc_release_resources(current_proc);
+    current_proc->state = PROC_ZOMBIE;
+    for (;;)
+        schedule();
+}
+
+/* ---- Control of other processes ------------------------------------------ */
+int proc_kill(uint32_t pid)
+{
+    uint64_t irq = irq_save();
+    process_t *p = proc_by_pid(pid);
+
+    if (!p || (p->flags & (PROC_FLAG_SYSTEM | PROC_FLAG_SERVICE))) {
+        irq_restore(irq);
+        return -1;
+    }
+    if (p == current_proc) {
+        irq_restore(irq);
+        kthread_exit(137);
+    }
+
+    /* Not on the CPU (single core), so it can be removed on the spot. */
+    terminal_printf("[SCHED] Process killed: %s (PID %u)\n", p->name, p->pid);
+    proc_release_resources(p);
+    p->state = PROC_ZOMBIE;
+    p->pid = 0;
+    irq_restore(irq);
+    return 0;
+}
+
+int proc_suspend(uint32_t pid)
+{
+    uint64_t irq = irq_save();
+    process_t *p = proc_by_pid(pid);
+    int rc = -1;
+
+    if (p && !(p->flags & (PROC_FLAG_SYSTEM | PROC_FLAG_SERVICE)) && !p->suspended) {
+        p->suspended = 1;
+        rc = 0;
+        if (p == current_proc)
+            schedule();     /* comes back here once resumed */
+    }
+    irq_restore(irq);
+    return rc;
+}
+
+int proc_resume(uint32_t pid)
+{
+    uint64_t irq = irq_save();
+    process_t *p = proc_by_pid(pid);
+    int rc = -1;
+
+    if (p && p->suspended) {
+        p->suspended = 0;
+        rc = 0;
+    }
+    irq_restore(irq);
+    return rc;
+}
+
+int proc_set_priority(uint32_t pid, int prio)
+{
+    uint64_t irq = irq_save();
+    process_t *p = proc_by_pid(pid);
+    int rc = -1;
+
+    if (p && prio >= PRIO_REALTIME && prio <= PRIO_USER && !(p->flags & PROC_FLAG_SERVICE)) {
+        p->priority = (proc_prio_t)prio;
+        rc = 0;
+    }
+    irq_restore(irq);
+    return rc;
+}
+
+/* ---- Introspection ------------------------------------------------------- */
+int proc_list(proc_info_t *out, int max)
+{
+    uint64_t irq = irq_save();
+    int n = 0;
+
+    for (int i = 0; i < MAX_PROCESSES && n < max; i++) {
+        process_t *p = &proc_pool[i];
+        if (p->pid == 0) continue;
+
+        proc_info_t *o = &out[n++];
+        memset(o, 0, sizeof(*o));
+        o->pid = p->pid;
+        o->priority = (int)p->priority;
+        o->state = (int)p->state;
+        o->flags = p->flags;
+        o->suspended = p->suspended;
+        o->cpu_ticks = p->cpu_ticks;
+        o->start_tick = p->start_tick;
+        strncpy(o->name, p->name, sizeof(o->name) - 1);
+
+        if (p->state == PROC_BLOCKED && p->wait_kind == PROC_WAIT_MUTEX)
+            strncpy(o->waiting_on, mutexes[p->wait_id].name, sizeof(o->waiting_on) - 1);
+        else if (p->state == PROC_BLOCKED && p->wait_kind == PROC_WAIT_SEM)
+            strncpy(o->waiting_on, semaphores[p->wait_id].name, sizeof(o->waiting_on) - 1);
+        else if (p->state == PROC_BLOCKED && p->wait_kind == PROC_WAIT_MAIL)
+            strncpy(o->waiting_on, "message", sizeof(o->waiting_on) - 1);
+    }
+    irq_restore(irq);
+    return n;
+}
+
+void scheduler_stats(uint64_t *idle_ticks, uint64_t *switches)
+{
+    if (idle_ticks) *idle_ticks = sched_idle_ticks;
+    if (switches)   *switches = sched_switches;
+}
+
+/* Returns 1 and copies the text if something worth telling the user about
+ * happened since the last call (e.g. a deadlock was prevented). */
+int scheduler_take_event(char *buf, size_t n)
+{
+    uint64_t irq = irq_save();
+    int had = sched_event_count > 0;
+    if (had && n) {
+        strncpy(buf, sched_events[sched_event_head], n - 1);
+        buf[n - 1] = '\0';
+        sched_event_head = (sched_event_head + 1) % SCHED_EVENTS;
+        sched_event_count--;
+    }
+    irq_restore(irq);
+    return had;
+}
+
+/* ---- Synchronisation: mutexes -------------------------------------------- */
+int kmutex_create(const char *name)
+{
+    uint64_t irq = irq_save();
+    int id = -1;
+    for (int i = 0; i < MAX_MUTEXES; i++) {
+        if (!mutexes[i].used) {
+            memset(&mutexes[i], 0, sizeof(mutexes[i]));
+            mutexes[i].used = 1;
+            strncpy(mutexes[i].name, name ? name : "mutex", sizeof(mutexes[i].name) - 1);
+            id = i;
+            break;
+        }
+    }
+    irq_restore(irq);
+    return id;
+}
+
+void kmutex_destroy(int id)
+{
+    if (id < 0 || id >= MAX_MUTEXES) return;
+    uint64_t irq = irq_save();
+    mutexes[id].used = 0;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t *w = &proc_pool[i];
+        if (w->pid && w->state == PROC_BLOCKED &&
+            w->wait_kind == PROC_WAIT_MUTEX && w->wait_id == id)
+            w->state = PROC_READY;
+    }
+    irq_restore(irq);
+}
+
 /*
- * Pick next process to run AND perform the actual switch — called every
- * timer tick. (Previously "pick" and "switch" were split across this
- * function and kernel.c's ai_scheduler_tick(), each keeping its *own*
- * separate `current_proc` variable that never agreed with each other —
- * the one in kernel.c was the only one ai_scheduler_tick ever updated, but
- * the *other* one, here, is what every preemption/requeue decision in this
- * function actually reads. Since nothing ever wrote to this file's
- * current_proc, every check below saw it as permanently NULL, so a
- * just-dequeued thread was never put back in its run queue — after one
- * pass through the four priority buckets, every created thread had been
- * silently dropped from scheduling forever. Folding both halves into one
- * function with one source of truth fixes both bugs at once.)
+ * Deadlock detection. Waiting for mutex `id` is only safe if following
+ * "owner of this mutex -> the mutex that owner is itself waiting for -> its
+ * owner -> ..." never leads back to the caller. If it does, granting the
+ * wait would complete a cycle in which no process can ever proceed.
  */
+static int would_deadlock(int id)
+{
+    uint32_t me = current_proc->pid;
+    int m = id;
+
+    for (int hops = 0; hops < MAX_PROCESSES; hops++) {
+        uint32_t owner = mutexes[m].owner;
+        if (owner == 0) return 0;
+        if (owner == me) return 1;
+
+        process_t *p = proc_by_pid(owner);
+        if (!p || p->state != PROC_BLOCKED || p->wait_kind != PROC_WAIT_MUTEX)
+            return 0;
+        m = p->wait_id;
+    }
+    return 1;
+}
+
+/* 0 = acquired; -1 = invalid; -2 = refused because it would deadlock. */
+int kmutex_lock(int id)
+{
+    if (id < 0 || id >= MAX_MUTEXES || !current_proc) return -1;
+    uint64_t irq = irq_save();
+
+    for (;;) {
+        if (!mutexes[id].used) { irq_restore(irq); return -1; }
+
+        if (mutexes[id].owner == 0) {
+            mutexes[id].owner = current_proc->pid;
+            irq_restore(irq);
+            return 0;
+        }
+        if (would_deadlock(id)) {
+            char msg[96];
+            snprintf(msg, sizeof(msg), "Deadlock prevented: %s (PID %u) was refused lock '%s'",
+                     current_proc->name, current_proc->pid, mutexes[id].name);
+            sched_note(msg);
+            terminal_printf("[SCHED] %s\n", msg);
+            irq_restore(irq);
+            return -2;
+        }
+
+        current_proc->state = PROC_BLOCKED;
+        current_proc->wait_kind = PROC_WAIT_MUTEX;
+        current_proc->wait_id = id;
+        schedule();
+        current_proc->wait_kind = PROC_WAIT_NONE;
+    }
+}
+
+int kmutex_unlock(int id)
+{
+    if (id < 0 || id >= MAX_MUTEXES || !current_proc) return -1;
+    uint64_t irq = irq_save();
+
+    if (!mutexes[id].used || mutexes[id].owner != current_proc->pid) {
+        irq_restore(irq);
+        return -1;
+    }
+    mutexes[id].owner = 0;
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t *w = &proc_pool[i];
+        if (w->pid && w->state == PROC_BLOCKED &&
+            w->wait_kind == PROC_WAIT_MUTEX && w->wait_id == id)
+            w->state = PROC_READY;      /* they re-contend for the lock */
+    }
+    irq_restore(irq);
+    return 0;
+}
+
+/* ---- Synchronisation: counting semaphores -------------------------------- */
+int ksem_create(const char *name, int initial)
+{
+    uint64_t irq = irq_save();
+    int id = -1;
+    for (int i = 0; i < MAX_SEMAPHORES; i++) {
+        if (!semaphores[i].used) {
+            memset(&semaphores[i], 0, sizeof(semaphores[i]));
+            semaphores[i].used = 1;
+            semaphores[i].count = initial;
+            strncpy(semaphores[i].name, name ? name : "sem", sizeof(semaphores[i].name) - 1);
+            id = i;
+            break;
+        }
+    }
+    irq_restore(irq);
+    return id;
+}
+
+int ksem_wait(int id)
+{
+    if (id < 0 || id >= MAX_SEMAPHORES || !current_proc) return -1;
+    uint64_t irq = irq_save();
+
+    while (semaphores[id].used && semaphores[id].count <= 0) {
+        current_proc->state = PROC_BLOCKED;
+        current_proc->wait_kind = PROC_WAIT_SEM;
+        current_proc->wait_id = id;
+        schedule();
+        current_proc->wait_kind = PROC_WAIT_NONE;
+    }
+    int ok = semaphores[id].used;
+    if (ok) semaphores[id].count--;
+    irq_restore(irq);
+    return ok ? 0 : -1;
+}
+
+int ksem_signal(int id)
+{
+    if (id < 0 || id >= MAX_SEMAPHORES) return -1;
+    uint64_t irq = irq_save();
+
+    if (!semaphores[id].used) { irq_restore(irq); return -1; }
+    semaphores[id].count++;
+    for (int i = 0; i < MAX_PROCESSES; i++) {        /* wake one waiter */
+        process_t *w = &proc_pool[i];
+        if (w->pid && w->state == PROC_BLOCKED &&
+            w->wait_kind == PROC_WAIT_SEM && w->wait_id == id) {
+            w->state = PROC_READY;
+            break;
+        }
+    }
+    irq_restore(irq);
+    return 0;
+}
+
+/* ---- IPC: per-process mailboxes ------------------------------------------ */
+int proc_send(uint32_t to_pid, uint64_t value)
+{
+    uint64_t irq = irq_save();
+    process_t *p = proc_by_pid(to_pid);
+    int rc = -1;
+
+    if (p && p->mail_count < MAILBOX_SIZE) {
+        int slot = (p->mail_head + p->mail_count) % MAILBOX_SIZE;
+        p->mailbox[slot].from = current_proc ? current_proc->pid : 0;
+        p->mailbox[slot].value = value;
+        p->mail_count++;
+        if (p->state == PROC_BLOCKED && p->wait_kind == PROC_WAIT_MAIL)
+            p->state = PROC_READY;
+        rc = 0;
+    }
+    irq_restore(irq);
+    return rc;
+}
+
+/* Blocks until a message arrives. */
+int proc_recv(uint32_t *from_pid, uint64_t *value)
+{
+    if (!current_proc) return -1;
+    uint64_t irq = irq_save();
+
+    while (current_proc->mail_count == 0) {
+        current_proc->state = PROC_BLOCKED;
+        current_proc->wait_kind = PROC_WAIT_MAIL;
+        schedule();
+        current_proc->wait_kind = PROC_WAIT_NONE;
+    }
+    if (from_pid) *from_pid = current_proc->mailbox[current_proc->mail_head].from;
+    if (value)    *value = current_proc->mailbox[current_proc->mail_head].value;
+    current_proc->mail_head = (current_proc->mail_head + 1) % MAILBOX_SIZE;
+    current_proc->mail_count--;
+    irq_restore(irq);
+    return 0;
+}
+
+/* Kept for old callers: one scheduling decision. */
 void *scheduler_pick_next(void)
 {
-    cli();
-
-    if (!boot_proc_ready)
-        boot_proc_init();
-
-    /* Is something strictly higher-priority already waiting? If so it
-     * preempts immediately, regardless of how much quantum the current
-     * thread has left — this is the rule that guarantees REALTIME speech
-     * and AI inference are never starved by a long-running USER task. */
-    int higher_ready = -1;
-    if (current_proc) {
-        for (int prio = 0; prio < (int)current_proc->priority; prio++) {
-            if (run_queues[prio]) { higher_ready = prio; break; }
-        }
-    }
-
-    if (current_proc && current_proc->state == PROC_RUNNING &&
-        higher_ready < 0 && current_proc->quantum_rem > 1) {
-        current_proc->quantum_rem--;
-        sti();
-        return current_proc; /* nothing to do this tick */
-    }
-
-    process_t *prev = current_proc;
-
-    if (prev && prev->state == PROC_RUNNING) {
-        /* Only apply the CPU-hog demotion penalty if the thread actually
-         * burned through its whole slice itself. Being preempted by a
-         * more important thread is not a penalty. */
-        if (higher_ready < 0 && prev->priority < PRIO_USER)
-            prev->priority = (proc_prio_t)(prev->priority + 1);
-        prev->quantum_rem = quantum_ticks_for(prev->priority);
-        prev->state = PROC_READY;
-        enqueue(prev);
-    }
-
-    process_t *next = NULL;
-    for (int prio = 0; prio <= PRIO_USER; prio++) {
-        process_t *p = dequeue(prio);
-        if (!p) continue;
-
-        if (p->state == PROC_BLOCKED) {
-            if (p->wake_tick <= g_kstate.uptime_ticks) {
-                p->state = PROC_READY;
-            } else {
-                enqueue(p); /* not awake yet, put back */
-                continue;
-            }
-        }
-        next = p;
-        break;
-    }
-
-    if (!next) {
-        sti();
-        return prev; /* nothing else runnable, keep going */
-    }
-
-    next->state = PROC_RUNNING;
-    if (next->quantum_rem == 0)
-        next->quantum_rem = quantum_ticks_for(next->priority);
-
-    current_proc = next;
-
-    if (prev && prev != next)
-        context_switch(prev, next); /* may not return here until prev is rescheduled */
-
-    sti();
-    return next;
+    kthread_yield();
+    return current_proc;
 }
 
 /* CPU relax (pause instruction — avoids busy-loop burning) */
@@ -474,6 +908,7 @@ void cpu_relax(void)
 static uint8_t  phys_bitmap[BITMAP_SIZE];
 static uint64_t total_frames  = 0;
 static uint64_t free_frames   = 0;
+static uint64_t usable_frames;
 
 static void pmm_set_used(uint64_t frame)
 {
@@ -492,12 +927,22 @@ static int pmm_is_free(uint64_t frame)
 
 void pmm_free_range(uint64_t base, uint64_t len)
 {
+    /* The bitmap must start as "everything in use": only ranges the boot
+     * memory map reports as usable RAM are then released. It used to start
+     * zeroed (= all free), so holes in the memory map (firmware, ACPI) could
+     * be handed out as RAM and the free-frame counter underflowed. */
+    static int initialised = 0;
+    if (!initialised) {
+        memset(phys_bitmap, 0xFF, sizeof(phys_bitmap));
+        initialised = 1;
+    }
     uint64_t start = base / PAGE_SIZE;
     uint64_t end   = (base + len) / PAGE_SIZE;
     for (uint64_t f = start; f < end && f < MAX_FRAMES; f++) {
         if (!pmm_is_free(f)) {
             pmm_set_free(f);
             free_frames++;
+            usable_frames++;
         }
         total_frames = f + 1 > total_frames ? f + 1 : total_frames;
     }
@@ -515,26 +960,44 @@ void pmm_reserve_range(uint64_t base, uint64_t len)
     }
 }
 
-/* Allocate a single 4 KB frame */
+/* Allocate a single 4 KB frame. Searches from where the last search ended
+ * rather than from frame 0 every time. */
 uint64_t pmm_alloc_frame(void)
 {
-    for (uint64_t f = 0; f < total_frames; f++) {
-        if (pmm_is_free(f)) {
+    static uint64_t hint = 0;
+    uint64_t irqf = irq_save();
+
+    for (uint64_t n = 0; n < total_frames; n++) {
+        uint64_t f = (hint + n) % total_frames;
+        if (f != 0 && pmm_is_free(f)) {
             pmm_set_used(f);
             free_frames--;
+            hint = f + 1;
+            irq_restore(irqf);
             return f * PAGE_SIZE;
         }
     }
+    irq_restore(irqf);
     return 0; /* out of memory */
 }
 
 void pmm_free_frame(uint64_t phys)
 {
+    uint64_t irqf = irq_save();
     uint64_t f = phys / PAGE_SIZE;
     if (f < total_frames && !pmm_is_free(f)) {
         pmm_set_free(f);
         free_frames++;
     }
+    irq_restore(irqf);
+}
+
+/* total_frames spans holes in the memory map, so count what is actually
+ * usable: frames handed to the allocator, free or not. */
+void pmm_get_stats(uint64_t *total, uint64_t *free_count)
+{
+    if (total)      *total = usable_frames;
+    if (free_count) *free_count = free_frames;
 }
 
 /* Allocate N contiguous frames (for model pool DMA) */
@@ -625,7 +1088,7 @@ void *kmalloc(size_t size)
 
     size = (size + (HEAP_ALIGN - 1)) & ~(HEAP_ALIGN - 1);
 
-    cli();
+    uint64_t irqf = irq_save();
     for (heap_block_t *b = heap_head; b; b = b->next) {
         if (!b->free || b->size < size) continue;
 
@@ -640,10 +1103,10 @@ void *kmalloc(size_t size)
             b->size  = size;
         }
         b->free = 0;
-        sti();
+        irq_restore(irqf);
         return (void *)(b + 1);
     }
-    sti();
+    irq_restore(irqf);
     terminal_printf("[HEAP] kmalloc(%zu): small heap exhausted\n", size);
     return NULL;
 }
@@ -653,7 +1116,7 @@ void kfree(void *ptr)
     if (!ptr) return;
     heap_block_t *b = (heap_block_t *)ptr - 1;
 
-    cli();
+    uint64_t irqf = irq_save();
     b->free = 1;
 
     if (b->next && b->next->free) {
@@ -667,7 +1130,7 @@ void kfree(void *ptr)
         p->next  = b->next;
         if (b->next) b->next->prev = p;
     }
-    sti();
+    irq_restore(irqf);
 }
 
 /*
@@ -676,6 +1139,23 @@ void kfree(void *ptr)
  * the returned buffer stays page-aligned, which matters for DMA and for
  * any future AVX-aligned tensor loads of model weights.
  */
+void heap_get_stats(uint64_t *used_bytes, uint64_t *free_bytes, uint64_t *total_bytes)
+{
+    uint64_t used = 0, avail = 0;
+    uint64_t irqf = irq_save();
+
+    if (!heap_head) heap_init();
+    for (heap_block_t *b = heap_head; b; b = b->next) {
+        if (b->free) avail += b->size;
+        else         used += b->size;
+    }
+    irq_restore(irqf);
+
+    if (used_bytes)  *used_bytes = used;
+    if (free_bytes)  *free_bytes = avail;
+    if (total_bytes) *total_bytes = HEAP_SIZE;
+}
+
 #define MAX_LARGE_ALLOCS 64
 typedef struct { void *ptr; uint64_t pages; } large_alloc_t;
 static large_alloc_t large_allocs[MAX_LARGE_ALLOCS];
@@ -685,10 +1165,10 @@ void *kmalloc_large(size_t size)
     if (size == 0) return NULL;
     uint64_t pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
 
-    cli();
+    uint64_t irqf = irq_save();
     uint64_t phys = pmm_alloc_contiguous(pages);
     if (!phys) {
-        sti();
+        irq_restore(irqf);
         terminal_printf("[HEAP] kmalloc_large: failed to allocate %llu pages "
                          "(%zu bytes requested)\n", pages, size);
         return NULL;
@@ -698,7 +1178,7 @@ void *kmalloc_large(size_t size)
         if (!large_allocs[i].ptr) {
             large_allocs[i].ptr   = (void *)phys;
             large_allocs[i].pages = pages;
-            sti();
+            irq_restore(irqf);
             return (void *)phys;
         }
     }
@@ -707,7 +1187,7 @@ void *kmalloc_large(size_t size)
      * pointer kfree_large() could never reclaim. */
     for (uint64_t i = 0; i < pages; i++)
         pmm_free_frame(phys + i * PAGE_SIZE);
-    sti();
+    irq_restore(irqf);
     terminal_puts("[HEAP] kmalloc_large: tracking table full (max 64 "
                   "concurrent large allocations)\n");
     return NULL;
@@ -720,38 +1200,18 @@ void kfree_large(void *ptr, size_t size)
                    a stale/wrong size can't corrupt the PMM bitmap. */
     if (!ptr) return;
 
-    cli();
+    uint64_t irqf = irq_save();
     for (int i = 0; i < MAX_LARGE_ALLOCS; i++) {
         if (large_allocs[i].ptr == ptr) {
             for (uint64_t f = 0; f < large_allocs[i].pages; f++)
                 pmm_free_frame((uint64_t)ptr + f * PAGE_SIZE);
             large_allocs[i].ptr   = NULL;
             large_allocs[i].pages = 0;
-            sti();
+            irq_restore(irqf);
             return;
         }
     }
-    sti();
+    irq_restore(irqf);
     terminal_puts("[HEAP] kfree_large: pointer not found in tracking table "
                   "(double free, or it was never allocated via kmalloc_large)\n");
-}
-
-/* ============================================================================
- * Virtual memory manager stub
- * ============================================================================ */
-void vmm_init(uint64_t model_pool_phys)
-{
-    (void)model_pool_phys;
-    terminal_puts("[VMM] 4-level page tables active (set up by stage2)\n");
-}
-
-void *vmm_map_range(uint64_t phys, uint64_t size, uint32_t flags)
-{
-    (void)size; (void)flags;
-    /*
-     * Boot paging identity-maps the first 4 GiB with 2 MiB pages, which covers
-     * QEMU/Bochs display, NIC, AHCI, and HDA MMIO BARs. A full VMM will replace
-     * this with dynamic mappings later.
-     */
-    return (void *)phys;
 }

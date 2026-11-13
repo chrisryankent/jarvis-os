@@ -162,10 +162,17 @@ static void term_resolve(const char *arg, char *out, size_t n)
     else                    snprintf(out, n, "/jarvis/%s", arg);
 }
 
+uint32_t sysmon_spawn_test(const char *kind);                       /* apps/sysmon.c */
+const char *sysmon_state_name(const proc_info_t *p, char *buf, size_t n);
+
 static void cmd_help(void)
 {
     terminal_app_write(
-        "Files:    ls [dir]   cat <file>   mkdir <dir>   touch <file>\n"
+        "Files:    ls [dir]   cat <file>   mkdir <dir>   touch <file>   rm <path>\n"
+        "          mv <from> <to>   cp <from> <to>\n"
+        "Programs: run <name>   (hello, counter, kernelpoke, privileged)\n"
+        "Process:  ps   kill <pid>   suspend <pid>   resume <pid>\n"
+        "          spawn cpu|sleeper|deadlock|memory|isolate\n"
         "System:   status   uptime   date   clear   echo <text>\n"
         "Desktop:  apps   open <app>   theme dark|light|hc   notify <text>\n"
         "JARVIS:   ask <question>\n"
@@ -263,6 +270,8 @@ void terminal_app_execute_command(const char *cmd)
 
     char buf[160], path[128];
 
+    desktop_files_changed();    /* cheap; covers mkdir / touch / rm / mv / cp */
+
     if (strcmp(verb, "help") == 0) {
         cmd_help();
     } else if (strcmp(verb, "clear") == 0 || strcmp(verb, "cls") == 0) {
@@ -279,6 +288,57 @@ void terminal_app_execute_command(const char *cmd)
         term_resolve(rest, path, sizeof(path));
         terminal_app_write(*rest && vfs_create_file(path) == 0 ? "File created.\n"
                                                                : "touch: failed\n");
+    } else if (strcmp(verb, "rm") == 0) {
+        term_resolve(rest, path, sizeof(path));
+        terminal_app_write(*rest && vfs_delete(path) == 0 ? "Deleted.\n" : "rm: not found\n");
+    } else if (strcmp(verb, "mv") == 0 || strcmp(verb, "cp") == 0) {
+        char a[64] = {}, to[128];
+        const char *sp = strchr(rest, ' ');
+        if (!sp) { terminal_app_write("usage: mv|cp <from> <to>\n"); return; }
+        size_t alen = (size_t)(sp - rest);
+        if (alen >= sizeof(a)) alen = sizeof(a) - 1;
+        memcpy(a, rest, alen);
+        while (*sp == ' ') sp++;
+        term_resolve(a, path, sizeof(path));
+        term_resolve(sp, to, sizeof(to));
+        int rc = verb[0] == 'm' ? vfs_rename(path, to) : vfs_copy(path, to);
+        terminal_app_write(rc == 0 ? "Done.\n" : "Failed (missing source, or target exists).\n");
+    } else if (strcmp(verb, "ps") == 0) {
+        static proc_info_t procs[64];
+        int n = proc_list(procs, 64);
+        terminal_app_write("  PID  NAME              STATUS                CPU TIME\n");
+        for (int i = 0; i < n; i++) {
+            char st[40], line[120], name[18], stp[22];
+            sysmon_state_name(&procs[i], st, sizeof(st));
+            /* pad by hand: the kernel printf has no field widths */
+            memset(name, ' ', 17); name[17] = 0;
+            memcpy(name, procs[i].name, strlen(procs[i].name) < 17 ? strlen(procs[i].name) : 17);
+            memset(stp, ' ', 21); stp[21] = 0;
+            memcpy(stp, st, strlen(st) < 21 ? strlen(st) : 21);
+            snprintf(line, sizeof(line), "  %s%u  %s %s %u.%us\n",
+                     procs[i].pid < 10 ? "  " : (procs[i].pid < 100 ? " " : ""),
+                     procs[i].pid, name, stp,
+                     (unsigned)(procs[i].cpu_ticks / 100), (unsigned)((procs[i].cpu_ticks / 10) % 10));
+            terminal_app_write(line);
+        }
+    } else if (strcmp(verb, "kill") == 0 || strcmp(verb, "suspend") == 0 ||
+               strcmp(verb, "resume") == 0) {
+        uint32_t pid = 0;
+        for (const char *d = rest; *d >= '0' && *d <= '9'; d++) pid = pid * 10 + (uint32_t)(*d - '0');
+        int rc = verb[0] == 'k' ? proc_kill(pid)
+               : verb[0] == 's' ? proc_suspend(pid) : proc_resume(pid);
+        terminal_app_write(rc == 0 ? "OK\n" : "Failed: no such process, or it is protected.\n");
+    } else if (strcmp(verb, "run") == 0) {
+        /* Programs live in /jarvis/bin unless a path is given. */
+        if (strchr(rest, '/')) term_resolve(rest, path, sizeof(path));
+        else                   snprintf(path, sizeof(path), "/jarvis/bin/%s", rest);
+        uint32_t pid = *rest ? user_exec(path) : 0;
+        if (!pid) terminal_app_write("run: not a program (try: ls bin)\n");
+        else { snprintf(buf, sizeof(buf), "Started %s as PID %u (user mode)\n", rest, pid); terminal_app_write(buf); }
+    } else if (strcmp(verb, "spawn") == 0) {
+        uint32_t pid = sysmon_spawn_test(rest);
+        if (!pid) terminal_app_write("usage: spawn cpu|sleeper|deadlock|memory|isolate\n");
+        else { snprintf(buf, sizeof(buf), "Started PID %u\n", pid); terminal_app_write(buf); }
     } else if (strcmp(verb, "echo") == 0) {
         terminal_app_write(rest);
         terminal_app_write("\n");

@@ -34,6 +34,7 @@ void ui_shell_lock_input(uint32_t key, char ch);    /* desktop/ui_shell.c */
 #include "../apps/assistant.c"
 #include "../apps/security_center.c"
 #include "../apps/sysmon.c"
+#include "../apps/notepad.c"
 
 /* ---- App registry -------------------------------------------------------- */
 typedef wm_window_t *(*app_open_fn)(int x, int y, int w, int h);
@@ -52,7 +53,8 @@ static app_entry_t g_apps[] = {
     { { "Security",   ICON_SHIELD,   NULL }, security_app_open,   470, 440, "security guard" },
     { { "Settings",   ICON_GEAR,     NULL }, settings_app_open,   680, 400, "settings personalize" },
     { { "Calculator", ICON_CALC,     NULL }, calculator_app_open, 300, 430, "calculator calc" },
-    { { "System",     ICON_CHART,    NULL }, sysmon_app_open,     520, 420, "system monitor models" },
+    { { "Tasks",      ICON_CHART,    NULL }, sysmon_app_open,     640, 470, "system monitor taskmgr processes" },
+    { { "Notepad",    ICON_FILE,     NULL }, notepad_app_open,    600, 420, "notepad editor text" },
 };
 #define APP_COUNT ((int)(sizeof(g_apps) / sizeof(g_apps[0])))
 
@@ -272,6 +274,26 @@ void desktop_system_render(void)
 
     uint64_t now = g_kstate.uptime_ticks;
 
+    /* Scheduler events raised inside other processes (they must not touch
+     * the UI themselves) are shown from here, on the desktop process. */
+    governor_tick();        /* resource policy: AI advice or built-in rules */
+
+    /* Output printed by user programs appears in the Terminal. */
+    static char prog_out[512];
+    size_t out_len = user_console_read(prog_out, sizeof(prog_out) - 1);
+    if (out_len) {
+        prog_out[out_len] = 0;
+        terminal_puts(prog_out);                            /* serial log */
+        desktop_app_t *term = desktop_app_get(desktop_app_find("Terminal"));
+        if (term && term->window)
+            terminal_app_write(prog_out);
+        g_ds.dirty = 1;
+    }
+
+    char sched_msg[96];
+    if (scheduler_take_event(sched_msg, sizeof(sched_msg)))
+        notification_show("Process manager", sched_msg, NOTIF_WARNING, 8000);
+
     if (notifications_tick())
         g_ds.dirty = 1;
     if (now - g_ds.last_draw_tick >= 50)
@@ -328,16 +350,16 @@ void desktop_system_handle_mouse_move(int x, int y)
         g_ds.dirty = 1;
 }
 
-static void desktop_open_icon(int icon)
+void desktop_open_icon(int icon)
 {
     const char *target = desktop_get_icon_target(icon);
 
-    if (strcmp(target, "trash:") == 0) {
-        notification_show("Recycle Bin", "The Recycle Bin is empty.", NOTIF_INFO, 3000);
+    if (target[0] == '/' && !vfs_is_dir(target)) {
+        notepad_open_file(target);
     } else if (target[0] == '/') {
         desktop_app_launch(desktop_app_find("Files"));
         file_explorer_navigate_to(target);
-    } else {
+    } else if (target[0]) {
         desktop_system_open_app(target);
     }
 }
@@ -355,6 +377,10 @@ void desktop_system_handle_mouse_click(int x, int y, int button)
     if (!ui_shell_is_desktop())
         return;
 
+    /* Clicking anywhere accepts a desktop rename in progress. */
+    if (desktop_rename_active())
+        desktop_rename_finish(1);
+
     /* Top-most layers first. */
     if (desktop_context_click(x, y))
         return;
@@ -371,6 +397,8 @@ void desktop_system_handle_mouse_click(int x, int y, int button)
         return;
     }
 
+    /* A right-click anywhere first dismisses a menu that is already open
+     * (handled above), then goes to the window or desktop under it. */
     if (wm_handle_mouse_click(x, y, button))
         return;
 
@@ -445,10 +473,19 @@ void desktop_dispatch_event(wm_input_event_t *event)
         int mods = event->data.keyboard.mods;
         g_ds.dirty = 1;
 
+        if (desktop_rename_active()) {
+            desktop_rename_input(key, 0);
+            return;
+        }
         if (desktop_shortcut(key, mods))
             return;
         if (start_menu_key(key, mods))
             return;
+        /* With no window focused, Delete / F2 act on the selected desktop icon. */
+        if (!g_wm_ctx.focused && key == WM_KEY_DELETE) {
+            desktop_delete_selected();
+            return;
+        }
         if (key == WM_KEY_ESC && (desktop_context_is_open() ||
                                   notifications_center_is_visible())) {
             desktop_context_close();
@@ -460,6 +497,10 @@ void desktop_dispatch_event(wm_input_event_t *event)
     }
     case IE_TEXT_INPUT:
         g_ds.dirty = 1;
+        if (desktop_rename_active()) {
+            desktop_rename_input(0, event->data.text.ch);
+            return;
+        }
         if (start_menu_text(event->data.text.ch))
             return;
         wm_handle_input(event);

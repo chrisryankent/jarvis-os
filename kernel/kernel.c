@@ -105,7 +105,8 @@ void jarvis_kernel_main(void)
     memory_init();        /* physical frame allocator + virtual memory map   */
     interrupt_init();     /* IDT, PIC remapping, timer IRQ0 wired to AI tick */
     device_init();        /* PCI scan, AHCI, USB, NIC, audio, GPU framebuf   */
-    vfs_init();           /* ramfs, model slots, user data folders           */
+    vfs_init();           /* ramfs, model slots, user data folders */
+    usermode_install_programs();   /* bundled user programs -> /jarvis/bin */
     ui_shell_show_loading_desktop();
 
     /*
@@ -223,6 +224,9 @@ static void interrupt_init(void)
     terminal_puts("[IRQ] Setting up IDT\n");
     idt_init();
 
+    scheduler_init();   /* the running code becomes process 1 */
+    usermode_init();    /* GDT with user segments, TSS, SYSCALL */
+
     /* Remap PIC: master 0x20–0x27, slave 0x28–0x2F */
     pic_remap(0x20, 0x28);
 
@@ -268,15 +272,7 @@ int voice_bridge_is_active(void)
 void ai_scheduler_tick(void)
 {
     g_kstate.uptime_ticks++;
-
-    /*
-     * Preemptive context switching from the IRQ0 interrupt frame is not
-     * enabled yet. The desktop runtime below already services AI, speech,
-     * IPC, input, and TTS cooperatively every loop, which is the stable path
-     * for this build. Leaving scheduler_pick_next() out of the timer avoids
-     * switching away from the boot stack into an infinite service thread
-     * before jarvis_kernel_main() finishes first boot.
-     */
+    scheduler_tick();       /* may switch to another process */
 }
 
 
@@ -888,12 +884,11 @@ static void kernel_desktop_loop(void)
         desktop_system_render();
 
         /*
-         * Sleep until the next interrupt (timer tick at 100 Hz, keyboard or
-         * mouse). The old loop spun in a busy-wait and bumped uptime_ticks
-         * itself on top of the timer IRQ, so the clock ran at an arbitrary
-         * speed and the CPU was pinned at 100%.
+         * Give up the CPU until the next tick (or sooner, on keyboard / mouse
+         * input). Other processes run in the meantime; if there are none the
+         * scheduler halts the CPU.
          */
-        __asm__ volatile ("hlt");
+        kthread_sleep(1);
     }
 }
 
@@ -920,7 +915,7 @@ static void ai_core_init(void)
     g_kstate.model_vaddr = model_vaddr;
 
     /* Spawn AI inference thread (runs on CPU core 1, pinned) */
-    kthread_create("ai_brain", ai_brain_thread, PRIO_AI, /* stack */ 0x200000);
+    proc_spawn("ai_brain", ai_brain_thread, PRIO_AI, PROC_FLAG_SERVICE);
 
     /* Shared context window buffer — LLM reads from here */
     g_kstate.context_buffer = kmalloc(CONTEXT_BUFFER_SIZE);
@@ -951,10 +946,10 @@ static void speech_daemon_init(void)
     g_kstate.audio_out_buf = kmalloc(AUDIO_RING_SIZE);
 
     /* Thread: mic capture → VAD → STT */
-    kthread_create("speech_stt", speech_stt_thread, PRIO_REALTIME, 0x80000);
+    proc_spawn("speech_stt", speech_stt_thread, PRIO_REALTIME, PROC_FLAG_SERVICE);
 
     /* Thread: TTS render → speaker */
-    kthread_create("speech_tts", speech_tts_thread, PRIO_REALTIME, 0x80000);
+    proc_spawn("speech_tts", speech_tts_thread, PRIO_REALTIME, PROC_FLAG_SERVICE);
 
     g_kstate.speech_ready = 1;
     terminal_puts("[SPEECH] Speech pipeline ready\n");
@@ -980,7 +975,7 @@ static void security_daemon_init(void)
     nic_set_packet_hook(security_net_audit);
 
     /* Anomaly detection thread */
-    kthread_create("sec_daemon", security_daemon_thread, PRIO_AI, 0x80000);
+    proc_spawn("sec_daemon", security_daemon_thread, PRIO_AI, PROC_FLAG_SERVICE);
 
     /* Disk encryption (AES-256-XTS) key — derived from user voiceprint hash */
     disk_encryption_init();

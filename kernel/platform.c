@@ -282,9 +282,35 @@ void terminal_init(void)
     serial_init_port(0x2F8); /* COM2: host microphone/STT bridge */
 }
 
+/*
+ * A UART that is not there reads back 0xFF from every register, which looks
+ * like "data ready" forever. The desktop loop drains the voice bridge port
+ * (COM2) with `while (poll)`, so on a machine without COM2 that loop never
+ * returned and the desktop never got to draw. Probe each port once with the
+ * scratch register and treat a missing port as permanently empty.
+ */
+static int serial_port_present(uint16_t port)
+{
+    static int probed[2], present[2];
+    int idx = (port == 0x3F8) ? 0 : 1;
+
+    if (!probed[idx]) {
+        outb(port + 7, 0xA5);
+        int ok = inb(port + 7) == 0xA5;
+        outb(port + 7, 0x5A);
+        ok = ok && inb(port + 7) == 0x5A;
+        present[idx] = ok;
+        probed[idx] = 1;
+    }
+    return present[idx];
+}
+
 static int serial_received_port(uint16_t port)
 {
-    return inb(port + 5) & 1;
+    if (!serial_port_present(port))
+        return 0;
+    uint8_t lsr = inb(port + 5);
+    return lsr != 0xFF && (lsr & 1);
 }
 
 static char terminal_getchar(void)
@@ -519,19 +545,54 @@ static const char *exception_name(uint64_t vector)
  * every one of the 256 vectors. See that file's header comment for the
  * exact register-save convention this relies on.
  */
-void interrupt_dispatch(uint64_t vector, uint64_t error_code)
+void interrupt_dispatch(uint64_t vector, uint64_t error_code, uint64_t *frame)
 {
     if (vector < 0x20) {
-        /* CPU exception with no registered handler. Print diagnostics and
-         * halt rather than silently triple-faulting (the previous behaviour,
-         * since there was no IDT at all to even take the fault through). */
+        /*
+         * CPU exception. Three outcomes:
+         *   1. A page fault the memory manager can satisfy (first touch of a
+         *      demand-paged page, or a page that was swapped out): fix it and
+         *      retry the instruction. The process never notices.
+         *   2. A fault caused by an ordinary process: terminate that process
+         *      and keep the system running.
+         *   3. A fault in the kernel / desktop itself: nothing safe can be
+         *      done, so report and halt.
+         */
+        uint64_t rip = frame ? frame[17] : 0;
         uint64_t cr2 = 0;
         if (vector == 14)
             __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
 
-        terminal_printf("\n[PANIC] CPU exception %llu: %s (error_code=0x%llx",
+        int vm_result = VM_FAULT_BAD_ADDRESS;
+        if (vector == 14) {
+            vm_result = vm_handle_fault(proc_current_space(), cr2, error_code);
+            if (vm_result == 0)
+                return;
+        }
+
+        if (!proc_current_is_system()) {
+            char reason[96];
+            const char *what = exception_name(vector);
+            if (vector == 14) {
+                what = vm_result == VM_FAULT_READ_ONLY  ? "wrote to read-only memory"
+                     : vm_result == VM_FAULT_NO_EXECUTE ? "executed non-executable memory"
+                     : vm_result == VM_FAULT_NO_MEMORY  ? "ran out of memory"
+                     : "accessed memory it does not own";
+                snprintf(reason, sizeof(reason), "%s (PID %u) terminated: %s at 0x%llx",
+                         proc_current_name(), kthread_current_pid(), what,
+                         (unsigned long long)cr2);
+                terminal_printf("[FAULT] faulting instruction at 0x%llx\n", (unsigned long long)rip);
+            } else {
+                snprintf(reason, sizeof(reason), "%s (PID %u) terminated: %s at 0x%llx",
+                         proc_current_name(), kthread_current_pid(), what,
+                         (unsigned long long)rip);
+            }
+            proc_fault_exit(reason);    /* never returns */
+        }
+
+        terminal_printf("\n[PANIC] CPU exception %llu: %s (error_code=0x%llx, rip=0x%llx",
             (unsigned long long)vector, exception_name(vector),
-            (unsigned long long)error_code);
+            (unsigned long long)error_code, (unsigned long long)rip);
         if (vector == 14)
             terminal_printf(", faulting address=0x%llx", (unsigned long long)cr2);
         terminal_puts(")\n[PANIC] System halted.\n");
@@ -544,15 +605,36 @@ void interrupt_dispatch(uint64_t vector, uint64_t error_code)
      * always send EOI — even if nothing was registered for this line —
      * so an unhandled IRQ doesn't leave the PIC thinking it's still busy
      * and stop delivering further interrupts on that line. */
-    if (g_irq_handlers[vector])
-        g_irq_handlers[vector]();
-
+    /*
+     * Acknowledge the PIC *before* running the handler. The timer handler
+     * may switch to another process and not return here for a long time; if
+     * the EOI waited until after it, no further timer interrupts would be
+     * delivered and the new process could never be preempted. Interrupts
+     * stay disabled until iretq, so acknowledging early cannot nest.
+     */
     if (vector >= g_pic_master_offset && vector < (uint32_t)g_pic_master_offset + 8) {
         outb(PIC1_CMD, 0x20);
     } else if (vector >= g_pic_slave_offset && vector < (uint32_t)g_pic_slave_offset + 8) {
         outb(PIC1_CMD, 0x20);   /* cascade: ack master too */
         outb(PIC2_CMD, 0x20);
     }
+
+    /*
+     * Preserve the interrupted code's FPU/SSE state. The buffer lives on the
+     * interrupted process's own stack, so it also survives a process switch
+     * made inside the handler.
+     */
+    /* fxsave needs a 16-byte aligned buffer. The interrupt stub does not
+     * guarantee the C ABI's stack alignment, so align by hand rather than
+     * trusting __attribute__((aligned)). */
+    uint8_t fpu_raw[512 + 16];
+    uint8_t *fpu_state = (uint8_t *)(((uintptr_t)fpu_raw + 15) & ~(uintptr_t)15);
+    __asm__ volatile ("fxsave (%0)" : : "r"(fpu_state) : "memory");
+
+    if (g_irq_handlers[vector])
+        g_irq_handlers[vector]();
+
+    __asm__ volatile ("fxrstor (%0)" : : "r"(fpu_state) : "memory");
 }
 
 /*
@@ -628,11 +710,13 @@ static const char sc1_to_ascii_shift[128] = {
 void irq1_keyboard_handler(void)
 {
     ps2_irq_service();
+    scheduler_wake_main();      /* handle the input now, not at the next tick */
 }
 
 void irq12_mouse_handler(void)
 {
     ps2_irq_service();
+    scheduler_wake_main();
 }
 
 static int kbd_super_used = 0;

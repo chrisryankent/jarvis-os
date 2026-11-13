@@ -121,8 +121,18 @@ static ramfs_file_t *ramfs_create_node(const char *path, size_t initial_cap, int
 {
     ramfs_file_t *existing = ramfs_find(path);
     if (existing) return existing;
-    if (ramfs_count >= RAMFS_MAX_FILES) return NULL;
-    ramfs_file_t *f = &ramfs_files[ramfs_count++];
+    if (strlen(path) >= sizeof(ramfs_files[0].path)) return NULL;
+
+    /* Reuse a slot freed by vfs_delete() before growing the table. */
+    ramfs_file_t *f = NULL;
+    for (int i = 0; i < ramfs_count; i++) {
+        if (!ramfs_files[i].used) { f = &ramfs_files[i]; break; }
+    }
+    if (!f) {
+        if (ramfs_count >= RAMFS_MAX_FILES) return NULL;
+        f = &ramfs_files[ramfs_count++];
+    }
+    memset(f, 0, sizeof(*f));
     strncpy(f->path, path, sizeof(f->path) - 1);
     f->capacity = initial_cap ? initial_cap : 4096;
     f->large    = f->capacity >= LARGE_ALLOC_THRESHOLD;
@@ -397,6 +407,175 @@ void vfs_append(const char *path, const char *data, size_t len)
     vfs_write(fd, data, len);
     vfs_write(fd, "\n", 1);
     vfs_close(fd);
+}
+
+/* ==========================================================================
+ * File management: used by the Files app, Notepad and the terminal.
+ *
+ * The ramfs is a flat table of full paths, so a directory "contains" every
+ * entry whose path starts with "<dir>/". A directory may also exist only
+ * implicitly, as the prefix of deeper entries (e.g. /jarvis/models).
+ * ========================================================================== */
+
+/* 1 if `path` is `dir` itself or lies anywhere beneath it. */
+static int path_is_under(const char *path, const char *dir, size_t dlen)
+{
+    return strncmp(path, dir, dlen) == 0 && (path[dlen] == '/' || path[dlen] == '\0');
+}
+
+static void ramfs_free_node(ramfs_file_t *f)
+{
+    if (f->data) {
+        if (f->large) kfree_large(f->data, f->capacity);
+        else          kfree(f->data);
+    }
+    memset(f, 0, sizeof(*f));
+}
+
+int vfs_exists(const char *path)
+{
+    size_t plen = strlen(path);
+    for (int i = 0; i < ramfs_count; i++)
+        if (ramfs_files[i].used && path_is_under(ramfs_files[i].path, path, plen))
+            return 1;
+    return 0;
+}
+
+int vfs_is_dir(const char *path)
+{
+    ramfs_file_t *rf = ramfs_find(path);
+    if (rf) return rf->is_dir;
+
+    /* implicit directory: something lives beneath it */
+    size_t plen = strlen(path);
+    for (int i = 0; i < ramfs_count; i++)
+        if (ramfs_files[i].used && strncmp(ramfs_files[i].path, path, plen) == 0 &&
+            ramfs_files[i].path[plen] == '/')
+            return 1;
+    return 0;
+}
+
+/* Size in bytes of a file, or the total of everything under a directory. */
+long vfs_size(const char *path)
+{
+    size_t plen = strlen(path);
+    long total = -1;
+    for (int i = 0; i < ramfs_count; i++) {
+        ramfs_file_t *f = &ramfs_files[i];
+        if (!f->used || !path_is_under(f->path, path, plen)) continue;
+        if (total < 0) total = 0;
+        if (!f->is_dir) total += (long)f->size;
+    }
+    return total;
+}
+
+/* Number of entries beneath a directory (all levels). */
+int vfs_count_children(const char *path)
+{
+    size_t plen = strlen(path);
+    int n = 0;
+    for (int i = 0; i < ramfs_count; i++)
+        if (ramfs_files[i].used && strncmp(ramfs_files[i].path, path, plen) == 0 &&
+            ramfs_files[i].path[plen] == '/')
+            n++;
+    return n;
+}
+
+/* Delete a file, or a directory together with everything inside it. */
+int vfs_delete(const char *path)
+{
+    size_t plen = strlen(path);
+    int removed = 0;
+
+    if (plen < 2) return -1;                    /* never the root */
+    for (int i = 0; i < ramfs_count; i++) {
+        ramfs_file_t *f = &ramfs_files[i];
+        if (f->used && path_is_under(f->path, path, plen)) {
+            ramfs_free_node(f);
+            removed++;
+        }
+    }
+    return removed ? 0 : -1;
+}
+
+/* Rename / move a file or a whole directory tree. */
+int vfs_rename(const char *from, const char *to)
+{
+    size_t flen = strlen(from), tlen = strlen(to);
+
+    if (flen < 2 || tlen < 2 || strcmp(from, to) == 0) return -1;
+    if (!vfs_exists(from) || vfs_exists(to)) return -1;
+    if (path_is_under(to, from, flen)) return -1;   /* into itself */
+
+    /* Check every new path fits before changing anything. */
+    for (int i = 0; i < ramfs_count; i++) {
+        ramfs_file_t *f = &ramfs_files[i];
+        if (f->used && path_is_under(f->path, from, flen) &&
+            strlen(f->path) - flen + tlen >= sizeof(f->path))
+            return -1;
+    }
+
+    for (int i = 0; i < ramfs_count; i++) {
+        ramfs_file_t *f = &ramfs_files[i];
+        if (!f->used || !path_is_under(f->path, from, flen)) continue;
+
+        char tail[sizeof(f->path)];
+        strncpy(tail, f->path + flen, sizeof(tail) - 1);
+        tail[sizeof(tail) - 1] = '\0';
+        snprintf(f->path, sizeof(f->path), "%s%s", to, tail);
+    }
+    return 0;
+}
+
+/* Copy a file, or a directory tree, to a new path. */
+int vfs_copy(const char *from, const char *to)
+{
+    size_t flen = strlen(from);
+    int count = ramfs_count;            /* don't revisit the copies we add */
+    int copied = 0;
+
+    if (!vfs_exists(from) || vfs_exists(to)) return -1;
+    if (path_is_under(to, from, flen)) return -1;
+
+    for (int i = 0; i < count; i++) {
+        ramfs_file_t *src = &ramfs_files[i];
+        if (!src->used || !path_is_under(src->path, from, flen)) continue;
+
+        char dst_path[sizeof(src->path)];
+        if (strlen(src->path) - flen + strlen(to) >= sizeof(dst_path)) return -1;
+        snprintf(dst_path, sizeof(dst_path), "%s%s", to, src->path + flen);
+
+        size_t size = src->size;
+        int is_dir = src->is_dir;
+        ramfs_file_t *dst = ramfs_create_node(dst_path, is_dir ? 0 : size, is_dir);
+        if (!dst || !dst->data) return -1;
+
+        src = &ramfs_files[i];
+        if (!is_dir && size) {
+            memcpy(dst->data, src->data, size);
+            dst->size = size;
+        }
+        copied++;
+    }
+
+    /* Copying an implicit directory still has to produce a directory. */
+    if (!ramfs_find(to) && vfs_is_dir(from))
+        ramfs_create_node(to, 0, 1);
+    return copied || vfs_exists(to) ? 0 : -1;
+}
+
+/* Replace the contents of a file (created if missing). */
+int vfs_write_file(const char *path, const void *data, size_t len)
+{
+    int fd = vfs_open(path, VFS_FLAG_WRITE | VFS_FLAG_CREATE | VFS_FLAG_TRUNC);
+    if (fd < 0) return -1;
+
+    ramfs_file_t *rf = ramfs_find(path);
+    if (rf) rf->size = 0;
+
+    int n = len ? vfs_write(fd, data, len) : 0;
+    vfs_close(fd);
+    return n < 0 ? -1 : 0;
 }
 
 /* Memory-map a model file into the model pool (zero-copy for large weights) */

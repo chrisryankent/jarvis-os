@@ -14,7 +14,7 @@
 #include <string.h>
 #include <stdio.h>
 
-#define SET_SIDEBAR_W 170
+#define SET_SIDEBAR_W 190
 #define SET_ITEM_H    36
 
 typedef enum {
