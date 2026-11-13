@@ -676,6 +676,10 @@ void irq0_timer_handler(void)
  * and the actual code arrive as separate IRQs.
  */
 static int kbd_shift = 0, kbd_ctrl = 0, kbd_alt = 0, kbd_caps = 0, kbd_super = 0;
+
+/* Modifier keys held right now (KMOD_*), for code that needs them outside a
+ * key event, e.g. Shift+click. */
+int input_current_mods(void);
 static int kbd_extended_prefix = 0;
 
 /* Scan Code Set 1 -> ASCII, unshifted (US QWERTY). 0 = no printable char. */
@@ -706,6 +710,8 @@ static const char sc1_to_ascii_shift[128] = {
 #define KEY_RIGHT      0x105
 #define KEY_DELETE     0x106
 #define KEY_HOME       0x107
+#define KEY_PGUP       0x109
+#define KEY_PGDN       0x10A
 #define KEY_END        0x108
 #define KEY_F1         0x110  /* F1-F12 = 0x110..0x11B */
 #define KEY_TAB        9      /* matches ASCII \t, already produced by sc1_to_ascii[0x0F] */
@@ -781,6 +787,8 @@ void kbd_handle_scancode(uint8_t code)
         case 0x53: key = KEY_DELETE; break;
         case 0x47: key = KEY_HOME;   break;
         case 0x4F: key = KEY_END;    break;
+        case 0x49: key = KEY_PGUP;   break;
+        case 0x51: key = KEY_PGDN;   break;
         default: break;
         }
     } else if (sc == 0x01) {
@@ -887,3 +895,9 @@ void system_shutdown(void)
  * tries, which is the correct failure mode here — loud at link time, not
  * silent at runtime.
  */
+
+int input_current_mods(void)
+{
+    return (kbd_shift ? KMOD_SHIFT : 0) | (kbd_ctrl ? KMOD_CTRL : 0) |
+           (kbd_alt ? KMOD_ALT : 0) | (kbd_super ? KMOD_SUPER : 0);
+}

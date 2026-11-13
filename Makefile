@@ -192,7 +192,17 @@ $(AI_OBJS) $(SECURITY_OBJS) $(SPEECH_OBJS): %.o: %.cpp
 user/%.elf: user/%.c user/crt0.S user/jarvis.h user/user.ld
 	$(CC) $(USER_CFLAGS) user/crt0.S $< -o $@
 
-user/programs.o: user/programs.S $(USER_ELFS)
+# Sample packages (placed in Downloads at boot so there is something to install)
+user/hello.jpk: user/hello.elf tools/mkjpk.py
+	$(PYTHON) tools/mkjpk.py --name hello --title "Hello" --version 1.0 --publisher "JARVIS OS" \
+		--description "Greets you, writes a file and shows the system status." \
+		--exec bin/hello -o $@ user/hello.elf=bin/hello
+user/counter.jpk: user/counter.elf tools/mkjpk.py
+	$(PYTHON) tools/mkjpk.py --name counter --title "Counter" --version 1.0 --publisher "JARVIS OS" \
+		--description "Counts to twenty, once a second." \
+		--exec bin/counter -o $@ user/counter.elf=bin/counter
+
+user/programs.o: user/programs.S $(USER_ELFS) user/hello.jpk user/counter.jpk
 	$(CC) -c user/programs.S -o $@
 
 kernel/syscall_entry.o: kernel/syscall_entry.S
@@ -233,6 +243,6 @@ iso-models: kernel.elf
 	fi
 
 clean:
-	rm -f kernel.elf $(OBJS) $(USER_ELFS)
+	rm -f kernel.elf $(OBJS) $(USER_ELFS) user/*.jpk
 	$(MAKE) -C kernel clean
 	rm -rf $(ISO_DIR) build

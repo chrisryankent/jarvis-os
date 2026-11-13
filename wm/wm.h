@@ -47,6 +47,8 @@ typedef enum {
 #define WM_KEY_DELETE     0x106
 #define WM_KEY_HOME       0x107
 #define WM_KEY_END        0x108
+#define WM_KEY_PGUP       0x109
+#define WM_KEY_PGDN       0x10A
 #define WM_KEY_F1         0x110   /* F1..F12 = 0x110..0x11B */
 #define WM_KEY_F4         0x113
 #define WM_KEY_SUPER_TAP  0x120   /* Super/Windows key tapped on its own */
@@ -81,6 +83,9 @@ struct wm_window;
 typedef void (*wm_draw_callback_t)(struct wm_window *win, uint32_t *framebuffer);
 typedef void (*wm_event_callback_t)(struct wm_window *win, wm_input_event_t *event);
 typedef void (*wm_close_callback_t)(void *ctx);
+/* Asked before a window is closed by the user (close button, Alt+F4).
+ * Return 0 to keep it open (e.g. to ask about unsaved changes first). */
+typedef int (*wm_close_request_t)(struct wm_window *win);
 
 /* ---- Window Structure ---------------------------------------------------- */
 typedef struct wm_window {
@@ -97,6 +102,7 @@ typedef struct wm_window {
     wm_draw_callback_t on_draw;
     wm_event_callback_t on_event;
     wm_close_callback_t on_close;           /* fired just before destruction */
+    wm_close_request_t on_close_request;    /* may veto a user close; NULL = allow */
     void *close_ctx;
     void *user_data;
 
@@ -164,6 +170,7 @@ wm_window_t *wm_create_window(const char *title, int x, int y, int w, int h,
 void wm_destroy_window(wm_window_t *win);
 void wm_set_close_callback(wm_window_t *win, wm_close_callback_t cb, void *ctx);
 void wm_close_window(wm_window_t *win);      /* fires on_close, then destroys */
+void wm_request_close(wm_window_t *win);     /* user asked: honours on_close_request */
 
 void wm_set_focused(wm_window_t *win);       /* NULL clears focus; restores if minimized */
 void wm_set_minimized(wm_window_t *win, int minimized);

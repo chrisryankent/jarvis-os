@@ -152,3 +152,11 @@ int memcmp(const void *a, const void *b, size_t n)
         if (x[i] != y[i]) return (int)x[i] - (int)y[i];
     return 0;
 }
+
+void *memchr(const void *s, int c, size_t n)
+{
+    const unsigned char *p = (const unsigned char *)s;
+    for (size_t i = 0; i < n; i++)
+        if (p[i] == (unsigned char)c) return (void *)(p + i);
+    return NULL;
+}

@@ -127,11 +127,16 @@ typedef struct {
     struct wm_window *window;   /* NULL when not running                      */
 } desktop_app_t;
 
-int            desktop_app_count(void);
+int            desktop_app_count(void);          /* built-in + installed apps */
+int            desktop_app_builtin_count(void);  /* the taskbar shows these */
 desktop_app_t *desktop_app_get(int index);
 void           desktop_app_launch(int index);      /* open, or focus if open  */
 void           desktop_app_activate(int index);    /* taskbar click behaviour */
 int            desktop_app_find(const char *name); /* -1 if unknown           */
+
+/* Text clipboard shared by all apps (desktop/desktop_init.c). */
+void        clipboard_set(const char *text, size_t len);
+const char *clipboard_get(size_t *len);         /* "" and 0 when empty */
 
 /* Sends text to the assistant as if it had been spoken. */
 void           desktop_ask_jarvis(const char *text);

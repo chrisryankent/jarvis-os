@@ -348,7 +348,13 @@ public:
             system_shutdown();
 
         } else if (strcmp(name, "install_app") == 0) {
-            pkg_install(arg);
+            /* arg: path of a .jpk package (see kernel/pkg.c) */
+            char err[96];
+            pkg_info_t info;
+            if (pkg_install(arg, &info, err, sizeof(err)) == 0)
+                tts_speak("The app is installed.", 21);
+            else
+                terminal_printf("[AI TOOL] install_app %s: %s\n", arg, err);
 
         } else {
             terminal_printf("[AI TOOL] Unknown tool: %s\n", name);

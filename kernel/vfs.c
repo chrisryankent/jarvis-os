@@ -259,6 +259,10 @@ void vfs_init(void)
         "/jarvis/bin",
         "/jarvis/screenshots",
         "/jarvis/fonts",
+        "/jarvis/desktop",
+        "/jarvis/apps",
+        "/jarvis/trash",
+        "/jarvis/data/Downloads",
         NULL
     };
     for (int i = 0; dirs[i]; i++) {
@@ -835,7 +839,4 @@ void ai_filesystem_handle(void *msg_void)
         vfs_open(p + 5, VFS_FLAG_READ);
 }
 
-void pkg_install(const char *name)
-{
-    terminal_printf("[PKG] Install requested: %s (stub)\n", name);
-}
+

@@ -13,4 +13,15 @@ user_prog_\name\()_end:
     PROGRAM counter
     PROGRAM kernelpoke
     PROGRAM privileged
+
+    .macro PACKAGE name
+    .global user_pkg_\name\()_start
+    .global user_pkg_\name\()_end
+user_pkg_\name\()_start:
+    .incbin "user/\name\().jpk"
+user_pkg_\name\()_end:
+    .endm
+
+    PACKAGE hello
+    PACKAGE counter
     .section .note.GNU-stack, "", @progbits

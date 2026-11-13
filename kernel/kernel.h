@@ -199,6 +199,21 @@ void devmgr_release_all(uint32_t pid);
 pci_device_t *pci_get(int index);           /* NULL past the last device */
 uint64_t irq_count(int irq_line);           /* interrupts seen on a PIC line */
 
+/* ---- Packages (kernel/pkg.c) ---------------------------------------------- */
+typedef struct {
+    char     name[32], title[48], version[16], publisher[48], description[128], exec[64];
+    uint32_t files;
+    uint64_t bytes;
+    int      installed;
+} pkg_info_t;
+extern volatile uint32_t g_pkg_generation;
+int      pkg_inspect(const char *path, pkg_info_t *info, char *err, size_t errn);
+int      pkg_install(const char *path, pkg_info_t *info, char *err, size_t errn);
+int      pkg_uninstall(const char *name);
+int      pkg_list(pkg_info_t *out, int max);
+uint32_t pkg_run(const char *name);
+void     pkg_place_samples(void);
+
 /* ---- FAT volumes on USB drives, read-only (kernel/fatfs.c) ---------------- */
 void fatfs_mount_all(void);
 int  fatfs_owns(const char *path);
@@ -343,6 +358,7 @@ void    irq4_serial_handler(void);
 #define KMOD_ALT    0x04
 #define KMOD_CAPS   0x08
 #define KMOD_SUPER  0x10   /* Windows / Super key */
+int input_current_mods(void);       /* modifiers held right now */
 
 /* Unified WM input event queue (input/input_events.c) */
 void    input_key_press(uint32_t key, int mods);
@@ -558,7 +574,6 @@ void    disk_encryption_init(void);
 void    syscall_set_hook(void (*hook)(uint64_t, uint64_t *));
 void    nic_set_packet_hook(void (*hook)(const uint8_t *, size_t));
 void    cpu_relax(void);
-void    pkg_install(const char *name);
 
 /* VFS */
 void    vfs_init(void);

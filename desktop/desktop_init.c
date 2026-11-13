@@ -35,6 +35,7 @@ void ui_shell_lock_input(uint32_t key, char ch);    /* desktop/ui_shell.c */
 #include "../apps/security_center.c"
 #include "../apps/sysmon.c"
 #include "../apps/notepad.c"
+#include "../apps/store.c"
 
 /* ---- App registry -------------------------------------------------------- */
 typedef wm_window_t *(*app_open_fn)(int x, int y, int w, int h);
@@ -47,14 +48,15 @@ typedef struct {
 } app_entry_t;
 
 static app_entry_t g_apps[] = {
-    { { "Files",      ICON_FOLDER,   NULL }, file_explorer_open,  700, 460, "files file explorer" },
+    { { "Files",      ICON_FOLDER,   NULL }, file_explorer_open,  920, 560, "files file explorer this pc computer drives" },
     { { "Terminal",   ICON_TERMINAL, NULL }, terminal_app_open,   640, 400, "terminal term console shell" },
     { { "JARVIS",     ICON_JARVIS,   NULL }, assistant_app_open,  460, 500, "jarvis ai assistant voice" },
     { { "Security",   ICON_SHIELD,   NULL }, security_app_open,   470, 440, "security guard" },
     { { "Settings",   ICON_GEAR,     NULL }, settings_app_open,   680, 400, "settings personalize" },
     { { "Calculator", ICON_CALC,     NULL }, calculator_app_open, 300, 430, "calculator calc" },
     { { "Tasks",      ICON_CHART,    NULL }, sysmon_app_open,     640, 470, "system monitor taskmgr processes" },
-    { { "Notepad",    ICON_FILE,     NULL }, notepad_app_open,    600, 420, "notepad editor text" },
+    { { "Notepad",    ICON_FILE,     NULL }, notepad_app_open,    780, 520, "notepad editor text" },
+    { { "Apps",       ICON_STORE,    NULL }, store_app_open,      760, 520, "apps store install installer packages" },
 };
 #define APP_COUNT ((int)(sizeof(g_apps) / sizeof(g_apps[0])))
 
@@ -83,14 +85,65 @@ int desktop_system_is_initialized(void)
     return g_ds.initialized;
 }
 
-/* ---- Apps ---------------------------------------------------------------- */
+/* ---- Clipboard ----------------------------------------------------------- */
+#define CLIPBOARD_MAX (256 * 1024)
+static char   g_clipboard[CLIPBOARD_MAX + 1];
+static size_t g_clipboard_len = 0;
+
+void clipboard_set(const char *text, size_t len)
+{
+    if (len > CLIPBOARD_MAX) len = CLIPBOARD_MAX;
+    memcpy(g_clipboard, text, len);
+    g_clipboard[len] = 0;
+    g_clipboard_len = len;
+}
+
+const char *clipboard_get(size_t *len)
+{
+    if (len) *len = g_clipboard_len;
+    return g_clipboard;
+}
+
+/* ---- Apps ----------------------------------------------------------------
+ * Built-in apps (g_apps) come first, then one entry per installed package,
+ * rebuilt whenever a package is installed or removed. Package entries show in
+ * Start and search, not on the taskbar.
+ */
+#define PKG_APPS_MAX 24
+static struct { desktop_app_t pub; char title[48]; char name[32]; } g_pkg_apps[PKG_APPS_MAX];
+static int g_pkg_app_count = 0;
+static uint32_t g_pkg_seen = 0;
+
+static void pkg_apps_refresh(void)
+{
+    if (g_pkg_seen == g_pkg_generation) return;
+    g_pkg_seen = g_pkg_generation;
+    static pkg_info_t list[PKG_APPS_MAX];
+    int n = pkg_list(list, PKG_APPS_MAX);
+    for (int i = 0; i < n; i++) {
+        snprintf(g_pkg_apps[i].title, sizeof(g_pkg_apps[i].title), "%s", list[i].title);
+        snprintf(g_pkg_apps[i].name, sizeof(g_pkg_apps[i].name), "%s", list[i].name);
+        g_pkg_apps[i].pub.name = g_pkg_apps[i].title;
+        g_pkg_apps[i].pub.icon = ICON_PROGRAM;
+        g_pkg_apps[i].pub.window = NULL;
+    }
+    g_pkg_app_count = n;
+}
+
 int desktop_app_count(void)
+{
+    pkg_apps_refresh();
+    return APP_COUNT + g_pkg_app_count;
+}
+
+int desktop_app_builtin_count(void)
 {
     return APP_COUNT;
 }
 
 desktop_app_t *desktop_app_get(int index)
 {
+    if (index >= APP_COUNT && index < APP_COUNT + g_pkg_app_count) return &g_pkg_apps[index - APP_COUNT].pub;
     if (index < 0 || index >= APP_COUNT) return NULL;
     return &g_apps[index].pub;
 }
@@ -129,6 +182,14 @@ static void app_closed(void *ctx)
 
 void desktop_app_launch(int index)
 {
+    if (index >= APP_COUNT && index < APP_COUNT + g_pkg_app_count && g_ds.initialized) {
+        /* installed package: a console program, shown in the Terminal */
+        const char *name = g_pkg_apps[index - APP_COUNT].name;
+        desktop_app_launch(desktop_app_find("Terminal"));
+        if (!pkg_run(name))
+            notification_show(g_pkg_apps[index - APP_COUNT].title, "The app could not be started.", NOTIF_WARNING, 4000);
+        return;
+    }
     if (index < 0 || index >= APP_COUNT || !g_ds.initialized) return;
     app_entry_t *app = &g_apps[index];
 
@@ -152,7 +213,8 @@ void desktop_app_launch(int index)
  * in front. */
 void desktop_app_activate(int index)
 {
-    if (index < 0 || index >= APP_COUNT) return;
+    if (index >= APP_COUNT) { desktop_app_launch(index); return; }
+    if (index < 0) return;
     wm_window_t *win = g_apps[index].pub.window;
 
     if (!win)
@@ -363,11 +425,16 @@ void desktop_open_icon(int icon)
 {
     const char *target = desktop_get_icon_target(icon);
 
-    if (target[0] == '/' && !vfs_is_dir(target)) {
-        notepad_open_file(target);
-    } else if (target[0] == '/') {
+    if (!strncmp(target, "::", 2) || !strcmp(target, "/jarvis/trash") ||
+        (target[0] == '/' && vfs_is_dir(target))) {
+        /* This PC, the Recycle Bin (even while it is still empty) or a folder */
         desktop_app_launch(desktop_app_find("Files"));
         file_explorer_navigate_to(target);
+    } else if (target[0] == '/') {
+        int len = (int)strlen(target);
+        if (len > 4 && !strcmp(target + len - 4, ".jpk")) apps_store_show_install(target);
+        else if (user_is_program(target)) { desktop_app_launch(desktop_app_find("Terminal")); user_exec(target); }
+        else notepad_open_file(target);
     } else if (target[0]) {
         desktop_system_open_app(target);
     }

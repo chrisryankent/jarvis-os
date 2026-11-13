@@ -171,6 +171,7 @@ static void cmd_help(void)
         "Files:    ls [dir]   cat <file>   mkdir <dir>   touch <file>   rm <path>\n"
         "          mv <from> <to>   cp <from> <to>\n"
         "Programs: run <name>   (hello, counter, kernelpoke, privileged)\n"
+        "Apps:     packages   install <file.jpk>   uninstall <name>   start <name>\n"
         "Process:  ps   kill <pid>   suspend <pid>   resume <pid>\n"
         "          spawn cpu|sleeper|deadlock|memory|isolate\n"
         "Disk:     df   sync   disks   sector <disk> <n>      Devices: devices\n"
@@ -444,6 +445,32 @@ void terminal_app_execute_command(const char *cmd)
     } else if (strcmp(verb, "sync") == 0) {
         snprintf(buf, sizeof(buf), "%d item(s) written to disk.\n", diskfs_sync());
         terminal_app_write(buf);
+    } else if (strcmp(verb, "install") == 0) {
+        char err[96];
+        pkg_info_t info;
+        term_resolve(rest, path, sizeof(path));
+        if (!*rest) terminal_app_write("usage: install <file.jpk>   (e.g. install data/Downloads/hello-1.0.jpk)\n");
+        else if (pkg_install(path, &info, err, sizeof(err)) == 0) {
+            snprintf(buf, sizeof(buf), "Installed %s %s (%u file(s)). Start it from Start, or: start %s\n",
+                     info.title, info.version, info.files, info.name);
+            terminal_app_write(buf);
+        } else {
+            snprintf(buf, sizeof(buf), "install: %s\n", err);
+            terminal_app_write(buf);
+        }
+    } else if (strcmp(verb, "uninstall") == 0) {
+        terminal_app_write(*rest && pkg_uninstall(rest) == 0 ? "Uninstalled.\n" : "uninstall: no such app (see: packages)\n");
+    } else if (strcmp(verb, "packages") == 0) {
+        static pkg_info_t list[32];
+        int n = pkg_list(list, 32);
+        if (!n) terminal_app_write("No apps installed. Install one with: install <file.jpk>\n");
+        for (int i = 0; i < n; i++) {
+            snprintf(buf, sizeof(buf), "  %s  %s %s  (%s)\n", list[i].name, list[i].title, list[i].version,
+                     list[i].publisher[0] ? list[i].publisher : "unknown publisher");
+            terminal_app_write(buf);
+        }
+    } else if (strcmp(verb, "start") == 0) {
+        if (!*rest || !pkg_run(rest)) terminal_app_write("start: no such app (see: packages)\n");
     } else if (strcmp(verb, "run") == 0) {
         /* Programs live in /jarvis/bin unless a path is given. */
         if (strchr(rest, '/')) term_resolve(rest, path, sizeof(path));

@@ -67,7 +67,7 @@ static void taskbar_layout(void)
 {
     int W = (int)fb_get_width();
     int y = taskbar_y();
-    int n = desktop_app_count();
+    int n = desktop_app_builtin_count();
     if (n > TB_MAX_APPS) n = TB_MAX_APPS;
 
     g_tb.app_count = n;

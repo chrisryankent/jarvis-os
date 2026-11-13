@@ -133,6 +133,13 @@ void wm_set_close_callback(wm_window_t *win, wm_close_callback_t cb, void *ctx)
     win->close_ctx = ctx;
 }
 
+void wm_request_close(wm_window_t *win)
+{
+    if (!win) return;
+    if (win->on_close_request && !win->on_close_request(win)) return;
+    wm_close_window(win);
+}
+
 void wm_close_window(wm_window_t *win)
 {
     if (!win) return;
@@ -508,7 +515,7 @@ int wm_handle_mouse_click(int x, int y, int button)
             g_wm_ctx.hover_window = NULL;
             g_wm_ctx.hover_button = WM_BTN_NONE;
             switch (btn) {
-            case WM_BTN_CLOSE:    wm_close_window(win);       break;
+            case WM_BTN_CLOSE:    wm_request_close(win);      break;
             case WM_BTN_MAXIMIZE: wm_toggle_maximized(win);   break;
             case WM_BTN_MINIMIZE: wm_set_minimized(win, 1);   break;
             default: break;
@@ -655,7 +662,7 @@ void wm_handle_key(uint32_t key, int mods)
     }
     if ((mods & KMOD_ALT) && key == WM_KEY_F4) {
         if (g_wm_ctx.focused && (g_wm_ctx.focused->style & WS_CLOSABLE))
-            wm_close_window(g_wm_ctx.focused);
+            wm_request_close(g_wm_ctx.focused);
         return;
     }
     if (mods & KMOD_SUPER) {

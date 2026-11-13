@@ -112,6 +112,7 @@ void jarvis_kernel_main(void)
     fatfs_mount_all();             /* USB flash drives -> /jarvis/usb0, ... */
     usb_start_hotplug();           /* notice drives plugged in / removed later */
     usermode_install_programs();   /* bundled user programs -> /jarvis/bin */
+    pkg_place_samples();           /* sample .jpk packages -> Downloads */
     ui_shell_show_loading_desktop();
 
     /*

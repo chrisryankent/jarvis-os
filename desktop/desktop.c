@@ -125,7 +125,7 @@ void desktop_init(void)
     g_dicon_last_click = -1;
     g_drename.idx = -1;
 
-    desktop_add_icon("This PC",     "Tasks",         ICON_PC);
+    desktop_add_icon("This PC",     "::thispc",      ICON_PC);
     desktop_add_icon("Files",       "/jarvis",       ICON_FOLDER);
     desktop_add_icon("JARVIS",      "JARVIS",        ICON_JARVIS);
     desktop_add_icon("Terminal",    "Terminal",      ICON_TERMINAL);
