@@ -119,6 +119,67 @@ size_t user_console_read(char *buf, size_t max)
     return n;
 }
 
+/* ---- Keyboard input for the program running in the Terminal -------------- */
+#define STDIN_SIZE 1024
+static char g_stdin[STDIN_SIZE];
+static uint32_t g_in_head = 0, g_in_tail = 0;
+static uint32_t g_foreground = 0;
+
+void user_set_foreground(uint32_t pid)
+{
+    uint64_t irq = um_irq_save();
+    g_foreground = pid;
+    g_in_head = g_in_tail = 0;
+    um_irq_restore(irq);
+}
+
+uint32_t user_foreground(void)
+{
+    if (g_foreground && !proc_exists(g_foreground)) g_foreground = 0;
+    return g_foreground;
+}
+
+void user_stdin_push(const char *text, size_t len)
+{
+    uint64_t irq = um_irq_save();
+    for (size_t i = 0; i < len; i++) {
+        uint32_t next = (g_in_head + 1) % STDIN_SIZE;
+        if (next == g_in_tail) break;
+        g_stdin[g_in_head] = text[i];
+        g_in_head = next;
+    }
+    um_irq_restore(irq);
+}
+
+/* read(0): one line at a time, waiting until the user presses Enter. Only
+ * the foreground program gets input; others read end-of-file. */
+int user_stdin_read(char *buf, size_t max)
+{
+    if (kthread_current_pid() != g_foreground || max == 0) return 0;
+    proc_set_note("keyboard");
+    for (;;) {
+        uint64_t irq = um_irq_save();
+        int have_line = 0;
+        for (uint32_t i = g_in_tail; i != g_in_head; i = (i + 1) % STDIN_SIZE)
+            if (g_stdin[i] == '\n') { have_line = 1; break; }
+        if (have_line) {
+            size_t n = 0;
+            while (g_in_tail != g_in_head && n < max) {
+                char c = g_stdin[g_in_tail];
+                g_in_tail = (g_in_tail + 1) % STDIN_SIZE;
+                buf[n++] = c;
+                if (c == '\n') break;
+            }
+            um_irq_restore(irq);
+            proc_set_note(0);
+            return (int)n;
+        }
+        um_irq_restore(irq);
+        if (kthread_current_pid() != g_foreground) { proc_set_note(0); return 0; }
+        kthread_sleep(2);
+    }
+}
+
 /* ---- Per-program state --------------------------------------------------- */
 #define USER_MAX          16
 #define USER_STACK_TOP    0x00007FFFFFFFF000ULL
@@ -287,6 +348,8 @@ extern const uint8_t user_prog_hello_start[], user_prog_hello_end[];
 extern const uint8_t user_prog_kernelpoke_start[], user_prog_kernelpoke_end[];
 extern const uint8_t user_prog_privileged_start[], user_prog_privileged_end[];
 extern const uint8_t user_prog_counter_start[], user_prog_counter_end[];
+extern const uint8_t user_prog_ask_start[], user_prog_ask_end[];
+extern const uint8_t user_prog_launcher_start[], user_prog_launcher_end[];
 
 /* Copies the programs built from user/ into /jarvis/bin so they can be run,
  * copied and deleted like any other file. */
@@ -297,6 +360,8 @@ void usermode_install_programs(void)
         { "counter",    user_prog_counter_start,    user_prog_counter_end },
         { "kernelpoke", user_prog_kernelpoke_start, user_prog_kernelpoke_end },
         { "privileged", user_prog_privileged_start, user_prog_privileged_end },
+        { "ask",        user_prog_ask_start,        user_prog_ask_end },
+        { "launcher",   user_prog_launcher_start,   user_prog_launcher_end },
     };
     for (size_t i = 0; i < sizeof(progs) / sizeof(progs[0]); i++) {
         char path[64];

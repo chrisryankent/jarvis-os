@@ -33,17 +33,17 @@ int  kernel_voice_bridge_connected(void);
 #define SET_MAX_ROWS  64
 
 enum {
-    P_HOME, P_SYSTEM, P_DEVICES, P_NETWORK, P_PERSONAL, P_APPS, P_ACCOUNTS, P_TIME,
+    P_HOME, P_SYSTEM, P_DISPLAY, P_DEVICES, P_NETWORK, P_PERSONAL, P_APPS, P_ACCOUNTS, P_TIME,
     P_ACCESS, P_PRIVACY, P_UPDATE, P_COUNT
 };
 static const struct { const char *name; icon_id_t icon; } s_g_pages[P_COUNT] = {
-    { "Home", ICON_PC }, { "System", ICON_PC }, { "Bluetooth & devices", ICON_USB },
+    { "Home", ICON_PC }, { "System", ICON_PC }, { "Display", ICON_PHOTOS }, { "Bluetooth & devices", ICON_USB },
     { "Network & internet", ICON_CHART }, { "Personalization", ICON_GEAR }, { "Apps", ICON_STORE },
     { "Accounts", ICON_JARVIS }, { "Time & language", ICON_CALC }, { "Accessibility", ICON_JARVIS },
     { "Privacy & security", ICON_SHIELD }, { "Update", ICON_DRIVE },
 };
 
-enum { R_HEADER, R_INFO, R_TOGGLE, R_CHOICE, R_SLIDER, R_FIELD, R_BUTTON, R_DRIVE, R_NOTE };
+enum { R_HEADER, R_INFO, R_TOGGLE, R_CHOICE, R_SLIDER, R_FIELD, R_BUTTON, R_DRIVE, R_NOTE, R_WALLS };
 
 typedef struct {
     int type, id, value, danger, masked, enabled;
@@ -59,6 +59,7 @@ enum {
     A_LOCK_NOW, A_RESTART, A_SHUTDOWN, A_EMPTY_TRASH, A_CLEAR_CLIP, A_CLEAR_HISTORY, A_DEVICE_NAME,
     A_NAME, A_PASSWORD, A_PASSWORD_DEL, A_PIN, A_PIN_DEL, A_VOICE, A_VOICE_DEL, A_HC, A_UNINSTALL0,
     A_STARTUP0 = 200,
+    A_PREF0 = 300,              /* settings changed through prefs_set(): see s_pref_names */
 };
 
 static struct {
@@ -278,7 +279,7 @@ static void s_page_network(void)
     if (!ni.adapter) {
         s_info("Ethernet", "No supported Ethernet adapter found");
     } else {
-        s_info("Status", net_is_offline() ? "Off (airplane mode)" : !ni.link ? "Cable unplugged" :
+        s_info("Status", !net_adapter_enabled() ? "Adapter disabled in Device Manager" : net_is_offline() ? "Off (airplane mode)" : !ni.link ? "Cable unplugged" :
              ni.configured ? "Connected" : "Waiting for an address");
         net_format_ip(ni.ip, a, sizeof(a)); net_format_ip(ni.mask, b, sizeof(b));
         if (ni.configured) { s_info("IP address", a); s_info("Subnet mask", b); }
@@ -296,15 +297,96 @@ static void s_page_network(void)
     s_note("VPN, proxy and mobile hotspot are not available yet.");
 }
 
+/* Rows that change a setting through prefs_set(): the id is A_PREF0 + the
+ * index here; choices pass their option text as the value. */
+static const char *const s_pref_names[] = {
+    "brightness", "night_light", "night_light_strength", "night_light_auto", "resolution", "screen_off_min",
+    "wallpaper", "wallpaper_fit", "wallpaper_color", "transparency", "taskbar_align", "desktop_icons",
+    "clock_seconds", "scroll_lines", "mute", "wallpaper_picture",
+};
+enum { PF_BRIGHT, PF_NIGHT, PF_NIGHT_STR, PF_NIGHT_AUTO, PF_RES, PF_SCREEN_OFF, PF_WALL, PF_FIT, PF_COLOR,
+       PF_TRANSP, PF_ALIGN, PF_ICONS, PF_SECONDS, PF_SCROLL, PF_MUTE, PF_PICTURE };
+#define A_PF(k) (A_PREF0 + (k))
+
+static const char *const OPT_SCREEN_OFF[] = { "Never", "2 min", "5 min", "10 min", "30 min" };
+static const int SCREEN_OFF_MIN[] = { 0, 2, 5, 10, 30 };
+static const char *const OPT_FIT[] = { "Fill", "Fit", "Stretch", "Centre", "Tile" };
+static const char *const OPT_ALIGN[] = { "Centre", "Left" };
+static const char *const OPT_COLORS[] = { "Navy", "Blue", "Teal", "Green", "Purple", "Pink", "Orange", "Graphite", "Black" };
+static const char *const COLOR_HEX[] = { "#0A1A3A", "#1E5AA8", "#107C7C", "#1E7A3C", "#5B2A86", "#C2408A", "#C4501E", "#404040", "#000000" };
+static const char *const OPT_SCROLL[] = { "1", "3", "5", "10" };
+static char s_res_opts[16][16];
+static const char *s_res_ptr[16];
+
+static void s_page_display(void)
+{
+    char a[96];
+    s_header("Brightness & colour");
+    s_slider("Brightness", setting_get_int("brightness", 100), A_PF(PF_BRIGHT));
+    s_toggle("Night light", "Warmer colours, easier on the eyes in the evening", setting_get_int("night_light", 0), A_PF(PF_NIGHT));
+    s_slider("Night light strength", setting_get_int("night_light_strength", 50), A_PF(PF_NIGHT_STR));
+    s_toggle("Schedule night light", "On automatically from 19:00 to 07:00", setting_get_int("night_light_auto", 0), A_PF(PF_NIGHT_AUTO));
+    s_header("Scale & layout");
+    int n = fb_mode_count(), cur = 0;
+    if (n > 16) n = 16;
+    for (int i = 0; i < n; i++) {
+        int w, h;
+        fb_mode_get(i, &w, &h);
+        snprintf(s_res_opts[i], sizeof(s_res_opts[i]), "%dx%d", w, h);
+        s_res_ptr[i] = s_res_opts[i];
+        if ((uint32_t)w == fb_get_width() && (uint32_t)h == fb_get_height()) cur = i;
+    }
+    if (n > 1) {
+        /* too many to show side by side: the four nearest, plus the current one */
+        int first = cur - 2 < 0 ? 0 : cur - 2;
+        if (first + 5 > n) first = n - 5 < 0 ? 0 : n - 5;
+        s_choice("Display resolution", s_res_ptr + first, n - first < 5 ? n - first : 5, cur - first, A_PF(PF_RES));
+        s_note("More resolutions: in the Terminal type 'resolution list', or ask JARVIS.");
+    } else {
+        snprintf(a, sizeof(a), "%u x %u (the firmware's mode; this display adapter cannot change it)", fb_get_width(), fb_get_height());
+        s_info("Display resolution", a);
+    }
+    snprintf(a, sizeof(a), "%u x %u, 32-bit colour", fb_get_width(), fb_get_height());
+    s_info("Current mode", a);
+    s_header("Power");
+    int so = setting_get_int("screen_off_min", 0), si = 0;
+    for (int i = 0; i < 5; i++) if (SCREEN_OFF_MIN[i] == so) si = i;
+    s_choice("Turn the screen off after", OPT_SCREEN_OFF, 5, si, A_PF(PF_SCREEN_OFF));
+    s_header("Graphics");
+    s_info("Graphics adapter", s_has_device("Display", NULL) ? "Framebuffer driver (no hardware acceleration)" : "None");
+}
+
 static void s_page_personal(void)
 {
+    char a[200];
     s_header("Theme");
     s_choice("Mode", OPT_THEME, 3, (int)theme_get_mode(), A_THEME);
     s_choice("Accent colour", OPT_ACCENT, 7, setting_get_int("accent", 0), A_ACCENT);
+    s_toggle("Transparency effects", "See-through taskbar, Start menu and flyouts", setting_get_int("transparency", 1), A_PF(PF_TRANSP));
     s_header("Background");
-    s_choice("Wallpaper", OPT_WALL, 6, setting_get_int("wallpaper", 0), A_WALL);
+    s_add(R_WALLS, "Wallpaper")->value = wallpaper_style();
+    int st = wallpaper_style();
+    if (st == WP_BLOOM) s_choice("Bloom colours", OPT_WALL, 6, setting_get_int("wallpaper", 0), A_WALL);
+    if (st == WP_SOLID || st == WP_PICTURE) {
+        char c[16];
+        prefs_get("wallpaper_color", c, sizeof(c));
+        int ci = -1;
+        for (int i = 0; i < 9; i++) if (!strcmp(c, COLOR_HEX[i])) ci = i;
+        s_choice(st == WP_SOLID ? "Colour" : "Colour around the picture", OPT_COLORS, 9, ci, A_PF(PF_COLOR));
+    }
+    if (st == WP_PICTURE) s_choice("Fit the picture", OPT_FIT, 5, setting_get_int("wallpaper_fit", 0), A_PF(PF_FIT));
+    setting_get("wallpaper_picture", a, sizeof(a));
+    s_field("Picture file", a, 0, A_PF(PF_PICTURE));
+    s_note(wallpaper_last_error()[0] ? wallpaper_last_error() : "PNG, JPEG or BMP. Or open a picture in Photos and choose Set as wallpaper.");
     s_header("Taskbar");
+    s_choice("Taskbar alignment", OPT_ALIGN, 2, setting_get_int("taskbar_align", 0), A_PF(PF_ALIGN));
     s_toggle("24-hour clock", "Otherwise the clock shows AM and PM", sys_clock_24h(), A_CLOCK24);
+    s_toggle("Show seconds in the clock", NULL, setting_get_int("clock_seconds", 0), A_PF(PF_SECONDS));
+    s_header("Desktop");
+    s_toggle("Show desktop icons", NULL, setting_get_int("desktop_icons", 1), A_PF(PF_ICONS));
+    int sl = setting_get_int("scroll_lines", 3), sli = 1;
+    for (int i = 0; i < 4; i++) if (sh_num(OPT_SCROLL[i], 0) == sl) sli = i;
+    s_choice("Mouse wheel scrolls (lines)", OPT_SCROLL, 4, sli, A_PF(PF_SCROLL));
 }
 
 static void s_page_apps(void)
@@ -409,6 +491,7 @@ static void s_build_page(void)
     sg.nrows = 0;
     switch (sg.page) {
     case P_HOME: s_page_home(); break;           case P_SYSTEM: s_page_system(); break;
+    case P_DISPLAY: s_page_display(); break;
     case P_DEVICES: s_page_devices(); break;     case P_NETWORK: s_page_network(); break;
     case P_PERSONAL: s_page_personal(); break;   case P_APPS: s_page_apps(); break;
     case P_ACCOUNTS: s_page_accounts(); break;   case P_TIME: s_page_time(); break;
@@ -418,7 +501,7 @@ static void s_build_page(void)
     int y = 0;
     for (int i = 0; i < sg.nrows; i++) {
         s_row_t *r = &sg.rows[i];
-        r->h = r->type == R_HEADER ? 40 : r->type == R_NOTE ? 24 : r->type == R_INFO ? 36 : 58;
+        r->h = r->type == R_HEADER ? 40 : r->type == R_NOTE ? 24 : r->type == R_INFO ? 36 : r->type == R_WALLS ? 132 : 58;
         if (r->type == R_HEADER && i == 0) r->h = 30;
         r->y = y;
         y += r->h + (r->type == R_HEADER || r->type == R_NOTE ? 0 : 4);
@@ -441,10 +524,18 @@ static int s_needs_verify(int id)
             id == A_VOICE_DEL) && (account_has_password() || account_has_pin()) && !sg.verified;
 }
 
+static void s_say(const char *msg, uint32_t color);
+
 static void s_apply_field(int id, const char *text)
 {
     char err[96] = "";
     int rc = 0;
+    if (id == A_PF(PF_PICTURE)) {
+        char msg[200], path[256];
+        sh_path(text, path, sizeof(path));
+        if (prefs_set("wallpaper", path, msg, sizeof(msg))) s_say(msg, T(DANGER)); else s_say("Wallpaper changed.", T(OK));
+        return;
+    }
     switch (id) {
     case A_DEVICE_NAME: if (text[0]) setting_set("device_name", text); break;
     case A_NAME:        rc = account_set_name(text); break;
@@ -460,6 +551,23 @@ static void s_do_action(int id, int value)
     char p[24];
     if (s_needs_verify(id)) { sg.verify_open = 1; sg.verify_action = id; sg.verify_len = 0; sg.verify_buf[0] = 0; return; }
 
+    if (id >= A_PREF0 && id < A_PREF0 + (int)(sizeof(s_pref_names) / sizeof(s_pref_names[0]))) {
+        int k = id - A_PREF0;
+        char v[24], msg[200];
+        const s_row_t *row = NULL;
+        for (int i = 0; i < sg.nrows; i++) if (sg.rows[i].id == id) row = &sg.rows[i];
+        if (k == PF_BRIGHT) snprintf(v, sizeof(v), "%d", value < 10 ? 10 : value);
+        else if (k == PF_SCREEN_OFF) snprintf(v, sizeof(v), "%d", SCREEN_OFF_MIN[value]);
+        else if (k == PF_FIT) snprintf(v, sizeof(v), "%s", wallpaper_fit_name(value));
+        else if (k == PF_ALIGN) snprintf(v, sizeof(v), "%s", value ? "left" : "center");
+        else if (k == PF_COLOR) snprintf(v, sizeof(v), "%s", COLOR_HEX[value]);
+        else if (k == PF_WALL) snprintf(v, sizeof(v), "%s", wallpaper_style_name(value));
+        else if (row && row->type == R_CHOICE) snprintf(v, sizeof(v), "%s", row->opts[value]);
+        else if (row && row->type == R_TOGGLE) snprintf(v, sizeof(v), "%s", value ? "on" : "off");
+        else snprintf(v, sizeof(v), "%d", value);
+        if (prefs_set(s_pref_names[k], v, msg, sizeof(msg))) s_say(msg, T(DANGER));
+        return;
+    }
     switch (id) {
     case A_THEME:
         if (sg.page == P_HOME) value = theme_get_mode() == THEME_DARK ? THEME_LIGHT : THEME_DARK;
@@ -538,7 +646,7 @@ static void s_draw_row(s_row_t *r, int idx, int x, int y, int w)
         if (sep) *sep = 1;
         return;
     }
-    if (r->type != R_DRIVE)
+    if (r->type != R_DRIVE && r->type != R_WALLS)
         fb_draw_text(x + 16, y + (r->text[0] && r->type != R_FIELD ? 10 : 20), r->label, T(TEXT));
     if (r->text[0] && r->type != R_FIELD && r->type != R_DRIVE)
         ui_text_fit(x + 16, y + 32, w - 300, r->text, T(TEXT_DIM));
@@ -592,8 +700,34 @@ static void s_draw_row(s_row_t *r, int idx, int x, int y, int w)
         fb_draw_rounded_rect(fx, y + 14, fw, 30, 5, editing ? T(ACCENT) : T(BORDER));
         if (shown[0]) ui_text_fit(fx + 8, y + 21, fw - 16, shown, T(TEXT));
         else ui_text_fit(fx + 8, y + 21, fw - 16, r->masked ? (editing ? "" : "Type a new one") : "", T(TEXT_DIM));
-        if (editing) fb_fill_rect(fx + 9 + (int)strlen(shown) * 8, y + 21, 1, 16, T(TEXT));
+        if (editing) fb_fill_rect(fx + 9 + fb_text_width(shown), y + 21, 1, 16, T(TEXT));
         ui_button(rx - 68, y + 14, 68, 30, "Save", editing ? T(ACCENT) : T(HOVER), editing ? T(ACCENT_TEXT) : T(TEXT_DIM));
+        break;
+    }
+    case R_WALLS: {
+        fb_draw_text(x + 16, y + 10, r->label, T(TEXT));
+        for (int i = 0; i < WP_COUNT; i++) {
+            int tx = x + 16 + i * (WP_THUMB_W + 10), ty = y + 36;
+            if (tx + WP_THUMB_W > x + w - 8) break;
+            const uint32_t *t = wallpaper_thumb(i);
+            fb_clip_t c = fb_get_clip();
+            uint32_t *fbp = fb_get_base();
+            int sw = (int)fb_get_width();
+            for (int j = 0; j < WP_THUMB_H; j++) {
+                int yy = ty + j;
+                if (yy < c.y0 || yy >= c.y1) continue;
+                for (int k = 0; k < WP_THUMB_W; k++) {
+                    int xx = tx + k;
+                    if (xx >= c.x0 && xx < c.x1) fbp[(size_t)yy * sw + xx] = t[j * WP_THUMB_W + k];
+                }
+            }
+            if (i == r->value) {
+                fb_draw_rounded_rect(tx - 3, ty - 3, WP_THUMB_W + 6, WP_THUMB_H + 6, 5, T(ACCENT));
+                fb_draw_rounded_rect(tx - 2, ty - 2, WP_THUMB_W + 4, WP_THUMB_H + 4, 4, T(ACCENT));
+            }
+            fb_text(tx + (WP_THUMB_W - fb_text_width_font(wallpaper_style_title(i), FONT_SMALL)) / 2, ty + WP_THUMB_H + 8,
+                    wallpaper_style_title(i), i == r->value ? T(TEXT) : T(TEXT_DIM), FONT_SMALL);
+        }
         break;
     }
     case R_DRIVE:
@@ -705,11 +839,25 @@ static void s_verify_submit(void)
     }
 }
 
+/* Opens a page by (part of) its name: "display", "network", "personalization" ... */
+void settings_show_page(const char *name)
+{
+    if (!name) return;
+    if (!strcmp(name, "display") || !strcmp(name, "system") || !strcmp(name, "sound") || !strcmp(name, "power")) { sg.page = P_SYSTEM; sg.scroll = 0; return; }
+    for (int i = 0; i < P_COUNT; i++) {
+        char low[40];
+        snprintf(low, sizeof(low), "%s", s_g_pages[i].name);
+        for (char *c = low; *c; c++) if (*c >= 'A' && *c <= 'Z') *c = (char)(*c + 32);
+        if (strstr(low, name)) { sg.page = i; sg.scroll = 0; return; }
+    }
+}
+
 void settings_event_callback(wm_window_t *win, wm_input_event_t *ev)
 {
     int x, y, w, h;
     wm_get_client(win, &x, &y, &w, &h);
     int pw = w - SET_SIDEBAR_W, view_h = h - SET_TITLE_H;
+    if (ev->type == IE_MOUSE_WHEEL) { sg.scroll -= ev->data.mouse.button * 16; if (sg.scroll < 0) sg.scroll = 0; return; }
 
     if (sg.verify_open) {
         int vw = 380, vh = 170, vx = (w - vw) / 2, vy = (h - vh) / 2;
@@ -780,6 +928,17 @@ void settings_event_callback(wm_window_t *win, wm_input_event_t *ev)
         case R_TOGGLE:
             if (cx >= rx - 90) s_do_action(r->id, !r->value);
             break;
+        case R_WALLS: {
+            int k = (cx - 16) / (WP_THUMB_W + 10);
+            if (ly >= 30 && ly < 30 + WP_THUMB_H + 24 && k >= 0 && k < WP_COUNT) {
+                char msg[200], pic[256];
+                setting_get("wallpaper_picture", pic, sizeof(pic));
+                if (k == WP_PICTURE && !pic[0]) s_say("Type a picture's path below, or use Photos > Set as wallpaper.", T(WARN));
+                else if (k == WP_PICTURE ? prefs_set("wallpaper", pic, msg, sizeof(msg)) : prefs_set("wallpaper", wallpaper_style_name(k), msg, sizeof(msg)))
+                    s_say(msg, T(DANGER));
+            }
+            break;
+        }
         case R_CHOICE: {
             int total = 0;
             for (int k = 0; k < r->nopts; k++) total += s_choice_width(r, k) + 4;

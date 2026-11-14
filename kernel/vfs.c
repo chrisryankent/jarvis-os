@@ -335,6 +335,16 @@ int vfs_open(const char *path, uint32_t flags)
     return fd;
 }
 
+int vfs_lseek(int fd, int64_t off, int whence)
+{
+    if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].used) return -1;
+    fd_t *f = &fd_table[fd];
+    int64_t base = whence == 1 ? (int64_t)f->offset : whence == 2 ? (int64_t)f->node->size : 0;
+    if (base + off < 0) return -1;
+    f->offset = (size_t)(base + off);
+    return (int)f->offset;
+}
+
 int vfs_read(int fd, void *buf, size_t len)
 {
     if (fd < 0 || fd >= MAX_FDS || !fd_table[fd].used) return -1;
@@ -369,13 +379,13 @@ int vfs_stat(const char *path)
 
 int vfs_create_file(const char *path)
 {
-    if (vfs_on_mount(path)) return -1;
+    if (vfs_on_mount(path)) return fatfs_write_file(path, "", 0);
     return ramfs_create_node(path, 4096, 0) ? 0 : -1;
 }
 
 int vfs_mkdir(const char *path)
 {
-    if (vfs_on_mount(path)) return -1;
+    if (vfs_on_mount(path)) return fatfs_mkdir(path);
     return ramfs_create_node(path, 0, 1) ? 0 : -1;
 }
 
@@ -474,10 +484,10 @@ int vfs_list(const char *prefix, char *buf, size_t max)
 /* Append to a file by path (used by security logger) */
 void vfs_append(const char *path, const char *data, size_t len)
 {
+    if (vfs_on_mount(path)) { fatfs_append(path, data, len); return; }
     int fd = vfs_open(path, VFS_FLAG_WRITE | VFS_FLAG_APPEND | VFS_FLAG_CREATE);
     if (fd < 0) return;
     vfs_write(fd, data, len);
-    vfs_write(fd, "\n", 1);
     vfs_close(fd);
 }
 
@@ -574,7 +584,7 @@ int vfs_count_children(const char *path)
 /* Delete a file, or a directory together with everything inside it. */
 int vfs_delete(const char *path)
 {
-    if (vfs_on_mount(path)) return -1;              /* USB drives are read-only */
+    if (vfs_on_mount(path)) return fatfs_delete(path);
     size_t plen = strlen(path);
     int removed = 0;
 
@@ -592,7 +602,13 @@ int vfs_delete(const char *path)
 /* Rename / move a file or a whole directory tree. */
 int vfs_rename(const char *from, const char *to)
 {
-    if (vfs_on_mount(from) || vfs_on_mount(to)) return -1;
+    if (vfs_on_mount(from) || vfs_on_mount(to)) {
+        if (!vfs_exists(from) || vfs_exists(to) || !strcmp(from, to)) return -1;
+        if (vfs_on_mount(from) && vfs_on_mount(to) && fatfs_rename(from, to) == 0) return 0;
+        /* between drives: copy, then remove the original */
+        if (vfs_copy(from, to) != 0) return -1;
+        return vfs_delete(from);
+    }
     size_t flen = strlen(from), tlen = strlen(to);
 
     if (flen < 2 || tlen < 2 || strcmp(from, to) == 0) return -1;
@@ -660,9 +676,50 @@ static int copy_from_mount(const char *from, const char *to, int depth)
     return rc;
 }
 
+/* Copy a file or folder (from anywhere) onto a FAT drive. */
+static int copy_to_mount(const char *from, const char *to, int depth)
+{
+    if (depth > 16) return -1;
+    if (!vfs_is_dir(from)) {
+        long size = vfs_size(from);
+        if (size < 0 || size > 512L * 1024 * 1024) return -1;
+        size_t cap = (size_t)size + 1;
+        uint8_t *buf = cap >= LARGE_ALLOC_THRESHOLD ? (uint8_t *)kmalloc_large(cap) : (uint8_t *)kmalloc(cap);
+        if (!buf) return -1;
+        int n = size ? vfs_read_file(from, (char *)buf, cap) : 0;
+        int rc = n == (int)size ? fatfs_write_file(to, buf, (size_t)size) : -1;
+        if (cap >= LARGE_ALLOC_THRESHOLD) kfree_large(buf, cap); else kfree(buf);
+        return rc;
+    }
+    if (!vfs_is_dir(to) && fatfs_mkdir(to) != 0) return -1;
+    char *listing = (char *)kmalloc_large(65536);
+    if (!listing) return -1;
+    int rc = vfs_list(from, listing, 65536) < 0 ? -1 : 0;
+    size_t fl = strlen(from);
+    for (char *p = listing; rc == 0 && *p;) {
+        char *eol = strchr(p, '\n');
+        if (eol) *eol = 0;
+        char *child = strchr(p, '/');
+        if (child && !strncmp(child, from, fl) && child[fl] == '/' && !strchr(child + fl + 1, '/')) {
+            char dst[256];
+            snprintf(dst, sizeof(dst), "%s/%s", to, child + fl + 1);
+            if (!vfs_exists(dst)) rc = copy_to_mount(child, dst, depth + 1);
+        }
+        if (!eol) break;
+        p = eol + 1;
+    }
+    kfree_large(listing, 65536);
+    return rc;
+}
+
 int vfs_copy(const char *from, const char *to)
 {
-    if (vfs_on_mount(to)) return -1;
+    if (vfs_on_mount(to)) {
+        if (!vfs_exists(from) || vfs_exists(to)) return -1;
+        size_t fl = strlen(from);
+        if (!strncmp(to, from, fl) && to[fl] == '/') return -1;     /* into itself */
+        return copy_to_mount(from, to, 0);
+    }
     if (vfs_on_mount(from)) return vfs_exists(to) ? -1 : copy_from_mount(from, to, 0);
     size_t flen = strlen(from);
     int count = ramfs_count;            /* don't revisit the copies we add */
@@ -702,7 +759,7 @@ int vfs_copy(const char *from, const char *to)
 /* Replace the contents of a file (created if missing). */
 int vfs_write_file(const char *path, const void *data, size_t len)
 {
-    if (vfs_on_mount(path)) return -1;
+    if (vfs_on_mount(path)) return fatfs_write_file(path, data, len);
     int fd = vfs_open(path, VFS_FLAG_WRITE | VFS_FLAG_CREATE | VFS_FLAG_TRUNC);
     if (fd < 0) return -1;
 

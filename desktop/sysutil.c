@@ -180,3 +180,16 @@ void sys_reboot(void)
     for (;;)
         __asm__ volatile ("hlt");
 }
+
+/* Seconds since 1 Jan 1970 (UTC is not known: the clock's own time zone). */
+int64_t sys_unix_time(void)
+{
+    static const int mdays[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    sys_time_t t;
+    sys_get_time(&t);
+    int64_t days = 0;
+    for (int y = 1970; y < t.year; y++) days += (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) ? 366 : 365;
+    for (int m = 1; m < t.month; m++) days += mdays[m - 1] + (m == 2 && (t.year % 4 == 0 && (t.year % 100 != 0 || t.year % 400 == 0)));
+    days += t.day - 1;
+    return days * 86400 + t.hour * 3600 + t.minute * 60 + t.second;
+}

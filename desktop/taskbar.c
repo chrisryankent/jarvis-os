@@ -38,12 +38,13 @@ static int rect_hit(const rect_t *r, int px, int py)
 #define TB_MAX_APPS 16
 
 enum {
-    TBH_NONE = 0, TBH_START, TBH_SEARCH, TBH_CHIP, TBH_CLOCK, TBH_BELL,
+    TBH_NONE = 0, TBH_START, TBH_SEARCH, TBH_CHIP, TBH_CLOCK, TBH_BELL, TBH_STATUS,
     TBH_SHOWDESK, TBH_APP0 = 100,
 };
 
 static struct {
     rect_t start, search, apps[TB_MAX_APPS], chip, status, clock, bell, showdesk;
+    int app_idx[TB_MAX_APPS];   /* taskbar slot -> app index */
     int app_count;
     int wide_search;
     int hover;
@@ -56,6 +57,46 @@ static struct {
     int hover;
 } g_start;
 
+/* ---- Pinned apps (setting "pins": names separated by commas) -------------- */
+static const char *g_default_pins = "Files,Terminal,JARVIS,Settings,Notepad,Photos";
+
+int taskbar_is_pinned(int idx)
+{
+    char pins[256];
+    setting_get("pins", pins, sizeof(pins));
+    if (!pins[0]) snprintf(pins, sizeof(pins), "%s", g_default_pins);
+    desktop_app_t *a = desktop_app_get(idx);
+    if (!a) return 0;
+    size_t l = strlen(a->name);
+    for (const char *p = pins; *p;) {
+        const char *e = strchr(p, ',');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n == l && !strncmp(p, a->name, l)) return 1;
+        if (!e) break;
+        p = e + 1;
+    }
+    return 0;
+}
+
+void taskbar_set_pinned(int idx, int on)
+{
+    char pins[256], out[256] = "";
+    setting_get("pins", pins, sizeof(pins));
+    if (!pins[0]) snprintf(pins, sizeof(pins), "%s", g_default_pins);
+    desktop_app_t *a = desktop_app_get(idx);
+    if (!a) return;
+    for (char *p = pins; *p;) {
+        char *e = strchr(p, ',');
+        if (e) *e = 0;
+        if (strcmp(p, a->name) && *p) snprintf(out + strlen(out), sizeof(out) - strlen(out), "%s%s", out[0] ? "," : "", p);
+        if (!e) break;
+        p = e + 1;
+    }
+    if (on) snprintf(out + strlen(out), sizeof(out) - strlen(out), "%s%s", out[0] ? "," : "", a->name);
+    setting_set("pins", out[0] ? out : ",");
+    desktop_invalidate();
+}
+
 static int taskbar_y(void)
 {
     return (int)fb_get_height() - TASKBAR_H;
@@ -67,14 +108,18 @@ static void taskbar_layout(void)
 {
     int W = (int)fb_get_width();
     int y = taskbar_y();
-    int n = desktop_app_builtin_count();
-    if (n > TB_MAX_APPS) n = TB_MAX_APPS;
+    /* pinned apps first, then any other open app */
+    int n = 0;
+    for (int i = 0; i < desktop_app_builtin_count() && n < TB_MAX_APPS; i++)
+        if (taskbar_is_pinned(i)) g_tb.app_idx[n++] = i;
+    for (int i = 0; i < desktop_app_builtin_count() && n < TB_MAX_APPS; i++)
+        if (!taskbar_is_pinned(i) && desktop_app_get(i)->window) g_tb.app_idx[n++] = i;
 
     g_tb.app_count = n;
     g_tb.wide_search = W >= 1200;
     int search_w = g_tb.wide_search ? 200 : 44;
     int total = 44 + 4 + search_w + 4 + n * 44;
-    int x = (W - total) / 2;
+    int x = setting_get_int("taskbar_align", 0) == 1 ? 8 : (W - total) / 2;
 
     g_tb.start = (rect_t){ x, y + 4, 44, 40 };            x += 48;
     g_tb.search = (rect_t){ x, y + 4, search_w, 40 };     x += search_w + 4;
@@ -97,6 +142,7 @@ static int taskbar_hit(int x, int y)
     for (int i = 0; i < g_tb.app_count; i++)
         if (rect_hit(&g_tb.apps[i], x, y)) return TBH_APP0 + i;
     if (rect_hit(&g_tb.chip, x, y))     return TBH_CHIP;
+    if (rect_hit(&g_tb.status, x, y))   return TBH_STATUS;
     if (rect_hit(&g_tb.clock, x, y))    return TBH_CLOCK;
     if (rect_hit(&g_tb.bell, x, y))     return TBH_BELL;
     if (rect_hit(&g_tb.showdesk, x, y)) return TBH_SHOWDESK;
@@ -131,7 +177,10 @@ void taskbar_draw(void)
 
     taskbar_layout();
 
-    fb_fill_rect(0, y, W, TASKBAR_H, T(TASKBAR));
+    if (setting_get_int("transparency", 1) && theme_get_mode() != THEME_HIGH_CONTRAST)
+        fb_blend_rect(0, y, W, TASKBAR_H, T(TASKBAR), 225);         /* see-through, like Windows */
+    else
+        fb_fill_rect(0, y, W, TASKBAR_H, T(TASKBAR));
     fb_fill_rect(0, y, W, 1, T(BORDER));
 
     /* ---- Start ---- */
@@ -155,7 +204,7 @@ void taskbar_draw(void)
 
     /* ---- Apps ---- */
     for (int i = 0; i < g_tb.app_count; i++) {
-        desktop_app_t *app = desktop_app_get(i);
+        desktop_app_t *app = desktop_app_get(g_tb.app_idx[i]);
         rect_t *r = &g_tb.apps[i];
         int running = app->window != NULL;
         int focused = running && app->window == g_wm_ctx.focused;
@@ -184,10 +233,16 @@ void taskbar_draw(void)
     }
 
     /* ---- Network + volume ---- */
-    glyph_draw(GLYPH_NET, g_tb.status.x + 6, g_tb.status.y + 12, 16,
-               net_connected() ? T(TEXT) : T(TEXT_DIM), T(TASKBAR));
-    glyph_draw(GLYPH_VOLUME, g_tb.status.x + 30, g_tb.status.y + 12, 16,
-               g_kstate.audio_ready ? T(TEXT) : T(TEXT_DIM), T(TASKBAR));
+    if (shell_flyout_is_open() == FLY_QUICK) fb_fill_rounded_rect(g_tb.status.x, g_tb.status.y, g_tb.status.w, g_tb.status.h, 5, T(HOVER));
+    tb_hover_bg(&g_tb.status, TBH_STATUS);
+    {
+        uint32_t sbg = (shell_flyout_is_open() == FLY_QUICK || g_tb.hover == TBH_STATUS) ? T(HOVER) : T(TASKBAR);
+        glyph_draw(setting_get_int("airplane", 0) ? GLYPH_PLANE : GLYPH_NET, g_tb.status.x + 6, g_tb.status.y + 12, 16,
+                   net_connected() ? T(TEXT) : T(TEXT_DIM), sbg);
+        glyph_draw(GLYPH_VOLUME, g_tb.status.x + 30, g_tb.status.y + 12, 16,
+                   g_kstate.audio_ready && !setting_get_int("mute", 0) ? T(TEXT) : T(TEXT_DIM), sbg);
+        if (setting_get_int("mute", 0)) fb_draw_line(g_tb.status.x + 30, g_tb.status.y + 28, g_tb.status.x + 46, g_tb.status.y + 12, T(DANGER));
+    }
 
     /* ---- Clock ---- */
     {
@@ -198,9 +253,14 @@ void taskbar_draw(void)
         char clock[12], date[16];
         sys_time_t t;
 
+        if (shell_flyout_is_open() == FLY_CALENDAR) fb_fill_rounded_rect(r->x, r->y, r->w, r->h, 5, T(HOVER));
         tb_hover_bg(r, TBH_CLOCK);
         sys_get_time(&t);
         sys_format_clock(clock, sizeof(clock));
+        if (setting_get_int("clock_seconds", 0)) {
+            if (sys_clock_24h()) snprintf(clock, sizeof(clock), "%02d:%02d:%02d", t.hour, t.minute, t.second);
+            else snprintf(clock, sizeof(clock), "%d:%02d:%02d %s", t.hour % 12 ? t.hour % 12 : 12, t.minute, t.second, t.hour < 12 ? "AM" : "PM");
+        }
         snprintf(date, sizeof(date), "%d %s %d", t.day, months[t.month - 1], t.year);
         fb_draw_text(r->x + r->w - 6 - fb_text_width(clock), r->y + 3, clock, T(TEXT));
         fb_draw_text(r->x + r->w - 6 - fb_text_width(date), r->y + 21, date, T(TEXT));
@@ -226,6 +286,49 @@ void taskbar_draw(void)
     fb_fill_rect(g_tb.showdesk.x, y + 8, 1, TASKBAR_H - 16, T(BORDER));
 }
 
+static int g_tb_menu_app = -1;
+static void taskbar_menu_action(int id, void *ctx)
+{
+    (void)ctx;
+    int idx = g_tb_menu_app;
+    desktop_app_t *a = idx >= 0 ? desktop_app_get(idx) : NULL;
+    switch (id) {
+    case 1: if (a) desktop_app_launch(idx); break;
+    case 2: if (a && a->window) wm_request_close(a->window); break;
+    case 3: taskbar_set_pinned(idx, !taskbar_is_pinned(idx)); break;
+    case 4: desktop_app_launch(desktop_app_find("Tasks")); break;
+    case 5: desktop_app_launch(desktop_app_find("Settings")); settings_show_page("personalization"); break;
+    }
+}
+
+/* Is (x,y) on the network / volume icons? (mouse wheel changes the volume) */
+int taskbar_tray_hit(int x, int y)
+{
+    taskbar_layout();
+    return rect_hit(&g_tb.status, x, y);
+}
+
+/* Right-click on the taskbar: per-app menu, or taskbar menu. */
+int taskbar_handle_right_click(int x, int y)
+{
+    if (y < taskbar_y()) return 0;
+    int hit = taskbar_hit(x, y);
+    if (hit >= TBH_APP0) {
+        g_tb_menu_app = g_tb.app_idx[hit - TBH_APP0];
+        desktop_app_t *a = desktop_app_get(g_tb_menu_app);
+        ui_menu_item_t items[3] = {
+            { a->window ? "Bring to front" : "Open", 1, 0, 0 },
+            { taskbar_is_pinned(g_tb_menu_app) ? "Unpin from taskbar" : "Pin to taskbar", 3, 0, 1 },
+            { "Close window", 2, !a->window, 0 },
+        };
+        ui_menu_open(x, taskbar_y() - 3 * 30 - 16, items, 3, taskbar_menu_action, NULL);
+    } else {
+        ui_menu_item_t items[2] = { { "Task Manager", 4, 0, 0 }, { "Taskbar settings", 5, 0, 0 } };
+        ui_menu_open(x, taskbar_y() - 2 * 30 - 16, items, 2, taskbar_menu_action, NULL);
+    }
+    return 1;
+}
+
 /* Returns 1 if the click landed on the taskbar. */
 int taskbar_handle_click(int x, int y)
 {
@@ -236,18 +339,24 @@ int taskbar_handle_click(int x, int y)
 
     if (hit != TBH_START && hit != TBH_SEARCH)
         start_menu_close();
-    if (hit != TBH_BELL && hit != TBH_CLOCK)
+    if (hit != TBH_BELL)
         notifications_close_center();
+    if (hit != TBH_STATUS && hit != TBH_CLOCK)
+        shell_flyout_close();
 
     if (hit == TBH_START) {
         taskbar_toggle_start_menu();
     } else if (hit == TBH_SEARCH) {
         if (!g_start.open) taskbar_toggle_start_menu();
     } else if (hit >= TBH_APP0) {
-        desktop_app_activate(hit - TBH_APP0);
+        desktop_app_activate(g_tb.app_idx[hit - TBH_APP0]);
+    } else if (hit == TBH_STATUS) {
+        shell_flyout_toggle(FLY_QUICK);
     } else if (hit == TBH_CHIP) {
         desktop_app_launch(desktop_app_find("JARVIS"));
-    } else if (hit == TBH_CLOCK || hit == TBH_BELL) {
+    } else if (hit == TBH_CLOCK) {
+        shell_flyout_toggle(FLY_CALENDAR);
+    } else if (hit == TBH_BELL) {
         notifications_toggle_center();
     } else if (hit == TBH_SHOWDESK) {
         wm_minimize_all();
@@ -396,7 +505,7 @@ void start_menu_draw(void)
     glyph_draw(GLYPH_SEARCH, x + 38, y + 34, 16, T(TEXT_DIM), T(INPUT));
     if (g_start.qlen) {
         fb_draw_text(x + 64, y + 34, g_start.query, T(TEXT));
-        fb_fill_rect(x + 64 + g_start.qlen * 8 + 1, y + 34, 1, 16, T(TEXT));
+        fb_fill_rect(x + 64 + fb_text_width_n(g_start.query, g_start.qlen) + 1, y + 34, 1, 16, T(TEXT));
     } else {
         fb_draw_text(x + 64, y + 34, "Type to search apps, or ask JARVIS", T(TEXT_DIM));
     }

@@ -32,30 +32,20 @@ static char *append_char(char *out, size_t *left, char c)
     return out;
 }
 
-static char *append_str(char *out, size_t *left, const char *s)
+/* printf with the usual flags: '-' (left align), '0' (zero pad), '+', ' ',
+ * width and precision (also as '*'), and the conversions d i u x X o c s p
+ * %zu %ld %lld %llu. %f prints with the given precision (default 2). */
+static char *emit_field(char *out, size_t *left, const char *body, int blen,
+                        const char *prefix, int width, int left_align, int zero)
 {
-    if (!s)
-        s = "(null)";
-    while (*s)
-        out = append_char(out, left, *s++);
-    return out;
-}
-
-static char *append_uint(char *out, size_t *left, uint64_t val, unsigned base,
-                         int upper)
-{
-    char tmp[32];
-    const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
-    int i = 0;
-
-    if (val == 0)
-        tmp[i++] = '0';
-    while (val != 0) {
-        tmp[i++] = digits[val % base];
-        val /= base;
-    }
-    while (i > 0)
-        out = append_char(out, left, tmp[--i]);
+    int plen = 0;
+    while (prefix[plen]) plen++;
+    int pad = width - blen - plen;
+    if (!left_align && !zero) while (pad-- > 0) out = append_char(out, left, ' ');
+    for (int i = 0; i < plen; i++) out = append_char(out, left, prefix[i]);
+    if (!left_align && zero) while (pad-- > 0) out = append_char(out, left, '0');
+    for (int i = 0; i < blen; i++) out = append_char(out, left, body[i]);
+    if (left_align) while (pad-- > 0) out = append_char(out, left, ' ');
     return out;
 }
 
@@ -69,69 +59,93 @@ static int kvsnprintf(char *buf, size_t size, const char *fmt, va_list ap)
             out = append_char(out, &left, *fmt++);
             continue;
         }
-
         fmt++;
         if (*fmt == '%') {
             out = append_char(out, &left, *fmt++);
             continue;
         }
 
-        while (*fmt >= '0' && *fmt <= '9')
-            fmt++;
+        int left_align = 0, zero = 0, plus = 0, space = 0, alt = 0;
+        for (;; fmt++) {
+            if (*fmt == '-') left_align = 1;
+            else if (*fmt == '0') zero = 1;
+            else if (*fmt == '+') plus = 1;
+            else if (*fmt == ' ') space = 1;
+            else if (*fmt == '#') alt = 1;
+            else break;
+        }
+        int width = 0, prec = -1;
+        if (*fmt == '*') { width = va_arg(ap, int); if (width < 0) { left_align = 1; width = -width; } fmt++; }
+        else while (*fmt >= '0' && *fmt <= '9') width = width * 10 + (*fmt++ - '0');
         if (*fmt == '.') {
             fmt++;
-            while (*fmt >= '0' && *fmt <= '9')
-                fmt++;
+            prec = 0;
+            if (*fmt == '*') { prec = va_arg(ap, int); fmt++; }
+            else while (*fmt >= '0' && *fmt <= '9') prec = prec * 10 + (*fmt++ - '0');
         }
+        int long_count = 0, size_t_arg = 0;
+        while (*fmt == 'l') { long_count++; fmt++; }
+        if (*fmt == 'z') { size_t_arg = 1; fmt++; }
+        if (*fmt == 'h') { fmt++; if (*fmt == 'h') fmt++; }
 
-        int long_count = 0;
-        while (*fmt == 'l') {
-            long_count++;
-            fmt++;
-        }
-
-        switch (*fmt++) {
-        case 's':
-            out = append_str(out, &left, va_arg(ap, const char *));
+        char tmp[72];
+        int tl = 0;
+        char conv = *fmt ? *fmt++ : 0;
+        switch (conv) {
+        case 's': {
+            const char *str = va_arg(ap, const char *);
+            if (!str) str = "(null)";
+            int n = 0;
+            while (str[n] && (prec < 0 || n < prec)) n++;
+            out = emit_field(out, &left, str, n, "", width, left_align, 0);
             break;
+        }
         case 'c':
-            out = append_char(out, &left, (char)va_arg(ap, int));
+            tmp[0] = (char)va_arg(ap, int);
+            out = emit_field(out, &left, tmp, 1, "", width, left_align, 0);
             break;
-        case 'd':
-        case 'i': {
-            int64_t v = long_count ? va_arg(ap, int64_t) : va_arg(ap, int);
-            if (v < 0) {
-                out = append_char(out, &left, '-');
-                v = -v;
-            }
-            out = append_uint(out, &left, (uint64_t)v, 10, 0);
+        case 'd': case 'i': case 'u': case 'x': case 'X': case 'o': case 'p': {
+            uint64_t v;
+            int neg = 0;
+            unsigned base = conv == 'x' || conv == 'X' || conv == 'p' ? 16 : conv == 'o' ? 8 : 10;
+            if (conv == 'p') v = (uint64_t)va_arg(ap, void *);
+            else if (conv == 'd' || conv == 'i') {
+                int64_t sv = (long_count || size_t_arg) ? va_arg(ap, int64_t) : va_arg(ap, int);
+                if (sv < 0) { neg = 1; v = (uint64_t)(-(sv + 1)) + 1; } else v = (uint64_t)sv;
+            } else v = (long_count || size_t_arg) ? va_arg(ap, uint64_t) : va_arg(ap, unsigned int);
+            const char *digits = conv == 'X' ? "0123456789ABCDEF" : "0123456789abcdef";
+            char rev[24];
+            int rl = 0;
+            if (v == 0 && prec != 0) rev[rl++] = '0';
+            while (v) { rev[rl++] = digits[v % base]; v /= base; }
+            while (rl < prec && rl < 23) rev[rl++] = '0';
+            while (rl) tmp[tl++] = rev[--rl];
+            const char *prefix = neg ? "-" : plus ? "+" : space ? " " : "";
+            if (conv == 'p' || (alt && base == 16)) prefix = conv == 'X' ? "0X" : "0x";
+            out = emit_field(out, &left, tmp, tl, prefix, width, left_align, zero && prec < 0);
             break;
         }
-        case 'u':
-            out = append_uint(out, &left,
-                long_count ? va_arg(ap, uint64_t) : va_arg(ap, unsigned int),
-                10, 0);
+        case 'f': {
+            double d = va_arg(ap, double);
+            if (prec < 0) prec = 2;
+            if (prec > 9) prec = 9;
+            int neg = d < 0;
+            if (neg) d = -d;
+            uint64_t scale = 1;
+            for (int i = 0; i < prec; i++) scale *= 10;
+            uint64_t whole = (uint64_t)d;
+            uint64_t frac = (uint64_t)((d - (double)whole) * (double)scale + 0.5);
+            if (frac >= scale) { whole++; frac -= scale; }
+            char rev[24];
+            int rl = 0;
+            for (int i = 0; i < prec; i++) { rev[rl++] = (char)('0' + frac % 10); frac /= 10; }
+            if (prec) rev[rl++] = '.';
+            if (!whole) rev[rl++] = '0';
+            while (whole && rl < 23) { rev[rl++] = (char)('0' + whole % 10); whole /= 10; }
+            while (rl) tmp[tl++] = rev[--rl];
+            out = emit_field(out, &left, tmp, tl, neg ? "-" : plus ? "+" : "", width, left_align, zero);
             break;
-        case 'x':
-        case 'X':
-            out = append_uint(out, &left,
-                long_count ? va_arg(ap, uint64_t) : va_arg(ap, unsigned int),
-                16, fmt[-1] == 'X');
-            break;
-        case 'p':
-            out = append_str(out, &left, "0x");
-            out = append_uint(out, &left, (uint64_t)va_arg(ap, void *), 16, 0);
-            break;
-        case 'z':
-            if (*fmt == 'u') {
-                fmt++;
-                out = append_uint(out, &left, va_arg(ap, size_t), 10, 0);
-            }
-            break;
-        case 'f':
-            (void)va_arg(ap, double);
-            out = append_str(out, &left, "0.00");
-            break;
+        }
         default:
             break;
         }
@@ -250,8 +264,24 @@ char *strstr(const char *haystack, const char *needle)
     return NULL;
 }
 
+/* The last 32 KB of kernel messages, for 'dmesg'. */
+static char g_klog[32768];
+static size_t g_klog_pos;          /* total bytes ever written */
+
+size_t klog_read(char *out, size_t n)
+{
+    size_t have = g_klog_pos < sizeof(g_klog) ? g_klog_pos : sizeof(g_klog);
+    if (!n) return 0;
+    if (have > n - 1) have = n - 1;
+    size_t start = g_klog_pos - have;
+    for (size_t i = 0; i < have; i++) out[i] = g_klog[(start + i) % sizeof(g_klog)];
+    out[have] = 0;
+    return have;
+}
+
 void terminal_puts(const char *s)
 {
+    for (const char *p = s; *p; p++) g_klog[g_klog_pos++ % sizeof(g_klog)] = *p;
     while (*s) {
         if (*s == '\n') {
             outb(0x3F8, (uint8_t)'\r');
@@ -756,6 +786,8 @@ void kbd_handle_scancode(uint8_t code)
     int extended = kbd_extended_prefix;
     kbd_extended_prefix = 0;
 
+    /* Print Screen sends a fake shift (E0 2A / E0 AA) around E0 37: ignore it. */
+    if (extended && (sc == 0x2A || sc == 0x36)) return;
     /* Modifier tracking (make = pressed, break = released) */
     if (sc == 0x2A || sc == 0x36) { kbd_shift = !is_break; return; }     /* L/R shift */
     if (sc == 0x1D) { kbd_ctrl  = !is_break; return; }                   /* ctrl (also E0-prefixed for R-ctrl; treated the same) */
@@ -794,6 +826,10 @@ void kbd_handle_scancode(uint8_t code)
         case 0x4F: key = KEY_END;    break;
         case 0x49: key = KEY_PGUP;   break;
         case 0x51: key = KEY_PGDN;   break;
+        case 0x52: key = 0x10C;      break;    /* Insert */
+        case 0x37: key = 0x121;      break;    /* Print Screen */
+        case 0x1C: key = '\n';      break;    /* keypad Enter */
+        case 0x35: key = '/';        break;    /* keypad / */
         default: break;
         }
     } else if (sc == 0x01) {

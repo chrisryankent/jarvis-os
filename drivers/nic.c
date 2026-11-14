@@ -72,6 +72,8 @@ static uint64_t   g_rx_frames = 0, g_tx_frames = 0;
 static uint32_t nic_read(uint32_t reg)            { return *(volatile uint32_t *)(e1000_mmio + reg); }
 static void     nic_write(uint32_t reg, uint32_t v) { *(volatile uint32_t *)(e1000_mmio + reg) = v; }
 
+static void nic_program(void);
+
 void nic_init(void)
 {
     terminal_puts("[NIC] Initialising Intel e1000\n");
@@ -98,6 +100,31 @@ void nic_init(void)
     rx_bufs = (uint8_t *)(mem + 2 * 4096);
     tx_bufs = rx_bufs + NUM_DESC * BUF_SIZE;
 
+    nic_program();
+}
+
+/* Device Manager "Restart device": full adapter reset (CTRL.RST), then the
+ * rings are programmed again; the link renegotiates and DHCP runs again. */
+int nic_restart(void)
+{
+    if (!e1000_mmio || !rx_descs) return -1;
+    nic_ready = 0;
+    g_kstate.network_ready = 0;
+    nic_write(E1000_CTRL, nic_read(E1000_CTRL) | (1u << 26));
+    for (volatile int i = 0; i < 200000; i++);
+    for (int i = 0; i < 1000 && (nic_read(E1000_CTRL) & (1u << 26)); i++)
+        for (volatile int k = 0; k < 1000; k++);
+    memset(rx_descs, 0, 4096);
+    memset(tx_descs, 0, 4096);
+    rx_head = 0;
+    tx_tail = 0;
+    nic_program();
+    terminal_puts("[NIC] Restarted by Device Manager\n");
+    return 0;
+}
+
+static void nic_program(void)
+{
     uint32_t ral = nic_read(E1000_RAL), rah = nic_read(E1000_RAH);
     mac_addr[0] = (uint8_t)ral;         mac_addr[1] = (uint8_t)(ral >> 8);
     mac_addr[2] = (uint8_t)(ral >> 16); mac_addr[3] = (uint8_t)(ral >> 24);

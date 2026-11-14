@@ -48,19 +48,38 @@ void fb_draw_rounded_rect(int x, int y, int w, int h, int r, uint32_t color);
 void fb_fill_circle(int cx, int cy, int r, uint32_t color);
 void fb_fill_ring(int cx, int cy, int r_out, int r_in, uint32_t color);
 
-/* ---- Text (8x16 bitmap font) --------------------------------------------- */
-void fb_put_char(int px, int py, char c, uint32_t fg, uint32_t bg);
+/* ---- Text ----------------------------------------------------------------
+ * Anti-aliased fonts (see drivers/font_aa.h for the faces). y is the top of a
+ * 16 px text line. fb_draw_text is proportional; *_mono and the char calls
+ * use the 8 px monospace face. */
+#include "font_aa.h"
+int  fb_text(int px, int py, const char *str, uint32_t fg, int font);     /* returns end x */
+int  fb_text_n(int px, int py, const char *str, int n, uint32_t fg, int font);
+int  fb_text_width_font(const char *str, int font);
+int  fb_text_width_n_font(const char *str, int n, int font);
+int  fb_text_index_at(const char *str, int dx, int font);
+void fb_put_char(int px, int py, char c, uint32_t fg, uint32_t bg);      /* mono */
 void fb_put_string(int px, int py, const char *str, uint32_t fg, uint32_t bg);
-void fb_draw_char(int px, int py, char c, uint32_t fg);             /* no bg */
-void fb_draw_text(int px, int py, const char *str, uint32_t fg);    /* no bg */
+void fb_draw_char(int px, int py, char c, uint32_t fg);                  /* mono, no bg */
+void fb_draw_text(int px, int py, const char *str, uint32_t fg);
 void fb_draw_text_bold(int px, int py, const char *str, uint32_t fg);
+void fb_draw_text_mono(int px, int py, const char *str, uint32_t fg);
 void fb_draw_text_scaled(int px, int py, const char *str, uint32_t fg, int scale);
 int  fb_text_width(const char *str);
+int  fb_text_width_n(const char *str, int n);       /* first n characters */
+int  fb_text_width_bold(const char *str);
+int  fb_text_width_scaled(const char *str, int scale);
 
 /* ---- Whole-frame operations ---------------------------------------------- */
 void fb_save_frame(uint32_t *dst);          /* back buffer -> dst (w*h px)   */
 void fb_load_frame(const uint32_t *src);    /* src -> back buffer            */
 void fb_present(void);                      /* back buffer -> screen         */
+
+/* ---- Display settings ---------------------------------------------------- */
+void fb_set_color_filter(int brightness, int warmth);   /* 10..100 %, 0..100 */
+int  fb_mode_count(void);
+void fb_mode_get(int i, int *w, int *h);
+int  fb_set_mode(int w, int h);                        /* 0 = ok */
 
 /* ---- Mouse cursor (drawn on the screen only, never in the back buffer) --- */
 void fb_cursor_set_pos(int x, int y);

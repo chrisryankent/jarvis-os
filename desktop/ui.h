@@ -71,6 +71,12 @@ typedef enum {
     ICON_PACKAGE,       /* installable .jpk package */
     ICON_PROGRAM,       /* runnable program */
     ICON_STORE,         /* Apps (package manager) */
+    ICON_DISKS,         /* Disks (disk management) */
+    ICON_DEVICES,       /* Device Manager */
+    ICON_PHOTOS,        /* Photos */
+    ICON_CLOCK,         /* Clock */
+    ICON_REGEDIT,       /* Registry Editor */
+    ICON_BROWSER,       /* Browser */
 } icon_id_t;
 
 typedef enum {
@@ -89,6 +95,11 @@ typedef enum {
     GLYPH_FORWARD,
     GLYPH_GRID,         /* large icons view */
     GLYPH_LIST,         /* details view */
+    GLYPH_SUN,          /* brightness */
+    GLYPH_MOON,         /* night light */
+    GLYPH_PLANE,        /* airplane mode */
+    GLYPH_CONTRAST,     /* dark mode */
+    GLYPH_CAMERA,       /* screenshot */
 } glyph_id_t;
 
 /* Full-colour app icon in a size x size box. */
@@ -177,12 +188,41 @@ int  start_menu_hover(int x, int y);
 int  start_menu_key(uint32_t key, int mods);    /* 1 if consumed             */
 int  start_menu_text(char ch);
 
+int  taskbar_tray_hit(int x, int y);
+int  taskbar_handle_right_click(int x, int y);
+int  taskbar_is_pinned(int app_index);
+void taskbar_set_pinned(int app_index, int on);
+
+/* ---- Flyouts: Quick Settings, Calendar (desktop/flyouts.c) ---------------- */
+enum { FLY_NONE = 0, FLY_QUICK, FLY_CALENDAR };
+int  shell_flyout_is_open(void);            /* FLY_* */
+void shell_flyout_toggle(int which);
+void shell_flyout_close(void);
+void shell_flyout_draw(void);
+int  shell_flyout_click(int x, int y);
+int  shell_flyout_hover(int x, int y);
+int  shell_flyout_wheel(int x, int y, int delta);
+void shell_flyout_release(void);
+int  shell_flyout_dragging(void);
+
+void desktop_take_screenshot(char *saved, size_t n);    /* desktop_init.c */
+void settings_show_page(const char *name);              /* apps/settings.c */
+int  prefs_set(const char *name, const char *value, char *msg, size_t n);   /* desktop/prefs.c */
+int  prefs_get(const char *name, char *out, size_t n);
+
 /* ---- Desktop surface (desktop/desktop.c) --------------------------------- */
 void desktop_init(void);
 void desktop_draw(void);
 int  desktop_handle_click(int x, int y);
 const char *desktop_get_icon_target(int index);
 void desktop_wallpaper_invalidate(void);
+void wallpaper_paint_backdrop(int dim);           /* desktop/wallpaper.c */
+int  wallpaper_style(void);
+const char *wallpaper_style_name(int i);
+const char *wallpaper_style_title(int i);
+const char *wallpaper_fit_name(int i);
+const char *wallpaper_last_error(void);
+const uint32_t *wallpaper_thumb(int style);       /* 76 x 43 preview */
 int  desktop_icon_at(int x, int y);
 void desktop_files_changed(void);             /* Desktop folder contents changed */
 int  desktop_rename_active(void);

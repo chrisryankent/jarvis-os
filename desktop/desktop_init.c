@@ -26,9 +26,13 @@ void ui_shell_login_click(int x, int y);
 #include "sysutil.c"
 #include "icons.c"
 #include "notifications.c"
+#include "wallpaper.c"
+#include "prefs.c"
 #include "desktop.c"
 #include "taskbar.c"
+#include "flyouts.c"
 #include "../apps/file_explorer.c"
+#include "../apps/shell.c"
 #include "../apps/terminal.c"
 #include "../apps/settings.c"
 #include "../apps/calculator.c"
@@ -37,6 +41,11 @@ void ui_shell_login_click(int x, int y);
 #include "../apps/sysmon.c"
 #include "../apps/notepad.c"
 #include "../apps/store.c"
+#include "../apps/disks.c"
+#include "../apps/devices.c"
+#include "../apps/photos.c"
+#include "../apps/clock.c"
+#include "../apps/regedit.c"
 
 /* ---- App registry -------------------------------------------------------- */
 typedef wm_window_t *(*app_open_fn)(int x, int y, int w, int h);
@@ -50,14 +59,20 @@ typedef struct {
 
 static app_entry_t g_apps[] = {
     { { "Files",      ICON_FOLDER,   NULL }, file_explorer_open,  920, 560, "files file explorer this pc computer drives" },
-    { { "Terminal",   ICON_TERMINAL, NULL }, terminal_app_open,   640, 400, "terminal term console shell" },
+    { { "Terminal",   ICON_TERMINAL, NULL }, terminal_app_open,   820, 480, "terminal term console shell" },
     { { "JARVIS",     ICON_JARVIS,   NULL }, assistant_app_open,  460, 500, "jarvis ai assistant voice" },
     { { "Security",   ICON_SHIELD,   NULL }, security_app_open,   470, 440, "security guard" },
     { { "Settings",   ICON_GEAR,     NULL }, settings_app_open,   1000, 600, "settings personalize" },
     { { "Calculator", ICON_CALC,     NULL }, calculator_app_open, 300, 430, "calculator calc" },
-    { { "Tasks",      ICON_CHART,    NULL }, sysmon_app_open,     640, 470, "system monitor taskmgr processes" },
+    { { "Tasks",      ICON_CHART,    NULL }, sysmon_app_open,     900, 500, "system monitor taskmgr processes" },
     { { "Notepad",    ICON_FILE,     NULL }, notepad_app_open,    780, 520, "notepad editor text" },
     { { "Apps",       ICON_STORE,    NULL }, store_app_open,      760, 520, "apps store install installer packages" },
+    { { "Disks",      ICON_DISKS,    NULL }, disks_app_open,      960, 600, "disks disk management manager drives partitions storage" },
+    { { "Device Manager", ICON_DEVICES, NULL }, devices_app_open, 940, 600, "device manager devices hardware drivers devmgmt" },
+    { { "Photos",     ICON_PHOTOS,   NULL }, photos_app_open,     900, 600, "photos pictures images viewer gallery picture" },
+    { { "Clock",      ICON_CLOCK,    NULL }, clock_app_open,      520, 460, "clock alarm alarms timer stopwatch" },
+    { { "Run",        ICON_TERMINAL, NULL }, run_app_open,        480, 170, "run" },
+    { { "Registry Editor", ICON_REGEDIT, NULL }, regedit_app_open, 1000, 600, "regedit registry editor reg" },
 };
 #define APP_COUNT ((int)(sizeof(g_apps) / sizeof(g_apps[0])))
 
@@ -276,6 +291,44 @@ void desktop_apply_settings(void)
     audio_set_volume(setting_get_int("volume", 80));
     ai_tools_set_ask_first(setting_get_int("ai_ask_first", 0));
     if (setting_get_int("airplane", 0)) net_set_offline(1);
+    if (setting_get_int("dev_net_off", 0)) net_set_adapter_enabled(0);
+    if (setting_get_int("dev_audio_off", 0)) audio_set_enabled(0);
+    if (setting_get_int("mute", 0)) audio_set_volume(0);
+    prefs_apply_display();
+    static int res_done;
+    if (!res_done) {                    /* saved resolution: once, at start-up */
+        res_done = 1;
+        char r[16], msg[160];
+        setting_get("resolution", r, sizeof(r));
+        if (r[0]) prefs_apply_resolution(r, msg, sizeof(msg));
+    }
+}
+
+/* The screen mode changed: re-fit the work area, windows and wallpaper. */
+static void desktop_display_changed(void)
+{
+    int W = (int)fb_get_width(), H = (int)fb_get_height();
+    g_wm_ctx.screen_w = (uint32_t)W;
+    g_wm_ctx.screen_h = (uint32_t)H;
+    wm_set_workarea(0, 0, W, H - TASKBAR_H);
+    for (wm_window_t *w = g_wm_ctx.windows_head; w; w = w->next) {
+        if (w->state != WIN_STATE_NORMAL) {           /* maximized or snapped: re-apply */
+            wm_window_state_t st = w->state;
+            w->state = WIN_STATE_NORMAL;
+            if (st == WIN_STATE_MAXIMIZED) wm_set_maximized(w, 1);
+            else wm_snap_window(w, st);
+            continue;
+        }
+        if (w->w > W) w->w = W;
+        if (w->h > H - TASKBAR_H) w->h = H - TASKBAR_H;
+        if (w->x + w->w > W) w->x = W - w->w;
+        if (w->y + w->h > H - TASKBAR_H) w->y = H - TASKBAR_H - w->h;
+        if (w->x < 0) w->x = 0;
+        if (w->y < 0) w->y = 0;
+    }
+    desktop_wallpaper_invalidate();
+    desktop_files_changed();
+    desktop_invalidate();
 }
 
 void desktop_send_host_prefs(void)
@@ -308,6 +361,24 @@ void desktop_lock(void)
     ui_shell_show_lock_screen();
 }
 
+/* Print Screen / Win+Shift+S / "screenshot": the current frame as a PNG in
+ * Pictures/Screenshots. */
+void desktop_take_screenshot(char *saved, size_t n)
+{
+    saved[0] = 0;
+    const char *dir = "/jarvis/data/Pictures/Screenshots";
+    if (!vfs_is_dir("/jarvis/data/Pictures")) vfs_mkdir("/jarvis/data/Pictures");
+    if (!vfs_is_dir(dir)) vfs_mkdir(dir);
+    sys_time_t t;
+    sys_get_time(&t);
+    char path[160];
+    snprintf(path, sizeof(path), "%s/Screenshot %04d-%02d-%02d %02d%02d%02d.png", dir, t.year, t.month, t.day, t.hour, t.minute, t.second);
+    if (image_save_png(path, fb_get_base(), (int)fb_get_width(), (int)fb_get_height()) != 0) return;
+    snprintf(saved, n, "%s", path);
+    notification_show("Screenshot saved", "Saved in Pictures > Screenshots. Open Photos to see it.", NOTIF_INFO, 4000);
+    desktop_files_changed();
+}
+
 static void power_screen(const char *text)
 {
     fb_reset_clip();
@@ -320,6 +391,7 @@ static void power_screen(const char *text)
 void desktop_system_shutdown(void)
 {
     power_screen("Shutting down...");
+    reg_flush();
     diskfs_sync();          /* nothing unsaved is lost */
     sys_poweroff();
 }
@@ -327,6 +399,7 @@ void desktop_system_shutdown(void)
 void desktop_system_restart(void)
 {
     power_screen("Restarting...");
+    reg_flush();
     diskfs_sync();          /* nothing unsaved is lost */
     sys_reboot();
 }
@@ -382,7 +455,15 @@ void desktop_system_render(void)
     static uint64_t last_sync;
     if (now - last_sync >= 200) {
         last_sync = now;
+        reg_flush();
         diskfs_sync();
+        /* hardware or apps changed: rebuild the live registry keys */
+        static uint32_t seen_storage, seen_pkg;
+        if (seen_storage != g_storage_generation || seen_pkg != g_pkg_generation) {
+            seen_storage = g_storage_generation;
+            seen_pkg = g_pkg_generation;
+            reg_refresh_live();
+        }
     }
 
     /* Output printed by user programs appears in the Terminal. */
@@ -400,7 +481,13 @@ void desktop_system_render(void)
     char sched_msg[96];
     if (scheduler_take_event(sched_msg, sizeof(sched_msg))) {
         int usb = !strncmp(sched_msg, "USB drive", 9);
-        notification_show(usb ? "USB" : "Process manager", sched_msg, usb ? NOTIF_INFO : NOTIF_WARNING, 8000);
+        if (!strcmp(sched_msg, "Disk check finished")) {
+            diskfs_check_t ck;
+            diskfs_check_status(&ck);
+            notification_show("Disk check finished", ck.summary, ck.problems ? NOTIF_WARNING : NOTIF_INFO, 8000);
+            ai_tools_disk_check_done();
+        } else
+            notification_show(usb ? "USB" : "Process manager", sched_msg, usb ? NOTIF_INFO : NOTIF_WARNING, 8000);
         /* AutoPlay: show the new drive in This PC */
         if (!strncmp(sched_msg, "USB drive connected", 19) && setting_get_int("autoplay", 1) && ui_shell_is_desktop()) {
             desktop_app_launch(desktop_app_find("Files"));
@@ -417,8 +504,26 @@ void desktop_system_render(void)
     if (is_desktop && idle_min > 0 && account_has_sign_in() && now - g_last_input_tick > (uint64_t)idle_min * 6000)
         desktop_lock();
 
+    /* Screen off after inactivity (Settings > Display > Power): a black
+     * frame until the next key press or mouse movement. */
+    static int screen_off = 0;
+    int off_min = setting_get_int("screen_off_min", 0);
+    if (off_min > 0 && now - g_last_input_tick > (uint64_t)off_min * 6000) {
+        if (!screen_off) {
+            screen_off = 1;
+            fb_reset_clip();
+            fb_clear(0);
+            fb_cursor_show(0);
+            fb_present();
+        }
+        return;
+    }
+    if (screen_off) { screen_off = 0; fb_cursor_show(1); g_ds.dirty = 1; }
+
     if (notifications_tick())
         g_ds.dirty = 1;
+    static uint64_t last_pref_tick;
+    if (now - last_pref_tick >= 50) { last_pref_tick = now; prefs_tick(); clock_tick(); }
     if (now - g_ds.last_draw_tick >= 50)
         g_ds.dirty = 1;
 
@@ -447,6 +552,7 @@ void desktop_system_render(void)
     taskbar_draw();
     start_menu_draw();
     notifications_draw();
+    shell_flyout_draw();
     desktop_context_draw();
     fb_present();
 }
@@ -462,12 +568,17 @@ void desktop_system_handle_mouse_move(int x, int y)
         return;
 
     int changed = 0;
+    if (shell_flyout_dragging()) {
+        if (shell_flyout_hover(x, y)) g_ds.dirty = 1;
+        return;
+    }
     if (wm_is_dragging()) {
         changed = wm_handle_mouse_move(x, y);
     } else {
         changed |= desktop_context_hover(x, y);
         changed |= start_menu_hover(x, y);
         changed |= taskbar_hover(x, y);
+        changed |= shell_flyout_hover(x, y);
         changed |= wm_handle_mouse_move(x, y);
     }
     if (changed)
@@ -484,10 +595,7 @@ void desktop_open_icon(int icon)
         desktop_app_launch(desktop_app_find("Files"));
         file_explorer_navigate_to(target);
     } else if (target[0] == '/') {
-        int len = (int)strlen(target);
-        if (len > 4 && !strcmp(target + len - 4, ".jpk")) apps_store_show_install(target);
-        else if (user_is_program(target)) { desktop_app_launch(desktop_app_find("Terminal")); user_exec(target); }
-        else notepad_open_file(target);
+        shell_open_path(target);
     } else if (target[0]) {
         desktop_system_open_app(target);
     }
@@ -510,6 +618,12 @@ void desktop_system_handle_mouse_click(int x, int y, int button)
 
     /* Top-most layers first. */
     if (desktop_context_click(x, y))
+        return;
+    if (shell_flyout_is_open()) {
+        if (shell_flyout_click(x, y)) return;
+        if (y < (int)fb_get_height() - TASKBAR_H) { shell_flyout_close(); return; }  /* click outside dismisses it */
+    }
+    if (button == 2 && taskbar_handle_right_click(x, y))
         return;
     if (taskbar_handle_click(x, y))
         return;
@@ -543,19 +657,45 @@ void desktop_system_handle_mouse_release(int x, int y, int button)
 {
     if (!g_ds.initialized || !ui_shell_is_desktop())
         return;
+    shell_flyout_release();
     wm_handle_mouse_release(x, y, button);
     g_ds.dirty = 1;
 }
 
+/* The wheel goes to the window under the pointer (as on Windows 10/11),
+ * one event per notch; delta > 0 = scroll up. */
 void desktop_system_handle_mouse_wheel(int x, int y, int delta)
 {
-    (void)x; (void)y; (void)delta;      /* no wheel-capable mouse driver yet */
+    g_last_input_tick = g_kstate.uptime_ticks;
+    if (!g_ds.initialized || !ui_shell_is_desktop()) return;
+    if (taskbar_is_start_menu_open() || desktop_context_is_open()) return;
+    if (shell_flyout_wheel(x, y, delta)) { g_ds.dirty = 1; return; }
+    wm_window_t *win = wm_window_at_point(x, y);
+    if (!win || !win->on_event) return;
+    int cx, cy, cw, ch;
+    wm_get_client(win, &cx, &cy, &cw, &ch);
+    wm_input_event_t ev;
+    ev.type = IE_MOUSE_WHEEL;
+    ev.timestamp = (uint32_t)g_kstate.uptime_ticks;
+    ev.data.mouse.x = x - cx;
+    ev.data.mouse.y = y - cy;
+    int lines = setting_get_int("scroll_lines", 3);
+    for (int i = 0; i < (delta < 0 ? -delta : delta); i++) {
+        ev.data.mouse.button = delta > 0 ? lines : -lines;
+        win->on_event(win, &ev);
+    }
+    g_ds.dirty = 1;
 }
 
 /* ---- Keyboard ------------------------------------------------------------ */
 /* Global shortcuts. Returns 1 if the key was consumed. */
 static int desktop_shortcut(uint32_t key, int mods)
 {
+    if (key == WM_KEY_PRTSC || ((mods & KMOD_SUPER) && (mods & KMOD_SHIFT) && lower((char)key) == 's')) {
+        char saved[160];
+        desktop_take_screenshot(saved, sizeof(saved));
+        return 1;
+    }
     if (key == WM_KEY_SUPER_TAP || ((mods & KMOD_CTRL) && key == WM_KEY_ESC)) {
         taskbar_toggle_start_menu();
         return 1;
@@ -568,6 +708,10 @@ static int desktop_shortcut(uint32_t key, int mods)
         case 'i': desktop_app_launch(desktop_app_find("Settings"));    return 1;
         case 'j': desktop_app_launch(desktop_app_find("JARVIS"));      return 1;
         case 'l': desktop_lock();                                      return 1;
+        case 'a': shell_flyout_toggle(FLY_QUICK);                      return 1;
+        case 'n': shell_flyout_toggle(FLY_CALENDAR);                   return 1;
+        case 'x': desktop_app_launch(desktop_app_find("Device Manager")); return 1;
+        case 'r': desktop_app_launch(desktop_app_find("Run"));         return 1;
         default: break;
         }
     }
@@ -612,8 +756,9 @@ void desktop_dispatch_event(wm_input_event_t *event)
             desktop_delete_selected();
             return;
         }
-        if (key == WM_KEY_ESC && (desktop_context_is_open() ||
+        if (key == WM_KEY_ESC && (desktop_context_is_open() || shell_flyout_is_open() ||
                                   notifications_center_is_visible())) {
+            shell_flyout_close();
             desktop_context_close();
             notifications_close_center();
             return;

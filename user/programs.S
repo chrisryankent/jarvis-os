@@ -13,6 +13,8 @@ user_prog_\name\()_end:
     PROGRAM counter
     PROGRAM kernelpoke
     PROGRAM privileged
+    PROGRAM ask
+    PROGRAM launcher
 
     .macro PACKAGE name
     .global user_pkg_\name\()_start

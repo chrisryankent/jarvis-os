@@ -114,13 +114,13 @@ static void login_draw_lock(void)
     draw_backdrop();
     sys_format_clock(clock, sizeof(clock));
     sys_format_date(date, sizeof(date));
-    fb_draw_text_scaled((W - fb_text_width(clock) * 4) / 2, H / 2 - 230, clock, 0x00FFFFFF, 4);
+    fb_draw_text_scaled((W - fb_text_width_scaled(clock, 4)) / 2, H / 2 - 230, clock, 0x00FFFFFF, 4);
     ui_text_center(0, H / 2 - 160, W, date, 0x00C0D0E0);
 
     int cy = H / 2 - 40;
     fb_fill_circle(W / 2, cy, 40, T(ACCENT));
     glyph_draw(GLYPH_USER, W / 2 - 20, cy - 21, 40, T(ACCENT_TEXT), T(ACCENT));
-    fb_draw_text_scaled((W - fb_text_width(account_name()) * 2) / 2, cy + 54, account_name(), 0x00FFFFFF, 2);
+    fb_draw_text_scaled((W - fb_text_width_scaled(account_name(), 2)) / 2, cy + 54, account_name(), 0x00FFFFFF, 2);
 
     if (!account_has_sign_in()) {
         ui_text_center(0, cy + 100, W, "Press any key or click to sign in", 0x00C0D0E0);

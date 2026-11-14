@@ -90,8 +90,7 @@ static void ui_shell_ensure_init(void)
 static void draw_backdrop(void)
 {
     fb_reset_clip();
-    fb_gradient_v(0, 0, (int)fb_get_width(), (int)fb_get_height(),
-                  T(WALL_TOP), T(WALL_BOTTOM));
+    wallpaper_paint_backdrop(g_ui.mode == UI_MODE_LOADING ? 150 : 90);
 }
 
 static void draw_loading(void)
@@ -101,7 +100,7 @@ static void draw_loading(void)
 
     draw_backdrop();
     icon_draw(ICON_JARVIS, cx - 48, cy - 130, 96);
-    fb_draw_text_scaled(cx - fb_text_width("JARVIS OS"), cy - 10, "JARVIS OS", 0x00FFFFFF, 2);
+    fb_draw_text_scaled(cx - fb_text_width_scaled("JARVIS OS", 2) / 2, cy - 10, "JARVIS OS", 0x00FFFFFF, 2);
 
     int progress = 15 + (g_ui.line_count * 12) % 80;
     ui_progress(cx - 120, cy + 50, 240, 6, progress, 0x00203040, T(ACCENT));
@@ -302,6 +301,13 @@ void ui_shell_mouse_button(int button, int pressed)
         desktop_system_handle_mouse_click(g_ui.cursor_x, g_ui.cursor_y, button);
     else
         desktop_system_handle_mouse_release(g_ui.cursor_x, g_ui.cursor_y, button);
+}
+
+void desktop_system_handle_mouse_wheel(int x, int y, int delta);   /* desktop_init.c */
+void ui_shell_mouse_wheel(int delta)
+{
+    if (desktop_system_is_initialized())
+        desktop_system_handle_mouse_wheel(g_ui.cursor_x, g_ui.cursor_y, delta);
 }
 
 /* Used by the "click" voice command. */

@@ -40,7 +40,7 @@ def _tool(name: str, description: str, props: dict | None = None, required: list
 S = {"type": "string"}
 I = {"type": "integer"}
 TOOLS = [
-    _tool("open_app", "Open an app (Files, Terminal, Settings, Calculator, Tasks, Notepad, Apps, Security).", {"name": S}, ["name"]),
+    _tool("open_app", "Open an app (Files, Terminal, Settings, Calculator, Tasks, Notepad, Apps, Security, Disks, Device Manager, Photos, Clock, Run).", {"name": S}, ["name"]),
     _tool("close_app", "Close an open app window.", {"name": S}, ["name"]),
     _tool("list_apps", "List the apps on this PC and which are open."),
     _tool("list_files", "List the files and folders in a folder.", {"path": S}, ["path"]),
@@ -53,14 +53,37 @@ TOOLS = [
     _tool("copy", "Copy a file or folder.", {"from": S, "to": S}, ["from", "to"]),
     _tool("open_file", "Open a file in Notepad, or a folder in Files.", {"path": S}, ["path"]),
     _tool("system_status", "Time, date, memory, disk, network."),
-    _tool("list_processes", "List running processes with their PID."),
+    _tool("list_processes", "List running processes: PID, state, priority, parent, memory."),
     _tool("kill_process", "End a process by PID.", {"pid": I}, ["pid"]),
     _tool("suspend_process", "Pause a process by PID.", {"pid": I}, ["pid"]),
     _tool("resume_process", "Resume a paused process by PID.", {"pid": I}, ["pid"]),
-    _tool("list_devices", "List the hardware devices and their drivers."),
-    _tool("list_drives", "List the disks and USB drives with free space."),
+    _tool("set_priority", "Change a process's priority by PID.", {"pid": I, "level": {"type": "string", "enum": ["low", "normal", "high"]}}, ["pid", "level"]),
+    _tool("list_devices", "List the hardware devices, their drivers and status."),
+    _tool("device_details", "Details of one device: maker, hardware ID, driver, interrupts, status.", {"name": S}, ["name"]),
+    _tool("set_device_enabled", "Disable or enable a device (network adapter, sound card, USB device).", {"name": S, "enabled": {"type": "boolean"}}, ["name", "enabled"]),
+    _tool("list_drives", "List the drives with free space."),
+    _tool("list_disks", "Disk management: every disk, its file system, space, data read and written, errors."),
+    _tool("check_disk", "Check the JARVIS disk for errors in the background; repair fixes them; surface reads every block.", {"repair": {"type": "boolean"}, "surface": {"type": "boolean"}}),
+    _tool("disk_check_status", "Progress or result of the disk check."),
+    _tool("eject_drive", "Safely eject a USB drive so it can be unplugged.", {"name": S}),
     _tool("network_info", "Network connection details."),
     _tool("set_theme", "Change the look: dark, light or high_contrast.", {"mode": {"type": "string", "enum": ["dark", "light", "high_contrast"]}}, ["mode"]),
+    _tool("change_setting", "Change any system setting. Names: brightness (10-100, up, down), night_light (on/off), night_light_strength, "
+          "resolution (e.g. 1920x1080), screen_off_min, theme (dark/light/high_contrast), accent (blue/red/green/gold/purple/orange), "
+          "wallpaper (bloom, aurora, mountains, dunes, night, waves, solid, or a picture path), wallpaper_fit, wallpaper_color, "
+          "transparency, taskbar_align (center/left), desktop_icons, clock_24h, clock_seconds, volume (0-100, up, down), mute, "
+          "voice_volume, mouse_speed (slow/normal/fast/fastest), scroll_lines, dnd, lock_after_min, airplane, device_name, autoplay.",
+          {"name": S, "value": S}, ["name", "value"]),
+    _tool("get_settings", "All system settings and their current values."),
+    _tool("run_command", "Run a Terminal command and get its output (ls, cat, grep, find, cp, mv, mkdir, df, ps, ifconfig, ping, uname, free, dmesg, tree, sha256sum ...; also 'timer 5m', 'alarm 07:30 Wake up', 'alarm list', 'stopwatch start'). Use for anything the other tools cannot do.", {"command": S}, ["command"]),
+    _tool("disk_action", "Disk management: list, info, create a volume, format, label, extend, shrink, delete, init. "
+          "disk is a number from list (0 = system disk) or 'usb'. format, delete and init erase data: only with confirm true after the user agreed.",
+          {"action": {"type": "string", "enum": ["list", "info", "create", "format", "label", "extend", "shrink", "delete", "init"]},
+           "disk": S, "volume": S, "size_mb": I, "label": S, "fs": {"type": "string", "enum": ["fat32", "fat16", "auto"]},
+           "confirm": {"type": "boolean"}}, ["action"]),
+    _tool("device_action", "Device Manager: info, enable, disable, restart, uninstall (driver), scan (for hardware changes), events, driver.",
+          {"action": {"type": "string", "enum": ["info", "enable", "disable", "restart", "uninstall", "scan", "events", "driver"]}, "name": S}, ["action"]),
+    _tool("screenshot", "Take a screenshot (saved in Pictures/Screenshots)."),
     _tool("notify", "Show a notification.", {"title": S, "text": S}, ["text"]),
     _tool("lock_screen", "Lock the computer."),
     _tool("list_packages", "List apps installed from packages."),
@@ -199,7 +222,8 @@ class LlamaServer:
 
 
 INFO_TOOLS = {"list_files", "find_files", "read_file", "system_status", "list_processes", "list_devices",
-              "list_drives", "network_info", "list_apps", "list_packages", "web_search", "read_webpage"}
+              "list_drives", "network_info", "list_apps", "list_packages", "web_search", "read_webpage",
+              "device_details", "list_disks", "disk_check_status", "get_settings", "run_command"}
 
 
 def tool_catalogue() -> str:
@@ -219,7 +243,8 @@ Answer only with JSON: {"tool": <tool name or "none">, "args": {...}, "say": <te
 - Otherwise use "tool": "none" and put your answer in say: one or two short spoken sentences, no markdown.
 - You have full control of this PC, but only delete, overwrite, end processes, uninstall or shut down when the user clearly asked for exactly that.
 - The words come from speech recognition and may be misheard: pick the app or command that sounds closest (e.g. "not bad" means Notepad).
-Folders: Documents, Downloads, Desktop (write paths like "Documents/notes.txt"). USB drives: /jarvis/usb0 (read-only).
+Folders: Documents, Downloads, Desktop, Pictures (write paths like "Documents/notes.txt"). USB drives: /jarvis/usb0 (read and write).
+Settings (brightness, wallpaper, night light, volume, resolution, theme ...) all go through change_setting.
 Tools:
 """ + tool_catalogue()
 

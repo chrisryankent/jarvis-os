@@ -22,6 +22,17 @@ typedef long           int64_t;
 #define SYS_exit     60
 #define SYS_mkdir    83
 #define SYS_unlink   87
+#define SYS_lseek    8
+#define SYS_wait4    61
+#define SYS_kill     62
+#define SYS_rename   82
+#define SYS_getppid  110
+#define SYS_time     201
+#define SYS_clock_gettime 228
+#define SYS_jarvis_notify  504
+#define SYS_spawn    520
+#define SYS_listdir  521
+#define SYS_filesize 522
 #define SYS_jarvis_speak   500
 #define SYS_jarvis_task    502
 #define SYS_jarvis_status  503
@@ -58,6 +69,28 @@ static inline void    exit(int code)
     syscall3(SYS_exit, (uint64_t)code, 0, 0);
     for (;;) { }
 }
+
+static inline int strcmp(const char *a, const char *b)
+{
+    while (*a && *a == *b) { a++; b++; }
+    return (unsigned char)*a - (unsigned char)*b;
+}
+static inline int64_t lseek(int fd, int64_t off, int whence) { return syscall3(SYS_lseek, (uint64_t)fd, (uint64_t)off, (uint64_t)whence); }
+static inline int     getppid(void)                  { return (int)syscall3(SYS_getppid, 0, 0, 0); }
+static inline int64_t spawn(const char *path)        { return syscall3(SYS_spawn, (uint64_t)path, 0, 0); }
+static inline int     waitpid(int pid, int *code)    { return (int)syscall3(SYS_wait4, (uint64_t)pid, (uint64_t)code, 0); }
+static inline int     kill(int pid)                  { return (int)syscall3(SYS_kill, (uint64_t)pid, 9, 0); }
+static inline int     rename(const char *a, const char *b) { return (int)syscall3(SYS_rename, (uint64_t)a, (uint64_t)b, 0); }
+static inline int64_t time_now(void)                 { return syscall3(SYS_time, 0, 0, 0); }
+static inline uint64_t uptime_ms(void)
+{
+    uint64_t ts[2];
+    syscall3(SYS_clock_gettime, 1, (uint64_t)ts, 0);
+    return ts[0] * 1000 + ts[1] / 1000000;
+}
+static inline int64_t listdir(const char *p, char *buf, size_t max) { return syscall3(SYS_listdir, (uint64_t)p, (uint64_t)buf, max); }
+static inline int64_t filesize(const char *p)        { return syscall3(SYS_filesize, (uint64_t)p, 0, 0); }
+static inline int     notify(const char *t, const char *x) { return (int)syscall3(SYS_jarvis_notify, (uint64_t)t, (uint64_t)x, 0); }
 
 static inline void print_num(uint64_t v)
 {

@@ -12,61 +12,7 @@
 #include "ui.h"
 #include <string.h>
 
-/* ---- Wallpaper -----------------------------------------------------------
- * Rendered once into a cache and copied into the back buffer every frame;
- * regenerated only when the theme changes.
- */
-static uint32_t *g_wallpaper = NULL;
-static int g_wallpaper_valid = 0;
-
-void desktop_wallpaper_invalidate(void)
-{
-    g_wallpaper_valid = 0;
-}
-
-static void wallpaper_render(void)
-{
-    int W = (int)fb_get_width();
-    int H = (int)fb_get_height();
-
-    fb_reset_clip();
-    fb_gradient_v(0, 0, W, H, T(WALL_TOP), T(WALL_BOTTOM));
-
-    if (theme_get_mode() != THEME_HIGH_CONTRAST) {
-        /* Soft "bloom" rising from the bottom centre, plus a faint glow in
-         * the top-right corner. */
-        uint32_t glow = (theme_get_mode() == THEME_LIGHT) ? 0x00FFFFFF : T(ACCENT);
-        int cx = W / 2, cy = H + H / 6;
-        static const int radii_pct[4] = { 95, 72, 52, 34 };
-        for (int i = 0; i < 4; i++) {
-            int r = (H * radii_pct[i]) / 100;
-            fb_blend_rounded_rect(cx - r, cy - r, 2 * r, 2 * r, r, glow, 16);
-        }
-        int r2 = H / 2;
-        fb_blend_rounded_rect(W - r2 / 2, -r2, 2 * r2, 2 * r2, r2, glow, 10);
-    }
-}
-
-static void wallpaper_draw(void)
-{
-    if (!g_wallpaper)
-        g_wallpaper = (uint32_t *)kmalloc_large((size_t)fb_get_width() *
-                                                fb_get_height() * 4);
-
-    if (!g_wallpaper) {             /* no memory for a cache: flat gradient */
-        fb_gradient_v(0, 0, (int)fb_get_width(), (int)fb_get_height(),
-                      T(WALL_TOP), T(WALL_BOTTOM));
-        return;
-    }
-
-    if (!g_wallpaper_valid) {
-        wallpaper_render();
-        fb_save_frame(g_wallpaper);
-        g_wallpaper_valid = 1;
-        return;
-    }
-    fb_load_frame(g_wallpaper);
-}
+/* The wallpaper lives in desktop/wallpaper.c. */
 
 void file_explorer_refresh(void);               /* apps/file_explorer.c */
 int  file_explorer_trash_path(const char *path);
@@ -198,6 +144,7 @@ void desktop_draw(void)
         desktop_reload_files();
 
     wallpaper_draw();
+    if (!setting_get_int("desktop_icons", 1)) return;
 
     for (int i = 0; i < g_dicon_count; i++) {
         int x, y;
@@ -211,30 +158,29 @@ void desktop_draw(void)
 
         if (i == g_drename.idx) {
             /* edit box, wide enough for the name being typed */
-            int bw = g_drename.len * 8 + 14;
+            int bw = fb_text_width_n(g_drename.buf, g_drename.len) + 14;
             if (bw < DICON_W + 20) bw = DICON_W + 20;
             int bx = x + (DICON_W - bw) / 2;
             if (bx < 2) bx = 2;
             fb_fill_rect(bx, y + 53, bw, 22, T(INPUT));
             fb_draw_rect(bx, y + 53, bw, 22, T(ACCENT));
             if (g_drename.fresh)
-                fb_fill_rect(bx + 5, y + 56, g_drename.len * 8 + 2, 16, T(ACCENT));
+                fb_fill_rect(bx + 5, y + 56, fb_text_width_n(g_drename.buf, g_drename.len) + 2, 16, T(ACCENT));
             fb_draw_text(bx + 6, y + 56, g_drename.buf,
                          g_drename.fresh ? T(ACCENT_TEXT) : T(TEXT));
             if (!g_drename.fresh)
-                fb_fill_rect(bx + 7 + g_drename.len * 8, y + 56, 1, 16, T(TEXT));
+                fb_fill_rect(bx + 7 + fb_text_width_n(g_drename.buf, g_drename.len), y + 56, 1, 16, T(TEXT));
             continue;
         }
 
         /* Label (shortened to fit) with a 1px shadow so it stays readable
          * on any wallpaper */
-        char label[16];
-        size_t n = strlen(g_dicons[i].label);
-        if (n > 11) {
-            memcpy(label, g_dicons[i].label, 9);
-            label[9] = '.'; label[10] = '.'; label[11] = 0;
-        } else {
-            memcpy(label, g_dicons[i].label, n + 1);
+        char label[48];
+        snprintf(label, sizeof(label), "%s", g_dicons[i].label);
+        int n = (int)strlen(label);
+        if (fb_text_width(label) > DICON_W + 4) {
+            while (n > 1 && fb_text_width_n(label, n) + fb_text_width(SYM_ELLIPSIS) > DICON_W + 4) n--;
+            memcpy(label + n, SYM_ELLIPSIS, 2);
         }
         int tx = x + (DICON_W - fb_text_width(label)) / 2;
         fb_draw_text(tx + 1, y + 57, label, 0x00000000);
@@ -315,6 +261,7 @@ void desktop_rename_input(uint32_t key, char ch)
  */
 int desktop_handle_click(int x, int y)
 {
+    if (!setting_get_int("desktop_icons", 1)) return -1;
     for (int i = 0; i < g_dicon_count; i++) {
         int ix, iy;
         dicon_rect(i, &ix, &iy);
@@ -533,6 +480,7 @@ static void desktop_menu_action(int id, void *ctx)
 /* Index of the desktop icon under (x,y), or -1. */
 int desktop_icon_at(int x, int y)
 {
+    if (!setting_get_int("desktop_icons", 1)) return -1;
     for (int i = 0; i < g_dicon_count; i++) {
         int ix, iy;
         dicon_rect(i, &ix, &iy);

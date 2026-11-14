@@ -165,6 +165,7 @@ const char *sysmon_state_name(const proc_info_t *p, char *buf, size_t n)
 {
     if (p->flags & PROC_FLAG_SERVICE)      snprintf(buf, n, "Service");
     else if (p->suspended)                 snprintf(buf, n, "Suspended");
+    else if (p->waiting_on[0] && p->state != PROC_ZOMBIE) snprintf(buf, n, "Waiting: %s", p->waiting_on);
     else if (p->state == PROC_SLEEPING)    snprintf(buf, n, "Sleeping");
     else if (p->state == PROC_BLOCKED)     snprintf(buf, n, "Waiting: %s", p->waiting_on);
     else if (p->state == PROC_ZOMBIE)      snprintf(buf, n, "Exiting");
@@ -234,7 +235,8 @@ static const char *net_status_text(void)
     net_info_t ni; char ip[16];
     net_get_info(&ni);
     net_format_ip(ni.ip, ip, sizeof(ip));
-    snprintf(buf, sizeof(buf), "%s%s", !ni.adapter ? "No adapter" : !ni.link ? "Cable unplugged"
+    snprintf(buf, sizeof(buf), "%s%s", !ni.adapter ? "No adapter" : !net_adapter_enabled() ? "Adapter disabled"
+             : net_is_offline() ? "Airplane mode" : !ni.link ? "Cable unplugged"
              : !ni.configured ? "Waiting for an address" : "Connected, ", ni.configured ? ip : "");
     return buf;
 }
@@ -303,7 +305,7 @@ static void draw_overview(int x, int y, int w)
 static void draw_devices(int x, int y, int w, int h)
 {
     static dev_info_t devs[48];
-    static const char *const states[3] = { "Working", "No driver", "Not working" };
+    static const char *const states[4] = { "Working", "No driver", "Not working", "Disabled" };
     char buf[48];
     int n = devmgr_list(devs, 48);
     int c_name = x + 16, c_type = x + 250, c_drv = x + 330, c_state = x + 430;
@@ -342,12 +344,15 @@ static void draw_processes(int x, int y, int w, int h)
 {
     static const char *const prio_names[4] = { "Realtime", "High", "Normal", "Low" };
     char buf[48];
-    int c_pid = x + 16, c_name = x + 64, c_state = x + 200;
-    int c_prio = x + w - 250, c_cpu = x + w - 160, c_time = x + w - 96;
+    int c_pid = x + 16, c_name = x + 64, c_type = x + 190, c_state = x + 262;
+    int c_par = x + w - 420, c_mem = x + w - 350, c_prio = x + w - 250, c_cpu = x + w - 160, c_time = x + w - 96;
 
     fb_draw_text(c_pid, y + 8, "PID", T(TEXT_DIM));
     fb_draw_text(c_name, y + 8, "Name", T(TEXT_DIM));
+    fb_draw_text(c_type, y + 8, "Type", T(TEXT_DIM));
     fb_draw_text(c_state, y + 8, "Status", T(TEXT_DIM));
+    fb_draw_text(c_par, y + 8, "Parent", T(TEXT_DIM));
+    fb_draw_text(c_mem, y + 8, "Memory", T(TEXT_DIM));
     fb_draw_text(c_prio, y + 8, "Priority", T(TEXT_DIM));
     fb_draw_text(c_cpu, y + 8, "CPU", T(TEXT_DIM));
     fb_draw_text(c_time, y + 8, "CPU time", T(TEXT_DIM));
@@ -368,9 +373,18 @@ static void draw_processes(int x, int y, int w, int h)
         }
         snprintf(buf, sizeof(buf), "%u", p->pid);
         fb_draw_text(c_pid, ry + 3, buf, dim);
-        ui_text_fit(c_name, ry + 3, c_state - c_name - 8, p->name, fg);
-        ui_text_fit(c_state, ry + 3, c_prio - c_state - 8,
+        ui_text_fit(c_name, ry + 3, c_type - c_name - 8, p->name, fg);
+        fb_draw_text(c_type, ry + 3, (p->flags & PROC_FLAG_USER) ? "User" : (p->flags & PROC_FLAG_SERVICE) ? "Service"
+                                     : (p->flags & PROC_FLAG_SYSTEM) ? "System" : "Kernel", dim);
+        ui_text_fit(c_state, ry + 3, c_par - c_state - 8,
                     sysmon_state_name(p, buf, sizeof(buf)), dim);
+        if (p->ppid) { snprintf(buf, sizeof(buf), "%u", p->ppid); fb_draw_text(c_par, ry + 3, buf, dim); }
+        else fb_draw_text(c_par, ry + 3, "-", dim);
+        if (p->flags & PROC_FLAG_USER) {
+            if (p->mem_kb >= 1024) snprintf(buf, sizeof(buf), "%u.%u MB", p->mem_kb / 1024, (p->mem_kb % 1024) * 10 / 1024);
+            else                   snprintf(buf, sizeof(buf), "%u KB", p->mem_kb);
+            fb_draw_text(c_mem, ry + 3, buf, dim);
+        } else fb_draw_text(c_mem, ry + 3, "shared", dim);
         fb_draw_text(c_prio, ry + 3, prio_names[p->priority & 3], dim);
         if (p->flags & PROC_FLAG_SERVICE) {
             fb_draw_text(c_cpu, ry + 3, "-", dim);
@@ -394,6 +408,8 @@ static void draw_processes(int x, int y, int w, int h)
     ui_button(x + 16, fy + 10, 100, 28, "End task",
               can_act ? T(DANGER) : off_bg, can_act ? 0x00FFFFFF : off_fg);
     ui_button(x + 124, fy + 10, 100, 28, (sel && sel->suspended) ? "Resume" : "Suspend",
+              can_act ? T(HOVER) : off_bg, can_act ? T(TEXT) : off_fg);
+    ui_button(x + 232, fy + 10, 140, 28, "Change priority",
               can_act ? T(HOVER) : off_bg, can_act ? T(TEXT) : off_fg);
     snprintf(buf, sizeof(buf), "%d processes   CPU %u%%", g_sysmon.proc_count,
              100 - g_sysmon.idle_pct);
@@ -463,6 +479,10 @@ void sysmon_event_callback(wm_window_t *win, wm_input_event_t *event)
         } else if (ui_hit(mx, my, 124, fy + 10, 100, 28) && sel) {
             if (sel->suspended) proc_resume(sel->pid);
             else                proc_suspend(sel->pid);
+        } else if (ui_hit(mx, my, 232, fy + 10, 140, 28) && sel && !(sel->flags & (PROC_FLAG_SYSTEM | PROC_FLAG_SERVICE))) {
+            /* Low -> Normal -> High -> Low (Realtime is kept for the kernel) */
+            int next = sel->priority == PRIO_USER ? PRIO_SYSTEM : sel->priority == PRIO_SYSTEM ? PRIO_AI : PRIO_USER;
+            proc_set_priority(sel->pid, next);
         } else if (ui_hit(mx, my, 112, fy + 46, 90, 28)) {
             g_sysmon.selected_pid = sysmon_spawn_test("cpu");
         } else if (ui_hit(mx, my, 210, fy + 46, 90, 28)) {

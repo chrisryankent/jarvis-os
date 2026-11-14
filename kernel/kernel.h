@@ -167,6 +167,14 @@ int  net_command_start(const char *cmdline);            /* ping / nslookup / htt
 void net_set_offline(int off);                          /* airplane mode */
 int  net_is_offline(void);
 void net_renew(void);                                   /* new DHCP request */
+void net_set_adapter_enabled(int on);                   /* Device Manager */
+int  net_adapter_enabled(void);
+void audio_set_enabled(int on);
+int  audio_is_enabled(void);
+int  usb_eject_port(int port);
+int  usb_enable_port(int port);
+int  usb_ejected_ports(int *ports, int max);
+int  usb_port_of_block(int dev);
 int  nic_send(const uint8_t *frame, size_t len);
 void nic_poll(void);
 int  nic_link_up(void);
@@ -174,7 +182,8 @@ void nic_get_mac(uint8_t out[6]);
 void nic_get_counters(uint64_t *rx, uint64_t *tx);
 
 /* ---- Device manager (kernel/devmgr.c) ------------------------------------- */
-enum { DEV_WORKING = 0, DEV_NO_DRIVER, DEV_FAILED };
+enum { DEV_WORKING = 0, DEV_NO_DRIVER, DEV_FAILED, DEV_DISABLED };
+enum { DEVCTL_NONE = 0, DEVCTL_NET, DEVCTL_AUDIO, DEVCTL_USB };   /* what "Disable" does */
 typedef struct {
     int      id;
     char     name[48];
@@ -187,7 +196,20 @@ typedef struct {
     int      irq;                   /* -1 = none                    */
     uint64_t interrupts;            /* raised since boot            */
     uint32_t owner_pid;             /* 0 = not claimed              */
+    char     vendor[24];            /* vendor name, "" if unknown   */
+    uint8_t  class_code, subclass, prog_if;
+    uint32_t bar[6];                /* PCI resources                */
+    int      control;               /* DEVCTL_*                     */
+    int      port;                  /* USB port for DEVCTL_USB      */
 } dev_info_t;
+int  devmgr_set_enabled(int id, int on, char *why, size_t why_len);
+int  devmgr_find(const char *name);         /* by (part of) its name; -1 */
+int  devmgr_restart(int id, char *why, size_t why_len);
+int  devmgr_uninstall(int id, char *why, size_t why_len);
+int  devmgr_rescan(void);                   /* scan for hardware changes; returns device count */
+void devmgr_driver_info(int id, char *out, size_t n);
+int  devmgr_events(int id, char *out, size_t n);    /* id < 0: all devices */
+void devmgr_log(const char *dev, const char *text);
 int  usb_device_total(void);                 /* currently connected */
 void usb_start_hotplug(void);
 int  fatfs_mount_dev(int dev);
@@ -244,6 +266,7 @@ int         ai_tools_pending(char *text, size_t n); /* an action awaiting Allow 
 void        ai_tools_confirm(int allow);
 int         ai_tools_ask_first(void);              /* ask before risky actions? */
 void        ai_tools_set_ask_first(int on);
+void        ai_tools_disk_check_done(void);
 
 /* ---- Packages (kernel/pkg.c) ---------------------------------------------- */
 typedef struct {
@@ -260,12 +283,109 @@ int      pkg_list(pkg_info_t *out, int max);
 uint32_t pkg_run(const char *name);
 void     pkg_place_samples(void);
 
-/* ---- FAT volumes on USB drives, read-only (kernel/fatfs.c) ---------------- */
+/* ---- FAT volumes on USB drives and extra disks (kernel/fatfs.c) ---------- */
 void fatfs_mount_all(void);
 int  fatfs_owns(const char *path);
 int  fatfs_stat(const char *path, int *is_dir, uint32_t *size);
 int  fatfs_list(const char *path, char *buf, size_t max);
 int  fatfs_read(const char *path, uint64_t offset, void *buf, size_t len);
+int  fatfs_write_file(const char *path, const void *data, size_t len);
+int  fatfs_append(const char *path, const void *data, size_t len);
+int  fatfs_mkdir(const char *path);
+int  fatfs_delete(const char *path);                   /* recursive */
+int  fatfs_rename(const char *from, const char *to);   /* same volume */
+int  fatfs_volume_info(const char *mount, char *label, size_t ln, int *fat32, uint64_t *total, uint64_t *free_b);
+const char *fatfs_mount_of(int dev, int part);         /* "" if not mounted */
+uint32_t fatfs_highest_used(const char *mount, uint32_t *clusters, uint32_t *spc);
+int  diskfs_device(void);                              /* block device of the JARVIS disk, -1 */
+int  diskfs_resize(uint64_t new_blocks, char *err, size_t n);   /* 4 KB blocks */
+uint64_t diskfs_max_blocks(void);
+uint64_t diskfs_min_blocks(void);
+
+/* ---- HTTP / HTTPS client (kernel/http.c; TLS in kernel/tls.c) ------------- */
+enum { HTTP_IDLE = 0, HTTP_QUEUED, HTTP_RUNNING, HTTP_DONE, HTTP_FAILED };
+typedef struct {
+    volatile int state;             /* HTTP_* */
+    char     url[1024];             /* after redirects: the final address */
+    char     method[8];             /* "GET" (default) or "POST" */
+    char     post[4096];
+    size_t   post_len;
+    char     save_path[256];        /* set: the body is also written to this file */
+    volatile int cancel;
+    /* results */
+    int      status, redirects;
+    char     ctype[96], disposition[160], tls[48], phase[96], err[160];
+    uint8_t *data;                  /* body, NUL-terminated; free with http_free */
+    volatile size_t len;
+    size_t   cap;
+    uint64_t expected;              /* Content-Length, 0 if unknown */
+} http_req_t;
+int  http_start(http_req_t *r);
+void http_free(http_req_t *r);
+int  http_parse_url(const char *url, int *https, char *host, size_t hn, int *port, char *path, size_t pn);
+void http_resolve_url(const char *base, const char *href, char *out, size_t n);
+void http_suggest_name(const http_req_t *r, char *out, size_t n);
+
+/* ---- Registry (kernel/registry.c) ------------------------------------------ */
+enum { REG_NONE = 0, REG_SZ = 1, REG_EXPAND_SZ = 2, REG_BINARY = 3, REG_DWORD = 4, REG_MULTI_SZ = 7, REG_QWORD = 11 };
+enum { REG_HKCR = 0, REG_HKCU, REG_HKLM, REG_HKCC, REG_HIVES };
+extern volatile uint32_t g_reg_generation;
+void reg_init(void);
+void reg_flush(void);                       /* save changed keys (called every few seconds) */
+void reg_refresh_live(void);                /* rebuild HKLM\HARDWARE etc. */
+int  reg_open_key(const char *path, int create);    /* key index, -1 */
+int  reg_key_path(int key, char *out, size_t n);
+const char *reg_key_name(int key);
+int  reg_key_parent(int key);
+int  reg_key_child(int key, int i);         /* key -1: the hives */
+int  reg_key_has_children(int key);
+int  reg_key_volatile(int key);             /* built from the hardware, not saved */
+int  reg_delete_key(const char *path);      /* with everything below it */
+int  reg_rename_key(const char *path, const char *new_name);
+int  reg_set_value(const char *path, const char *name, int type, const void *data, uint32_t len);
+int  reg_set_value_k(int key, const char *name, int type, const void *data, uint32_t len);
+int  reg_set_sz(const char *path, const char *name, const char *s);
+int  reg_set_dword(const char *path, const char *name, uint32_t d);
+int  reg_set_from_text(int key, const char *name, int type, const char *text, char *err, size_t en);
+int  reg_get_text(const char *path, const char *name, char *out, size_t n);
+int  reg_get_text_k(int key, const char *name, char *out, size_t n);
+int  reg_get_raw_k(int key, const char *name, int *type, void *buf, uint32_t cap);
+int  reg_value_at(int key, int i, char *name, size_t nn, int *type, char *text, size_t tn, uint32_t *len);
+int  reg_delete_value(const char *path, const char *name);
+int  reg_rename_value(const char *path, const char *old, const char *nw);
+const char *reg_type_name(int type);
+int  reg_type_parse(const char *s);
+int  reg_export(const char *path, char *out, size_t n, int include_volatile);
+int  reg_import(const char *text, int *keys, int *values, char *err, size_t en);
+int  reg_setting_get(const char *key, char *out, size_t n);
+void reg_setting_set(const char *key, const char *value, int numeric);
+
+/* ---- Disk management (kernel/diskmgmt.c) ----------------------------------- */
+#define DM_MAX_PARTS 8
+enum { DM_EMPTY = 0, DM_MBR, DM_GPT, DM_WHOLE, DM_UNREADABLE };
+typedef struct {
+    int      num;                   /* 1-4 (MBR), GPT index, 0 = whole disk */
+    uint8_t  type;                  /* MBR type byte */
+    int      bootable;
+    uint64_t start, sectors;
+    char     fs[16], label[16], mount[24];
+} dm_part_t;
+typedef struct {
+    int      dev;
+    char     name[16], model[41];
+    uint64_t sectors;
+    int      scheme;                /* DM_* */
+    int      system, removable;
+    int      nparts;
+    dm_part_t parts[DM_MAX_PARTS];
+} dm_disk_t;
+int dm_disk_info(int dev, dm_disk_t *out);
+int dm_init_mbr(int dev, char *err, size_t n);
+int dm_create_partition(int dev, uint64_t size_mb, const char *fs, const char *label, int *out_num, char *err, size_t n);
+int dm_delete_partition(int dev, int num, char *err, size_t n);
+int dm_format(int dev, int num, const char *fs, const char *label, char *err, size_t n);
+int dm_set_label(int dev, int num, const char *label, char *err, size_t n);
+int dm_resize(int dev, int num, uint64_t new_mb, char *err, size_t n);     /* 0 = largest */
 void vfs_mount_point(const char *path);
 void vfs_unmount_point(const char *path);
 
@@ -311,6 +431,21 @@ typedef struct {
 void diskfs_mount(void);            /* load saved files; formats a blank disk */
 int  diskfs_sync(void);             /* write changes; returns items written   */
 int  diskfs_get_stats(diskfs_stats_t *out);
+#define DISKFS_CHECK_ISSUES 8
+typedef struct {
+    int         running, done, progress;        /* progress 0..100 */
+    int         surface, repair;
+    uint32_t    pid;
+    const char *phase;
+    int         files, dirs, problems, repaired;
+    uint64_t    blocks_read, read_errors, overlaps, bitmap_diff;
+    int         content_mismatch;
+    int         issue_count;
+    char        issue[DISKFS_CHECK_ISSUES][96];
+    char        summary[96];
+} diskfs_check_t;
+uint32_t diskfs_check_start(int surface, int repair);
+void     diskfs_check_status(diskfs_check_t *out);
 
 typedef struct {
     char     path[256];
@@ -443,6 +578,8 @@ typedef struct {
     uint64_t cpu_ticks;         /* 10 ms each   */
     uint64_t start_tick;
     char     waiting_on[24];    /* what a blocked process waits for */
+    uint32_t ppid;              /* parent process */
+    uint32_t mem_kb;            /* own (user) memory in RAM */
 } proc_info_t;
 
 void     scheduler_init(void);
@@ -456,6 +593,15 @@ int      proc_suspend(uint32_t pid);
 int      proc_resume(uint32_t pid);
 int      proc_set_priority(uint32_t pid, int prio);
 int      proc_list(proc_info_t *out, int max);
+int      proc_wait(uint32_t pid, int *code);    /* blocks until it exits */
+uint32_t proc_parent(uint32_t pid);
+void     proc_set_note(const char *note);
+int      user_stdin_read(char *buf, size_t max);
+int64_t  sys_unix_time(void);
+void     user_stdin_push(const char *text, size_t len);   /* Terminal -> program */
+void     user_set_foreground(uint32_t pid);
+uint32_t user_foreground(void);
+int      vfs_lseek(int fd, int64_t off, int whence);
 void     kthread_sleep(uint32_t ticks);     /* 1 tick = 10 ms */
 
 /* Synchronisation */
@@ -488,8 +634,19 @@ void    kthread_yield(void); /* voluntary yield — promotes priority by one lev
  * this size must go through kmalloc_large()/kfree_large() instead of
  * kmalloc()/kfree() — they are not interchangeable allocators. */
 #define LARGE_ALLOC_THRESHOLD (1UL * 1024 * 1024) /* 1 MB */
+size_t  klog_read(char *out, size_t n);     /* recent kernel messages (dmesg) */
 void   *kmalloc_large(size_t size);
 void    kfree_large(void *ptr, size_t size);
+
+/* Pictures (kernel/image.c): PNG, baseline JPEG, BMP -> 0x00RRGGBB. */
+#define IMAGE_MAX_PIXELS (24L * 1024 * 1024)
+typedef struct { int w, h; uint32_t *px; } image_t;
+int  image_decode(const uint8_t *data, size_t len, image_t *img, char *err, size_t errn);
+int  image_load(const char *path, image_t *img, char *err, size_t errn);
+void image_free(image_t *img);
+void image_scale(const image_t *src, uint32_t *dst, int dw, int dh);   /* bilinear */
+int  image_save_png(const char *path, const uint32_t *px, int w, int h);
+int  image_is_picture_name(const char *name);
 
 /* IPC */
 typedef enum {

@@ -162,6 +162,8 @@ ipc_message_t ipc_recv_type(uint8_t type)
 
 typedef struct process {
     uint32_t       pid;             /* 0 = slot free */
+    const char    *note;            /* what it waits for besides locks (keyboard, child) */
+    uint32_t       ppid;            /* parent (who started it) */
     proc_prio_t    priority;
     proc_state_t   state;
     uint32_t       flags;           /* PROC_FLAG_* */
@@ -405,6 +407,7 @@ uint32_t proc_spawn(const char *name, void (*fn)(void), int prio, uint32_t flags
     /* everything except the (large) stack */
     memset(p, 0, offsetof(process_t, stack));
     p->pid = next_pid++;
+    p->ppid = current_proc ? current_proc->pid : 0;
     p->priority = (proc_prio_t)prio;
     p->flags = flags;
     p->entry = fn;
@@ -474,6 +477,63 @@ uint32_t kthread_current_pid(void)
     return current_proc ? current_proc->pid : 0;
 }
 
+/* Exit codes of finished processes, kept until the parent collects them
+ * with proc_wait() (or until 32 newer exits push them out). */
+#define EXIT_RECORDS 32
+static struct { uint32_t pid, ppid; int code; } g_exits[EXIT_RECORDS];
+static int g_exit_next = 0;
+
+static void record_exit(process_t *p, int code)
+{
+    g_exits[g_exit_next].pid = p->pid;
+    g_exits[g_exit_next].ppid = p->ppid;
+    g_exits[g_exit_next].code = code;
+    g_exit_next = (g_exit_next + 1) % EXIT_RECORDS;
+}
+
+/* Wait until process `pid` has finished; returns its exit code, or -1 if
+ * there is no such process (or its code is no longer known). */
+int proc_wait(uint32_t pid, int *code)
+{
+    proc_set_note("program to finish");
+    for (;;) {
+        uint64_t irq = irq_save();
+        int alive = proc_by_pid(pid) != NULL;
+        if (!alive) {
+            for (int i = 0; i < EXIT_RECORDS; i++) {
+                if (g_exits[i].pid == pid) {
+                    if (code) *code = g_exits[i].code;
+                    g_exits[i].pid = 0;
+                    irq_restore(irq);
+                    proc_set_note(0);
+                    return 0;
+                }
+            }
+            irq_restore(irq);
+            proc_set_note(0);
+            return -1;
+        }
+        irq_restore(irq);
+        kthread_sleep(2);
+    }
+}
+
+/* Shown in Task Manager as "Waiting: <note>" while it is set. */
+void proc_set_note(const char *note)
+{
+    process_t *p = proc_by_pid(kthread_current_pid());
+    if (p) p->note = note;
+}
+
+uint32_t proc_parent(uint32_t pid)
+{
+    process_t *p = proc_by_pid(pid);
+    if (p) return p->ppid;
+    for (int i = 0; i < EXIT_RECORDS; i++)       /* finished, not yet waited for */
+        if (g_exits[i].pid == pid) return g_exits[i].ppid;
+    return 0;
+}
+
 /* Release everything a dying process holds so nobody waits on it forever. */
 static void proc_release_resources(process_t *p)
 {
@@ -502,6 +562,7 @@ void kthread_exit(uint64_t exit_code)
     if (current_proc && !(current_proc->flags & PROC_FLAG_SYSTEM)) {
         terminal_printf("[SCHED] Process exited: %s (PID %u, code %llu)\n",
             current_proc->name, current_proc->pid, exit_code);
+        record_exit(current_proc, (int)exit_code);
         proc_release_resources(current_proc);
         current_proc->state = PROC_ZOMBIE;
     }
@@ -557,6 +618,7 @@ void proc_fault_exit(const char *reason)
     __asm__ volatile ("cli");
     terminal_printf("[FAULT] %s\n", reason);
     sched_note(reason);
+    record_exit(current_proc, 139);         /* crashed */
     proc_release_resources(current_proc);
     current_proc->state = PROC_ZOMBIE;
     for (;;)
@@ -580,6 +642,7 @@ int proc_kill(uint32_t pid)
 
     /* Not on the CPU (single core), so it can be removed on the spot. */
     terminal_printf("[SCHED] Process killed: %s (PID %u)\n", p->name, p->pid);
+    record_exit(p, 137);                    /* like a shell reports a killed program */
     proc_release_resources(p);
     p->state = PROC_ZOMBIE;
     p->pid = 0;
@@ -644,12 +707,19 @@ int proc_list(proc_info_t *out, int max)
         proc_info_t *o = &out[n++];
         memset(o, 0, sizeof(*o));
         o->pid = p->pid;
+        o->ppid = p->ppid;
         o->priority = (int)p->priority;
         o->state = (int)p->state;
         o->flags = p->flags;
         o->suspended = p->suspended;
         o->cpu_ticks = p->cpu_ticks;
         o->start_tick = p->start_tick;
+        if (p->vm_space) {                  /* memory the process's own pages use */
+            vm_space_info_t vi[32];
+            int nv = vm_space_list(vi, 32);
+            for (int k = 0; k < nv; k++)
+                if (vi[k].id == p->vm_space) o->mem_kb = vi[k].resident_pages * 4;
+        }
         strncpy(o->name, p->name, sizeof(o->name) - 1);
 
         if (p->state == PROC_BLOCKED && p->wait_kind == PROC_WAIT_MUTEX)
@@ -658,6 +728,8 @@ int proc_list(proc_info_t *out, int max)
             strncpy(o->waiting_on, semaphores[p->wait_id].name, sizeof(o->waiting_on) - 1);
         else if (p->state == PROC_BLOCKED && p->wait_kind == PROC_WAIT_MAIL)
             strncpy(o->waiting_on, "message", sizeof(o->waiting_on) - 1);
+        else if (p->note)
+            strncpy(o->waiting_on, p->note, sizeof(o->waiting_on) - 1);
     }
     irq_restore(irq);
     return n;

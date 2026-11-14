@@ -27,7 +27,7 @@ ISO_OUT := build/jarvis.iso
 
 KERNEL_CORE := kernel/kernel_core.o
 BOOT_OBJS := boot/multiboot2.o
-DRIVER_OBJS := drivers/ahci.o drivers/audio.o drivers/gpu.o drivers/input.o \
+DRIVER_OBJS := drivers/ahci.o drivers/audio.o drivers/gpu.o drivers/font_aa.o drivers/input.o \
                drivers/nic.o drivers/pci.o drivers/usb.o
 # desktop_init.c is a unity-style desktop bundle: it includes the taskbar,
 # theme, notifications, input queue, animations, and built-in apps. Compile
@@ -42,7 +42,7 @@ EXTRA_OBJS := kernel/syscall_entry.o user/programs.o
 
 # User-mode programs (ring 3). Built as static ELF files and bundled into
 # the kernel image, which installs them in /jarvis/bin at boot.
-USER_PROGS  := hello counter kernelpoke privileged
+USER_PROGS  := hello counter kernelpoke privileged ask launcher
 USER_ELFS   := $(USER_PROGS:%=user/%.elf)
 USER_CFLAGS := -std=c17 -ffreestanding -nostdlib -static -fno-pic -no-pie \
                -mcmodel=large -mgeneral-regs-only -fno-stack-protector -O2 \

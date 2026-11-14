@@ -78,6 +78,7 @@ static struct {
     int   *rows; int row_count, row_cap;    /* index where each visual row starts */
     int    layout_cols, layout_dirty;
     int    scroll_row, scroll_x;
+    int    free_scroll;         /* wheel moved the view away from the caret */
     int    wrap, status_bar;
     int    dragging, scroll_dragging;
     uint32_t last_click_tick; int last_click_pos;
@@ -802,7 +803,7 @@ static void draw_field(int x, int y, int w, const char *label, const char *text,
     fb_fill_rounded_rect(fx, y, w, 26, 4, T(INPUT));
     fb_draw_rounded_rect(fx, y, w, 26, 4, focused ? T(ACCENT) : T(BORDER));
     ui_text_fit(fx + 6, y + 5, w - 12, text, T(TEXT));
-    if (focused && 7 + len * 8 < w) fb_fill_rect(fx + 7 + len * 8, y + 5, 1, 16, T(TEXT));
+    if (focused && 7 + fb_text_width_n(text, len) < w) fb_fill_rect(fx + 7 + fb_text_width_n(text, len), y + 5, 1, 16, T(TEXT));
 }
 
 static void draw_find_bar(int x, int y, int w)
@@ -884,7 +885,7 @@ static void draw_dialog(int x, int y, int w, int h)
         fb_fill_rounded_rect(fx, py + ph - 82, pw - 120, 26, 4, T(INPUT));
         fb_draw_rounded_rect(fx, py + ph - 82, pw - 120, 26, 4, T(ACCENT));
         fb_draw_text(px + 16, py + ph - 76, "File name", T(TEXT_DIM));
-        fb_fill_rect(fx + 5, py + ph - 77, np.dlg_name_len * 8 + 2, 16, T(ACCENT));
+        fb_fill_rect(fx + 5, py + ph - 77, fb_text_width_n(np.dlg_name, np.dlg_name_len) + 2, 16, T(ACCENT));
         ui_text_fit(fx + 6, py + ph - 77, pw - 132, np.dlg_name, T(ACCENT_TEXT));
     } else {
         draw_field(px + 16, py + ph - 82, pw - 120, "File name", np.dlg_name, np.dlg_name_len, 1);
@@ -910,7 +911,9 @@ void notepad_draw_callback(wm_window_t *win, uint32_t *framebuffer)
     if (np.find_open) draw_find_bar(x, y + NP_MENU_H, w);
 
     /* text */
-    keep_caret_visible(rows, cols);
+    if (!np.free_scroll) keep_caret_visible(rows, cols);
+    if (np.scroll_row > np.row_count - 1) np.scroll_row = np.row_count > 0 ? np.row_count - 1 : 0;
+    if (np.scroll_row < 0) np.scroll_row = 0;
     fb_fill_rect(x + ta.x, y + ta.y, ta.w + NP_SCROLL_W, ta.h, T(INPUT));
     fb_clip_t saved = fb_get_clip();
     fb_set_clip(x + ta.x, y + ta.y, ta.w, ta.h);
@@ -1123,6 +1126,14 @@ void notepad_event_callback(wm_window_t *win, wm_input_event_t *event)
     np_rect_t ta = text_area(w, h);
     int cols = text_cols(w), rows = text_rows(h);
     layout(cols);
+    if (event->type == IE_MOUSE_WHEEL && !np.dialog) {
+        np.scroll_row -= event->data.mouse.button;
+        if (np.scroll_row > np.row_count - rows) np.scroll_row = np.row_count - rows;
+        if (np.scroll_row < 0) np.scroll_row = 0;
+        np.free_scroll = 1;
+        return;
+    }
+    if (event->type == IE_KEY_DOWN || event->type == IE_TEXT_INPUT || event->type == IE_MOUSE_DOWN) np.free_scroll = 0;
 
     if (np.dialog) { dialog_event(event, w, h); return; }
 

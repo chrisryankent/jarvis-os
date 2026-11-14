@@ -271,7 +271,7 @@ static int ac97_init(pci_device_t *dev)
     terminal_printf("[AUDIO] AC97 mixer I/O 0x%x, bus-master I/O 0x%x\n",
         ac97_nam_base, ac97_nabm_base);
 
-    if (ac97_alloc_dma() != 0)
+    if (!ac97_out_bdl_phys && ac97_alloc_dma() != 0)    /* once: a restart reuses it */
         return -1;
 
     audio_outl((uint16_t)(ac97_nabm_base + AC97_GLOB_CNT), 0x00000002);
@@ -317,6 +317,21 @@ static int ac97_init(pci_device_t *dev)
     g_kstate.speaker_ready = 1;
     terminal_puts("[AUDIO] AC97 capture/playback DMA ready\n");
     return 0;
+}
+
+/* Device Manager "Restart device": stop both DMA engines, reset the codec
+ * and program everything again. Volume and mute settings are re-applied. */
+int audio_restart(void)
+{
+    if (!ac97_nam_base) return -1;
+    pci_device_t *ac97 = pci_find_class(0x04, 0x01);
+    if (!ac97) return -1;
+    ac97_ready = 0;
+    ac97_bm_write8(AC97_PI_CR, 0);
+    ac97_bm_write8(AC97_PO_CR, 0);
+    int rc = ac97_init(ac97);
+    terminal_printf("[AUDIO] Restarted by Device Manager: %s\n", rc ? "failed" : "ok");
+    return rc;
 }
 
 /* ---- Audio driver init -------------------------------------------------- */
@@ -597,9 +612,12 @@ static int16_t float_to_i16(float s)
     return (int16_t)(s * 32767.0f);
 }
 
+static int g_audio_disabled = 0;         /* Device Manager */
+static int g_audio_volume = 80;
+
 static void ac97_queue_playback(const float *buf, size_t frames)
 {
-    if (!ac97_ready || !buf || frames == 0)
+    if (!ac97_ready || g_audio_disabled || !buf || frames == 0)
         return;
 
     uint8_t civ = ac97_bm_read8(AC97_PO_CIV) & (AC97_BDL_COUNT - 1);
@@ -700,6 +718,8 @@ void audio_set_volume(int percent)
 {
     if (percent < 0)   percent = 0;
     if (percent > 100) percent = 100;
+    g_audio_volume = percent;
+    if (g_audio_disabled) percent = 0;
     terminal_printf("[AUDIO] Volume set to %d%%\n", percent);
     if (ac97_ready) {
         /* AC97 master and PCM out: 6-bit attenuation per channel (0 = loudest,
@@ -714,3 +734,13 @@ void audio_set_volume(int percent)
      * Verb: SET_AMPLIFIER_GAIN_MUTE (0x3) with payload = volume level.
      */
 }
+
+/* Device Manager: a disabled sound card plays nothing and is muted. */
+void audio_set_enabled(int on)
+{
+    int vol = g_audio_volume;
+    g_audio_disabled = on ? 0 : 1;
+    audio_set_volume(vol);
+    g_audio_volume = vol;
+}
+int audio_is_enabled(void) { return !g_audio_disabled; }

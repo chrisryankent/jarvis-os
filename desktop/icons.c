@@ -177,6 +177,62 @@ void icon_draw(icon_id_t icon, int x, int y, int size)
         ic_rect(&c, 13, 16, 4, 4, 0x00FFB900);
         break;
 
+    case ICON_DISKS:
+        ic_rr(&c, 2, 9, 20, 11, 2, 0x007A8892);
+        ic_rr(&c, 3, 10, 18, 7, 1, 0x00B8C4CC);
+        ic_circle(&c, 18, 14, 1, 0x0040D080);
+        ic_circle(&c, 9, 7, 6, 0x003A7BD5);
+        ic_rect(&c, 9, 1, 6, 6, 0x0060CDFF);
+        break;
+
+    case ICON_DEVICES:
+        ic_rr(&c, 5, 5, 14, 14, 2, 0x00384858);
+        ic_rr(&c, 8, 8, 8, 8, 1, 0x0046D3C6);
+        for (int k = 0; k < 3; k++) {
+            ic_rect(&c, 7 + k * 4, 2, 2, 3, 0x009AA7B0);
+            ic_rect(&c, 7 + k * 4, 19, 2, 3, 0x009AA7B0);
+            ic_rect(&c, 2, 7 + k * 4, 3, 2, 0x009AA7B0);
+            ic_rect(&c, 19, 7 + k * 4, 3, 2, 0x009AA7B0);
+        }
+        break;
+
+    case ICON_PHOTOS:
+        ic_rr(&c, 2, 4, 20, 16, 3, 0x003A7BD5);
+        ic_rr(&c, 4, 6, 16, 12, 2, 0x0090D0FF);
+        ic_circle(&c, 15, 9, 2, 0x00FFE070);
+        ic_line(&c, 4, 17, 10, 10, 0x002E8B57);
+        ic_line(&c, 10, 10, 14, 15, 0x002E8B57);
+        ic_line(&c, 13, 14, 16, 12, 0x002E8B57);
+        ic_line(&c, 16, 12, 20, 17, 0x002E8B57);
+        ic_rect(&c, 4, 16, 16, 2, 0x002E8B57);
+        break;
+
+    case ICON_REGEDIT:                                  /* blue cubes, like regedit */
+        ic_rr(&c, 3, 11, 9, 9, 1, 0x002F6FD0);
+        ic_rr(&c, 12, 11, 9, 9, 1, 0x003A8EE8);
+        ic_rr(&c, 7, 2, 9, 9, 1, 0x0060B0FF);
+        ic_rect(&c, 5, 13, 5, 2, 0x00A0D0FF);
+        ic_rect(&c, 14, 13, 5, 2, 0x00A0D0FF);
+        ic_rect(&c, 9, 4, 5, 2, 0x00E0F0FF);
+        break;
+
+    case ICON_BROWSER:
+        ic_circle(&c, 12, 12, 10, 0x001A73E8);
+        ic_circle(&c, 12, 12, 8, 0x0034A0F0);
+        ic_ring(&c, 12, 12, 8, 7, 0x00D0E8FF);
+        ic_rect(&c, 4, 11, 16, 1, 0x00D0E8FF);
+        ic_rect(&c, 11, 4, 2, 16, 0x00D0E8FF);
+        ic_ring(&c, 12, 12, 5, 4, 0x00D0E8FF);
+        break;
+
+    case ICON_CLOCK:
+        ic_circle(&c, 12, 12, 10, 0x003A7BD5);
+        ic_circle(&c, 12, 12, 8, 0x00F4F7FA);
+        ic_rect(&c, 11, 6, 2, 7, 0x00243442);
+        ic_line(&c, 12, 12, 16, 15, 0x00243442);
+        ic_circle(&c, 12, 12, 1, 0x00E04040);
+        break;
+
     case ICON_TRASH:
         ic_rect(&c, 9, 2, 6, 2, 0x008896A0);
         ic_rr(&c, 4, 4, 16, 3, 1, 0x00B8C4CC);
@@ -212,6 +268,42 @@ void glyph_draw(glyph_id_t glyph, int x, int y, int size, uint32_t fg, uint32_t 
     ic_t c = { x, y, size };
 
     switch (glyph) {
+    case GLYPH_SUN:
+        ic_circle(&c, 12, 12, 5, fg);
+        for (int k = 0; k < 8; k++) {
+            static const int dx[8] = { 0, 6, 8, 6, 0, -6, -8, -6 }, dy[8] = { -8, -6, 0, 6, 8, 6, 0, -6 };
+            ic_line(&c, 12 + dx[k] * 9 / 8, 12 + dy[k] * 9 / 8, 12 + dx[k] * 11 / 8, 12 + dy[k] * 11 / 8, fg);
+        }
+        break;
+
+    case GLYPH_MOON:
+        ic_circle(&c, 11, 12, 9, fg);
+        ic_circle(&c, 16, 8, 8, bg);
+        break;
+
+    case GLYPH_PLANE:
+        ic_line(&c, 12, 2, 12, 20, fg);
+        ic_line(&c, 11, 2, 11, 20, fg);
+        ic_line(&c, 3, 13, 12, 8, fg);
+        ic_line(&c, 21, 13, 12, 8, fg);
+        ic_line(&c, 7, 21, 12, 18, fg);
+        ic_line(&c, 17, 21, 12, 18, fg);
+        break;
+
+    case GLYPH_CONTRAST:
+        ic_ring(&c, 12, 12, 9, 7, fg);
+        ic_rect(&c, 12, 4, 6, 16, fg);
+        ic_circle(&c, 12, 12, 7, fg);
+        ic_rect(&c, 5, 4, 7, 16, bg);
+        ic_ring(&c, 12, 12, 9, 7, fg);
+        break;
+
+    case GLYPH_CAMERA:
+        ic_rr(&c, 2, 7, 20, 13, 2, fg);
+        ic_rect(&c, 8, 4, 8, 4, fg);
+        ic_ring(&c, 12, 13, 5, 3, bg);
+        break;
+
     case GLYPH_SEARCH:
         ic_ring(&c, 10, 10, 7, 5, fg);
         ic_line(&c, 15, 15, 21, 21, fg);
@@ -323,26 +415,14 @@ void ui_text_center(int x, int y, int w, const char *text, uint32_t fg)
 
 void ui_text_fit(int x, int y, int max_w, const char *text, uint32_t fg)
 {
-    char buf[160];
-    int max_chars = max_w / 8;
-    int len = (int)strlen(text);
-
-    if (max_chars <= 0)
-        return;
-    if (len <= max_chars) {
-        fb_draw_text(x, y, text, fg);
-        return;
-    }
-    if (max_chars > (int)sizeof(buf) - 1)
-        max_chars = (int)sizeof(buf) - 1;
-
-    memcpy(buf, text, (size_t)max_chars);
-    if (max_chars >= 3) {
-        buf[max_chars - 2] = '.';
-        buf[max_chars - 1] = '.';
-    }
-    buf[max_chars] = 0;
-    fb_draw_text(x, y, buf, fg);
+    if (max_w <= 0 || !text) return;
+    if (fb_text_width(text) <= max_w) { fb_draw_text(x, y, text, fg); return; }
+    /* Longest prefix that still fits with an ellipsis after it. */
+    int ell = fb_text_width(SYM_ELLIPSIS);
+    int n = (int)strlen(text);
+    while (n > 0 && fb_text_width_n(text, n) + ell > max_w) n--;
+    int end = fb_text_n(x, y, text, n, fg, FONT_UI);
+    fb_draw_text(end, y, SYM_ELLIPSIS, fg);
 }
 
 void ui_button(int x, int y, int w, int h, const char *label,

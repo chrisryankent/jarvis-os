@@ -34,6 +34,7 @@
 void notepad_open_file(const char *path);       /* apps/notepad.c */
 void desktop_files_changed(void);               /* desktop/desktop.c */
 void apps_store_show_install(const char *path); /* apps/store.c */
+void shell_open_path(const char *p);            /* apps/shell.c */
 
 #define FX_MAX_FILES   256
 #define FX_PATH_LEN    200
@@ -79,6 +80,7 @@ static struct {
     int shown_count;
     int selected;                           /* index into shown[] (or This PC tiles), -1 = none */
     int scroll;
+    int free_scroll;            /* wheel moved the view: don't snap back to the selection */
     int view, sort, sort_desc;
 
     char back[FX_HISTORY][FX_PATH_LEN]; int back_n;
@@ -482,11 +484,11 @@ static void fx_open_entry(fx_file_entry_t *e)
         desktop_app_launch(desktop_app_find("Terminal"));
         if (!user_exec(e->path)) fx_toast("Run", "The program could not be started.");
         break;
-    case KIND_IMAGE: case KIND_AUDIO: case KIND_MODEL:
+    case KIND_AUDIO: case KIND_MODEL:
         fx_toast(e->name, "There is no app for this kind of file yet.");
         break;
     default:
-        notepad_open_file(e->path);            /* it says so itself if it is not text */
+        shell_open_path(e->path);              /* the app registered in HKEY_CLASSES_ROOT */
         break;
     }
 }
@@ -834,7 +836,7 @@ static void fx_draw_toolbar(int x, int y, int w)
     fx.crumb_count = 0;
     if (fx.addr_focus) {
         ui_text_fit(ax + 10, y + 15, aw - 20, fx.addr, T(TEXT));
-        int cx = ax + 10 + fx.addr_len * 8;
+        int cx = ax + 10 + fb_text_width_n(fx.addr, fx.addr_len);
         if (cx < ax + aw - 6) fb_fill_rect(cx, y + 15, 1, 16, T(TEXT));
     } else {
         /* This PC > Local Disk > data > projects */
@@ -880,7 +882,7 @@ static void fx_draw_toolbar(int x, int y, int w)
     glyph_draw(GLYPH_SEARCH, sx + 8, y + 15, 16, T(TEXT_DIM), T(INPUT));
     if (fx.search_len || fx.search_focus) {
         ui_text_fit(sx + 30, y + 15, 160, fx.search, T(TEXT));
-        if (fx.search_focus) fb_fill_rect(sx + 31 + fx.search_len * 8, y + 15, 1, 16, T(TEXT));
+        if (fx.search_focus) fb_fill_rect(sx + 31 + fb_text_width_n(fx.search, fx.search_len), y + 15, 1, 16, T(TEXT));
     } else {
         char name[64], hint[80];
         fx_location_name(fx.path, name, sizeof(name));
@@ -1045,11 +1047,11 @@ static void fx_draw_name(int x, int y, int box_w, fx_file_entry_t *e, int idx, u
     fb_fill_rect(x - 3, y - 3, box_w, 22, T(INPUT));
     fb_draw_rect(x - 3, y - 3, box_w, 22, T(ACCENT));
     if (fx.rename_fresh) {
-        int sw = fx.rename_len * 8 + 2;
+        int sw = fb_text_width_n(fx.rename_buf, fx.rename_len) + 2;
         fb_fill_rect(x - 1, y, sw < box_w - 4 ? sw : box_w - 4, 16, T(ACCENT));
     }
     ui_text_fit(x, y, box_w - 8, fx.rename_buf, fx.rename_fresh ? T(ACCENT_TEXT) : T(TEXT));
-    if (!fx.rename_fresh) fb_fill_rect(x + 1 + fx.rename_len * 8, y, 1, 16, T(TEXT));
+    if (!fx.rename_fresh) fb_fill_rect(x + 1 + fb_text_width_n(fx.rename_buf, fx.rename_len), y, 1, 16, T(TEXT));
 }
 
 static void fx_draw_details(fx_rect_t c, int ox, int oy)
@@ -1071,7 +1073,9 @@ static void fx_draw_details(fx_rect_t c, int ox, int oy)
     }
 
     int rows = fx_visible_rows(c);
-    if (fx.selected >= 0) {
+    if (fx.scroll > fx.shown_count - rows) fx.scroll = fx.shown_count - rows;
+    if (fx.scroll < 0) fx.scroll = 0;
+    if (fx.selected >= 0 && !fx.free_scroll) {
         if (fx.selected < fx.scroll) fx.scroll = fx.selected;
         if (fx.selected >= fx.scroll + rows) fx.scroll = fx.selected - rows + 1;
     }
@@ -1098,7 +1102,10 @@ static void fx_draw_icons(fx_rect_t c, int ox, int oy)
 {
     int cols = fx_icon_cols(c), rows = c.h / CELL_H;
     if (rows < 1) rows = 1;
-    if (fx.selected >= 0) {
+    int total_rows = (fx.shown_count + cols - 1) / cols;
+    if (fx.scroll > total_rows - rows) fx.scroll = total_rows - rows;
+    if (fx.scroll < 0) fx.scroll = 0;
+    if (fx.selected >= 0 && !fx.free_scroll) {
         int r = fx.selected / cols;
         if (r < fx.scroll) fx.scroll = r;
         if (r >= fx.scroll + rows) fx.scroll = r - rows + 1;
@@ -1290,6 +1297,15 @@ void explorer_event_callback(wm_window_t *win, wm_input_event_t *event)
     int x, y, w, h;
     wm_get_client(win, &x, &y, &w, &h);
     fx_rect_t c = fx_content_rect(w, h);
+
+    if (event->type == IE_MOUSE_WHEEL) {
+        int step = fx.view == VIEW_DETAILS ? event->data.mouse.button : (event->data.mouse.button > 0 ? 1 : -1);
+        fx.scroll -= step;
+        if (fx.scroll < 0) fx.scroll = 0;
+        fx.free_scroll = 1;
+        return;
+    }
+    if (event->type == IE_MOUSE_DOWN || event->type == IE_KEY_DOWN) fx.free_scroll = 0;
 
     if (fx.props_open) {
         if (event->type == IE_MOUSE_DOWN || event->type == IE_KEY_DOWN) fx.props_open = 0;

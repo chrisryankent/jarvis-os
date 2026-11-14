@@ -342,5 +342,5 @@ page_tables_end:
 
 section .boot.bss nobits align=16
 boot_stack:
-    resb 16384
+    resb 131072         ; the desktop (process 1) runs on this stack: keep it roomy
 boot_stack_top:

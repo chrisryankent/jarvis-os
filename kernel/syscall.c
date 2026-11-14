@@ -16,6 +16,7 @@
  */
 
 #include "kernel.h"
+#include "../desktop/ui.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -76,7 +77,7 @@ uint64_t syscall_handler(uint64_t nr,
     switch (nr) {
     case 0: /* read(fd, buf, len) */
         if (!user_ok(a2, a3, 1)) return E_FAULT;
-        if (a1 == 0) return 0;                      /* no keyboard input yet */
+        if (a1 == 0) return (uint64_t)(int64_t)user_stdin_read((char *)a2, (size_t)a3);  /* keyboard, via the Terminal */
         return (uint64_t)(int64_t)vfs_read((int)a1, (void *)a2, (size_t)a3);
 
     case 1: /* write(fd, buf, len) */
@@ -100,6 +101,47 @@ uint64_t syscall_handler(uint64_t nr,
 
     case 12: /* brk(addr) */
         return user_brk(a1);
+
+    case 8: /* lseek(fd, offset, whence) */
+        if (a1 < 3) return E_BADF;
+        { int r = vfs_lseek((int)a1, (int64_t)a2, (int)a3); return r < 0 ? E_INVAL : (uint64_t)r; }
+
+    case 61: /* wait4(pid, int *status, ...) : wait for a child to finish */
+    {
+        int code = 0;
+        if (a2 && !user_ok(a2, 4, 1)) return E_FAULT;
+        if (!a1 || proc_parent((uint32_t)a1) != kthread_current_pid()) return (uint64_t)-10; /* ECHILD */
+        if (proc_wait((uint32_t)a1, &code) != 0) return (uint64_t)-10;
+        if (a2) *(int *)a2 = code;
+        return a1;
+    }
+
+    case 62: /* kill(pid, sig): a program may end itself or its own children */
+        if (a1 != kthread_current_pid() && proc_parent((uint32_t)a1) != kthread_current_pid()) return (uint64_t)-1; /* EPERM */
+        return proc_kill((uint32_t)a1) == 0 ? 0 : (uint64_t)-3;                                      /* ESRCH */
+
+    case 82: /* rename(from, to) */
+    {
+        char to[160];
+        if (user_string(path, sizeof(path), a1) != 0 || user_string(to, sizeof(to), a2) != 0) return E_FAULT;
+        if (vfs_is_private(path) || vfs_is_private(to)) return E_ACCES;
+        return vfs_rename(path, to) == 0 ? 0 : E_NOENT;
+    }
+
+    case 110: /* getppid() */
+        return proc_parent(kthread_current_pid());
+
+    case 201: /* time(NULL): seconds since 1970 (from the PC clock) */
+        return (uint64_t)sys_unix_time();
+
+    case 228: /* clock_gettime(clock, struct timespec *) : time since boot */
+    {
+        if (!user_ok(a2, 16, 1)) return E_FAULT;
+        uint64_t t = g_kstate.uptime_ticks;
+        ((uint64_t *)a2)[0] = a1 == 0 ? (uint64_t)sys_unix_time() : t / 100;
+        ((uint64_t *)a2)[1] = (t % 100) * 10000000ULL;
+        return 0;
+    }
 
     case 24: /* sched_yield() */
         kthread_yield();
@@ -170,6 +212,56 @@ uint64_t syscall_handler(uint64_t nr,
         ((char *)a1)[len] = '\0';
         return len;
     }
+
+    case 504: /* jarvis_notify(title, text) */
+    {
+        char title[64], text[160];
+        if (user_string(title, sizeof(title), a1) != 0 || user_string(text, sizeof(text), a2) != 0) return E_FAULT;
+        notification_show(title, text, NOTIF_INFO, 5000);
+        return 0;
+    }
+
+    case 520: /* spawn(path): start another program; returns its PID */
+    {
+        if (user_string(path, sizeof(path), a1) != 0) return E_FAULT;
+        if (vfs_is_private(path)) return E_ACCES;
+        uint32_t pid = user_exec(path);
+        return pid ? pid : E_NOENT;
+    }
+
+    case 521: /* listdir(path, buf, max): "d name" / "f name size" lines */
+    {
+        static char listing[16384];
+        if (user_string(path, sizeof(path), a1) != 0 || !user_ok(a2, a3, 1) || !a3) return E_FAULT;
+        if (vfs_is_private(path)) return E_ACCES;
+        if (!vfs_is_dir(path) || vfs_list(path, listing, sizeof(listing)) < 0) return E_NOENT;
+        size_t dl = strlen(path), out = 0;
+        char *dst = (char *)a2;
+        for (const char *q = listing; *q;) {
+            const char *eol = strchr(q, '\n');
+            if (!eol) eol = q + strlen(q);
+            const char *full = strchr(q, '/');
+            if (full && full < eol && (size_t)(eol - full) > dl + 1 && !strncmp(full, path, dl) && full[dl] == '/' &&
+                !memchr(full + dl + 1, '/', (size_t)(eol - full) - dl - 1) && strncmp(full, "/jarvis/system", 14)) {
+                char line[200], fp[160];
+                size_t fl = (size_t)(eol - full) < 159 ? (size_t)(eol - full) : 159;
+                memcpy(fp, full, fl); fp[fl] = 0;
+                int n = !strncmp(q, "[dir]", 5) ? snprintf(line, sizeof(line), "d %s\n", fp + dl + 1)
+                                                 : snprintf(line, sizeof(line), "f %s %ld\n", fp + dl + 1, vfs_size(fp));
+                if (out + (size_t)n + 1 > a3) break;
+                memcpy(dst + out, line, (size_t)n);
+                out += (size_t)n;
+            }
+            q = *eol ? eol + 1 : eol;
+        }
+        dst[out] = 0;
+        return out;
+    }
+
+    case 522: /* filesize(path) */
+        if (user_string(path, sizeof(path), a1) != 0) return E_FAULT;
+        if (vfs_is_private(path)) return E_ACCES;
+        { long s = vfs_size(path); return s < 0 ? E_NOENT : (uint64_t)s; }
 
     case 510: /* device_claim(id): exclusive use of a device */
         return devmgr_claim((int)a1, kthread_current_pid()) == 0 ? 0 : (uint64_t)-16;   /* EBUSY */

@@ -193,7 +193,7 @@ void calculator_draw_callback(wm_window_t *win, uint32_t *framebuffer)
     }
     const char *shown = g_calc.error ? "Cannot divide by 0" : g_calc.entry;
     int scale = g_calc.error ? 1 : 2;
-    fb_draw_text_scaled(x + w - 16 - fb_text_width(shown) * scale, y + 44, shown,
+    fb_draw_text_scaled(x + w - 16 - fb_text_width_scaled(shown, scale), y + 44, shown,
                         g_calc.error ? T(DANGER) : T(TEXT), scale);
 
     for (int r = 0; r < 5; r++) {

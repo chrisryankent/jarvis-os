@@ -52,6 +52,8 @@ typedef enum {
 #define WM_KEY_F1         0x110   /* F1..F12 = 0x110..0x11B */
 #define WM_KEY_F4         0x113
 #define WM_KEY_SUPER_TAP  0x120   /* Super/Windows key tapped on its own */
+#define WM_KEY_INSERT     0x10C
+#define WM_KEY_PRTSC      0x121   /* Print Screen */
 
 /* ---- Input Events -------------------------------------------------------- */
 typedef enum {

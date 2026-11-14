@@ -21,6 +21,8 @@ static void fb_setup_backbuffer(void);
 /* ---- Framebuffer descriptor ---------------------------------------------- */
 typedef struct {
     uint32_t *base;      /* virtual address of framebuffer pixels       */
+    uint64_t  phys;      /* physical address (for re-mapping on a mode change) */
+    size_t    mapped;    /* bytes mapped at base                         */
     uint32_t  width;
     uint32_t  height;
     uint32_t  pitch;     /* bytes per row (may have padding)             */
@@ -162,6 +164,8 @@ static int gpu_try_qemu_stdvga_fallback(void)
     g_fb.height = height;
     g_fb.pitch = pitch;
     g_fb.bpp = 32;
+    g_fb.phys = fb_phys;
+    g_fb.mapped = fb_size;
 
     terminal_printf("[GPU] QEMU stdvga framebuffer: %ux%u phys=0x%llx vaddr=%p\n",
         g_fb.width, g_fb.height, fb_phys, (void *)g_fb.base);
@@ -215,6 +219,8 @@ void gpu_framebuffer_init(void)
             g_fb.height = gop->height;
             g_fb.pitch  = gop->pitch;
             g_fb.bpp    = (uint8_t)gop->bpp;
+            g_fb.phys   = gop->fb_base;
+            g_fb.mapped = fb_size;
 
             terminal_printf("[GPU] ✓ Framebuffer: %ux%u at vaddr %p (%zu KB)\n",
                 g_fb.width, g_fb.height, (void *)g_fb.base,
@@ -244,6 +250,21 @@ static uint32_t *g_back   = NULL;   /* off-screen buffer, NULL if alloc failed *
 static uint32_t *g_draw   = NULL;   /* where primitives draw                   */
 static uint32_t  g_stride = 0;      /* pixels per row of g_draw                */
 static fb_clip_t g_clip;
+
+/* Brightness and night light: applied while copying to the screen, so the
+ * back buffer (and screenshots) keep the true colours. */
+static inline void copy32(uint32_t *dst, const uint32_t *src, size_t n);
+static uint8_t g_lut[3][256];
+static int g_filter_on = 0;
+
+static void copy_filtered(uint32_t *dst, const uint32_t *src, size_t n)
+{
+    if (!g_filter_on) { copy32(dst, src, n); return; }
+    for (size_t i = 0; i < n; i++) {
+        uint32_t p = src[i];
+        dst[i] = ((uint32_t)g_lut[0][(p >> 16) & 255] << 16) | ((uint32_t)g_lut[1][(p >> 8) & 255] << 8) | g_lut[2][p & 255];
+    }
+}
 
 static int g_cur_x = 0, g_cur_y = 0;
 static int g_cur_visible = 1;
@@ -519,30 +540,96 @@ void fb_fill_ring(int cx, int cy, int r_out, int r_in, uint32_t color)
     }
 }
 
-/* ---- Text ---------------------------------------------------------------- */
-extern const uint8_t font8x16[256][16];   /* kernel/font8x16.c */
+/* ---- Text ----------------------------------------------------------------
+ * Anti-aliased faces pre-rendered by tools/gen_fonts.py (drivers/font_aa.c).
+ * A text "cell" keeps the old 8x16 geometry: y is the top of a 16 px line,
+ * so layouts written for the bitmap font still line up. The UI faces are
+ * proportional; FONT_MONO keeps an 8 px advance for terminals and editors.
+ */
+#include "font_aa.h"
+
+static const font_glyph_t *glyph_of(const font_face_t *f, unsigned char c)
+{
+    if (c >= 32 && c < 127) return &f->glyphs[c - 32];
+    if (c >= 0x80 && c < 0x80 + (FONT_GLYPHS - FONT_ASCII)) return &f->glyphs[FONT_ASCII + (c - 0x80)];
+    return &f->glyphs['?' - 32];
+}
+
+static void draw_glyph(const font_face_t *f, const font_glyph_t *g, int x, int y, uint32_t fg)
+{
+    if (!g->w || !g->h || !g_draw) return;
+    int gx = x + g->bx, gy = y + f->baseline + g->by;
+    if (gx >= g_clip.x1 || gy >= g_clip.y1 || gx + g->w <= g_clip.x0 || gy + g->h <= g_clip.y0) return;
+    const uint8_t *a = f->alpha + g->off;
+    for (int j = 0; j < g->h; j++, a += g->w) {
+        int yy = gy + j;
+        if (yy < g_clip.y0 || yy >= g_clip.y1) continue;
+        uint32_t *line = g_draw + (size_t)yy * g_stride;
+        for (int i = 0; i < g->w; i++) {
+            uint32_t al = a[i];
+            int xx = gx + i;
+            if (!al || xx < g_clip.x0 || xx >= g_clip.x1) continue;
+            line[xx] = al == 255 ? fg : blend_px(fg, line[xx], al);
+        }
+    }
+}
+
+int fb_text_n(int px, int py, const char *str, int n, uint32_t fg, int font)
+{
+    if (!str || font < 0 || font >= FONT_COUNT) return px;
+    const font_face_t *f = &g_font_faces[font];
+    int pen = px * 64;
+    for (int i = 0; (n < 0 || i < n) && str[i]; i++) {
+        unsigned char c = (unsigned char)str[i];
+        if (c == '\n') { pen = px * 64; py += f->cell; continue; }
+        const font_glyph_t *g = glyph_of(f, c);
+        draw_glyph(f, g, (pen + 32) >> 6, py, fg);
+        pen += g->adv;
+    }
+    return (pen + 32) >> 6;
+}
+
+int fb_text(int px, int py, const char *str, uint32_t fg, int font)
+{
+    return fb_text_n(px, py, str, -1, fg, font);
+}
+
+int fb_text_width_n_font(const char *str, int n, int font)
+{
+    if (!str || font < 0 || font >= FONT_COUNT) return 0;
+    const font_face_t *f = &g_font_faces[font];
+    int pen = 0, best = 0;
+    for (int i = 0; (n < 0 || i < n) && str[i]; i++) {
+        if (str[i] == '\n') { if (pen > best) best = pen; pen = 0; continue; }
+        pen += glyph_of(f, (unsigned char)str[i])->adv;
+    }
+    if (pen > best) best = pen;
+    return (best + 32) >> 6;
+}
+
+int fb_text_width_font(const char *str, int font) { return fb_text_width_n_font(str, -1, font); }
+int fb_text_width(const char *str)                { return fb_text_width_n_font(str, -1, FONT_UI); }
+int fb_text_width_n(const char *str, int n)       { return fb_text_width_n_font(str, n, FONT_UI); }
+int fb_text_width_bold(const char *str)           { return fb_text_width_n_font(str, -1, FONT_UI_BOLD); }
+
+/* Index of the character boundary closest to pixel offset dx (caret hits). */
+int fb_text_index_at(const char *str, int dx, int font)
+{
+    if (!str || font < 0 || font >= FONT_COUNT) return 0;
+    const font_face_t *f = &g_font_faces[font];
+    int pen = 0, i = 0;
+    for (; str[i]; i++) {
+        int adv = glyph_of(f, (unsigned char)str[i])->adv;
+        if ((pen + adv / 2) >> 6 >= dx) break;
+        pen += adv;
+    }
+    return i;
+}
 
 void fb_draw_char(int px, int py, char c, uint32_t fg)
 {
-    if (!g_draw) return;
-    if (px + 8 <= g_clip.x0 || px >= g_clip.x1 ||
-        py + 16 <= g_clip.y0 || py >= g_clip.y1)
-        return;
-
-    const uint8_t *glyph = font8x16[(uint8_t)c];
-    for (int row = 0; row < 16; row++) {
-        uint8_t bits = glyph[row];
-        if (!bits) continue;
-        int y = py + row;
-        if (y < g_clip.y0 || y >= g_clip.y1) continue;
-        uint32_t *line = g_draw + (size_t)y * g_stride;
-        for (int col = 0; col < 8; col++) {
-            if (!(bits & (0x80 >> col))) continue;
-            int x = px + col;
-            if (x >= g_clip.x0 && x < g_clip.x1)
-                line[x] = fg;
-        }
-    }
+    const font_face_t *f = &g_font_faces[FONT_MONO];
+    draw_glyph(f, glyph_of(f, (unsigned char)c), px, py, fg);
 }
 
 void fb_put_char(int px, int py, char c, uint32_t fg, uint32_t bg)
@@ -553,64 +640,43 @@ void fb_put_char(int px, int py, char c, uint32_t fg, uint32_t bg)
 
 void fb_draw_text(int px, int py, const char *str, uint32_t fg)
 {
-    int x = px;
-    if (!str) return;
-    while (*str) {
-        if (*str == '\n') {
-            x = px;
-            py += 16;
-        } else {
-            fb_draw_char(x, py, *str, fg);
-            x += 8;
-        }
-        str++;
-    }
+    fb_text_n(px, py, str, -1, fg, FONT_UI);
 }
 
 void fb_draw_text_bold(int px, int py, const char *str, uint32_t fg)
 {
-    fb_draw_text(px, py, str, fg);
-    fb_draw_text(px + 1, py, str, fg);
+    fb_text_n(px, py, str, -1, fg, FONT_UI_BOLD);
+}
+
+void fb_draw_text_mono(int px, int py, const char *str, uint32_t fg)
+{
+    fb_text_n(px, py, str, -1, fg, FONT_MONO);
 }
 
 void fb_put_string(int px, int py, const char *str, uint32_t fg, uint32_t bg)
 {
     int x = px;
     if (!str) return;
-    while (*str) {
-        if (*str == '\n') {
-            x = px;
-            py += 16;
-        } else {
-            fb_put_char(x, py, *str, fg, bg);
-            x += 8;
-        }
-        str++;
+    for (; *str; str++) {
+        if (*str == '\n') { x = px; py += 16; continue; }
+        fb_put_char(x, py, *str, fg, bg);
+        x += 8;
     }
+}
+
+static int scaled_font(int scale)
+{
+    return scale <= 1 ? FONT_UI : scale == 2 ? FONT_TITLE : scale == 3 ? FONT_LARGE : FONT_DISPLAY;
 }
 
 void fb_draw_text_scaled(int px, int py, const char *str, uint32_t fg, int scale)
 {
-    if (!str) return;
-    if (scale <= 1) { fb_draw_text(px, py, str, fg); return; }
-
-    for (; *str; str++, px += 8 * scale) {
-        const uint8_t *glyph = font8x16[(uint8_t)*str];
-        for (int row = 0; row < 16; row++) {
-            uint8_t bits = glyph[row];
-            for (int col = 0; col < 8; col++)
-                if (bits & (0x80 >> col))
-                    fb_fill_rect(px + col * scale, py + row * scale, scale, scale, fg);
-        }
-    }
+    fb_text_n(px, py, str, -1, fg, scaled_font(scale));
 }
 
-int fb_text_width(const char *str)
+int fb_text_width_scaled(const char *str, int scale)
 {
-    int n = 0;
-    if (!str) return 0;
-    while (*str++) n++;
-    return n * 8;
+    return fb_text_width_n_font(str, -1, scaled_font(scale));
 }
 
 /* ---- Whole-frame operations ---------------------------------------------- */
@@ -690,8 +756,8 @@ static void cursor_erase(void)
         if (x0 < 0) x0 = 0;
         if (x1 > (int)g_fb.width) x1 = (int)g_fb.width;
         if (x1 <= x0) continue;
-        copy32(g_fb.base + (size_t)y * fstride + (size_t)x0,
-               g_back + (size_t)y * g_fb.width + (size_t)x0, (size_t)(x1 - x0));
+        copy_filtered(g_fb.base + (size_t)y * fstride + (size_t)x0,
+                      g_back + (size_t)y * g_fb.width + (size_t)x0, (size_t)(x1 - x0));
     }
     g_cur_drawn = 0;
 }
@@ -724,15 +790,91 @@ void fb_present(void)
     if (g_back) {
         uint32_t fstride = g_fb.pitch / 4;
         if (fstride == g_fb.width) {
-            copy32(g_fb.base, g_back, (size_t)g_fb.width * g_fb.height);
+            copy_filtered(g_fb.base, g_back, (size_t)g_fb.width * g_fb.height);
         } else {
             for (uint32_t y = 0; y < g_fb.height; y++)
-                copy32(g_fb.base + (size_t)y * fstride,
-                       g_back + (size_t)y * g_fb.width, g_fb.width);
+                copy_filtered(g_fb.base + (size_t)y * fstride,
+                              g_back + (size_t)y * g_fb.width, g_fb.width);
         }
     }
     g_cur_drawn = 0;
     cursor_paint();
+}
+
+/* ---- Display settings ---------------------------------------------------- */
+/* brightness 10..100 %, warmth 0..100 (night light: less blue, less green). */
+void fb_set_color_filter(int brightness, int warmth)
+{
+    if (brightness < 10) brightness = 10;
+    if (brightness > 100) brightness = 100;
+    if (warmth < 0) warmth = 0;
+    if (warmth > 100) warmth = 100;
+    int gain[3] = { 100, 100 - warmth * 22 / 100, 100 - warmth * 55 / 100 };
+    for (int c = 0; c < 3; c++)
+        for (int v = 0; v < 256; v++)
+            g_lut[c][v] = (uint8_t)(v * gain[c] / 100 * brightness / 100);
+    g_filter_on = brightness < 100 || warmth > 0;
+}
+
+/* Resolutions the Bochs/QEMU display adapter can switch to. Hardware that
+ * only has the firmware (GOP) framebuffer keeps the mode it booted with. */
+static const uint16_t g_modes[][2] = {
+    { 800, 600 }, { 1024, 768 }, { 1152, 864 }, { 1280, 720 }, { 1280, 800 }, { 1280, 1024 },
+    { 1366, 768 }, { 1440, 900 }, { 1600, 900 }, { 1680, 1050 }, { 1920, 1080 },
+};
+
+static int vbe_available(void)
+{
+    uint16_t id = bochs_vbe_read(BOCHS_VBE_INDEX_ID);
+    return id >= 0xB0C0 && id <= 0xB0C5 && g_fb.phys;
+}
+
+int fb_mode_count(void)
+{
+    return vbe_available() ? (int)(sizeof(g_modes) / sizeof(g_modes[0])) : 1;
+}
+
+void fb_mode_get(int i, int *w, int *h)
+{
+    if (!vbe_available() || i < 0 || i >= fb_mode_count()) { *w = (int)g_fb.width; *h = (int)g_fb.height; return; }
+    *w = g_modes[i][0]; *h = g_modes[i][1];
+}
+
+/* Switches the screen mode. The caller (the desktop) relays out afterwards.
+ * Returns 0 on success. */
+int fb_set_mode(int w, int h)
+{
+    if (!vbe_available()) return -1;
+    int ok = 0;
+    for (int i = 0; i < fb_mode_count(); i++)
+        if (g_modes[i][0] == w && g_modes[i][1] == h) ok = 1;
+    if (!ok) return -2;
+    if ((uint32_t)w == g_fb.width && (uint32_t)h == g_fb.height) return 0;
+
+    size_t need = (size_t)w * h * 4;
+    uint32_t *base = g_fb.base;
+    if (need > g_fb.mapped) {
+        base = (uint32_t *)vmm_map_range(g_fb.phys, need, VMM_PROT_RW | VMM_PROT_NOCACHE);
+        if (!base) return -3;
+    }
+    size_t old_bytes = (size_t)g_fb.width * g_fb.height * 4;
+    uint32_t *back = (uint32_t *)kmalloc_large(need);
+    if (!back) return -3;
+
+    if (!bochs_vbe_set_mode((uint16_t)w, (uint16_t)h, 32)) { kfree_large(back, need); return -1; }
+    if (need > g_fb.mapped) { g_fb.base = base; g_fb.mapped = need; }
+    if (g_back) kfree_large(g_back, old_bytes);
+    g_fb.width = (uint32_t)w;
+    g_fb.height = (uint32_t)h;
+    g_fb.pitch = (uint32_t)w * 4;
+    g_back = g_draw = back;
+    g_stride = (uint32_t)w;
+    fb_reset_clip();
+    if (g_cur_x >= w) g_cur_x = w - 1;
+    if (g_cur_y >= h) g_cur_y = h - 1;
+    g_cur_drawn = 0;
+    fb_clear(0);
+    return 0;
 }
 
 /* ---- Getters ------------------------------------------------------------- */

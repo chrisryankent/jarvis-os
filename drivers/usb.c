@@ -92,6 +92,7 @@ static int       g_dev_count = 0;
 static int       usb_ready = 0;
 static int       g_lock = -1;
 static uint8_t   g_port_tries[256];  /* failed set-up attempts per port */
+#define PORT_EJECTED 0xFE           /* stopped by the user; set up again when re-plugged or enabled */
 
 /* ---- Small helpers ------------------------------------------------------- */
 static uint32_t rd32(volatile uint8_t *base, uint32_t off) { return *(volatile uint32_t *)(base + off); }
@@ -561,7 +562,7 @@ static void usb_hotplug_process(void)
                 if (sc & (0x7Fu << 17)) wr32(g_op, off, (sc & PORT_RO_RWS) | (0x7Fu << 17));
                 continue;
             }
-            if (d || g_port_tries[p] >= 3) continue;        /* already set up / gave up */
+            if (d || g_port_tries[p] >= 3) continue;        /* already set up / gave up / ejected */
 
             if (port_bringup(p)) {
                 d = device_on_port(p);
@@ -578,6 +579,62 @@ static void usb_hotplug_process(void)
         for (int i = 0; i < na; i++) fatfs_mount_dev(added[i]);
         if (nr) scheduler_post_event("USB drive removed");
     }
+}
+
+/* Safe removal: tell the drive to stop (SCSI START STOP UNIT, eject), then
+ * release it. The port stays off until the drive is re-plugged or enabled
+ * again. Returns 0, or -1 if no USB device is on that port. */
+int usb_eject_port(int port)
+{
+    if (!usb_ready || port < 1 || port >= 256) return -1;
+    kmutex_lock(g_lock);
+    usb_dev_t *d = device_on_port(port);
+    int dev = d ? d->block_dev : -1;
+    kmutex_unlock(g_lock);
+    if (!d) return -1;
+
+    if (dev >= 0) {
+        fatfs_unmount_dev(dev);                     /* nothing reads it any more */
+        block_flush(dev);
+    }
+    kmutex_lock(g_lock);
+    d = device_on_port(port);
+    if (d) {
+        if (d->bulk_in_dci) {
+            uint8_t cdb[6] = { 0x1B, 0, 0, 0, 0x02, 0 };    /* START STOP UNIT: LoEj=1, Start=0 */
+            scsi(d, cdb, 6, 0, NULL, 0);
+        }
+        detach(d);
+        g_port_tries[port] = PORT_EJECTED;
+    }
+    kmutex_unlock(g_lock);
+    g_storage_generation++;
+    return 0;
+}
+
+/* Undo usb_eject_port: the hot-plug thread sets the device up again. */
+int usb_enable_port(int port)
+{
+    if (port < 1 || port >= 256 || g_port_tries[port] != PORT_EJECTED) return -1;
+    g_port_tries[port] = 0;
+    return 0;
+}
+
+/* Ports holding a device that was ejected but is still plugged in. */
+int usb_ejected_ports(int *ports, int max)
+{
+    int n = 0;
+    for (int p = 1; p <= g_max_ports && p < 256 && n < max; p++)
+        if (g_port_tries[p] == PORT_EJECTED && (rd32(g_op, 0x400 + (uint32_t)(p - 1) * 0x10) & 1)) ports[n++] = p;
+    return n;
+}
+
+/* USB port of a block device (usbN), or -1. */
+int usb_port_of_block(int dev)
+{
+    for (int i = 0; i < USB_MAX_DEVS; i++)
+        if (g_devs[i].used && g_devs[i].block_dev == dev) return g_devs[i].port;
+    return -1;
 }
 
 void usb_start_hotplug(void)

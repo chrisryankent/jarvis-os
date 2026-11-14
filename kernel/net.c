@@ -497,12 +497,13 @@ void net_receive(const uint8_t *frame, size_t len)
 
 /* ---- The network process ------------------------------------------------- */
 static int g_offline = 0;               /* airplane mode */
+static int g_adapter_off = 0;           /* disabled in Device Manager */
 
 static void net_process(void)
 {
     for (;;) {
         net_lock();
-        if (!g_offline) {
+        if (!g_offline && !g_adapter_off) {
             nic_poll();
             dhcp_timer();
         }
@@ -524,12 +525,25 @@ void net_set_offline(int off)
     net_unlock();
 }
 
-int net_is_offline(void) { return g_offline; }
+int net_is_offline(void) { return g_offline || g_adapter_off; }
+
+/* Device Manager: disable the network adapter (no traffic, no address). */
+void net_set_adapter_enabled(int on)
+{
+    if (g_lock < 0) return;
+    net_lock();
+    g_adapter_off = on ? 0 : 1;
+    g_ip = 0;
+    g_dhcp_state = DHCP_IDLE;
+    for (int i = 0; i < ARP_CACHE; i++) g_arp[i].valid = 0;
+    net_unlock();
+}
+int net_adapter_enabled(void) { return !g_adapter_off; }
 
 /* Ask DHCP for an address again (keeps the old one until answered). */
 void net_renew(void)
 {
-    if (g_lock < 0 || g_offline) return;
+    if (g_lock < 0 || g_offline || g_adapter_off) return;
     net_lock();
     g_dhcp_state = DHCP_IDLE;
     net_unlock();

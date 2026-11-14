@@ -12,7 +12,8 @@
 #define PS2_CMD    0x64
 
 static int mouse_ready = 0;
-static uint8_t mouse_packet[3];
+static uint8_t mouse_packet[4];
+static int mouse_packet_size = 3;     /* 4 with a wheel (IntelliMouse) */
 static int mouse_packet_len = 0;
 static int mouse_buttons = 0;
 
@@ -84,7 +85,22 @@ static void input_init_locked(void)
     ps2_write_cmd(0x60);
     ps2_write_data(command_byte);
 
-    if (!ps2_mouse_write(0xF6) || !ps2_mouse_write(0xF4)) {
+    if (!ps2_mouse_write(0xF6)) {
+        mouse_ready = 0;
+        terminal_puts("[INPUT] PS/2 mouse not responding; keyboard only\n");
+        return;
+    }
+    /* IntelliMouse handshake: sample rates 200, 100, 80, then ask the ID.
+     * ID 3 means the mouse now sends a 4th byte with the wheel movement. */
+    if (ps2_mouse_write(0xF3) && ps2_mouse_write(200) && ps2_mouse_write(0xF3) && ps2_mouse_write(100) &&
+        ps2_mouse_write(0xF3) && ps2_mouse_write(80) && ps2_mouse_write(0xF2)) {
+        uint8_t id = ps2_read_data();
+        if (id == 3 || id == 4) {
+            mouse_packet_size = 4;
+            terminal_puts("[INPUT] Mouse wheel found (IntelliMouse)\n");
+        }
+    }
+    if (!ps2_mouse_write(0xF4)) {
         mouse_ready = 0;
         terminal_puts("[INPUT] PS/2 mouse not responding; keyboard only\n");
         return;
@@ -140,6 +156,8 @@ void ps2_irq_service(void)
     }
 }
 
+void ui_shell_mouse_wheel(int delta);
+
 static void mouse_handle_byte(uint8_t data)
 {
     /* Byte 0 of every packet has bit 3 set; use it to stay in sync. */
@@ -147,9 +165,13 @@ static void mouse_handle_byte(uint8_t data)
         return;
 
     mouse_packet[mouse_packet_len++] = data;
-    if (mouse_packet_len < 3)
+    if (mouse_packet_len < mouse_packet_size)
         return;
     mouse_packet_len = 0;
+    if (mouse_packet_size == 4) {
+        int z = (int)(int8_t)(uint8_t)(mouse_packet[3] << 4) >> 4;      /* signed 4 bits */
+        if (z) ui_shell_mouse_wheel(-z);                    /* IntelliMouse: negative = rolled away (up) */
+    }
 
     if (mouse_packet[0] & 0xC0)     /* X/Y overflow: discard the packet */
         return;

@@ -18,7 +18,7 @@
  * towards that, so mishearing can never lock you out; after 10 misses in a
  * row voice sign-in pauses until a typed sign-in succeeds.
  *
- * Settings (key=value) live in /jarvis/system/settings.conf.
+ * Settings live in the registry: HKCU\\Software\\JARVIS OS\\Settings (kernel/registry.c).
  * =============================================================================
  */
 
@@ -27,7 +27,6 @@
 #include <stdio.h>
 
 #define ACCOUNT_FILE  "/jarvis/system/account.conf"
-#define SETTINGS_FILE "/jarvis/system/settings.conf"
 
 /* ==========================================================================
  * SHA-256 (FIPS 180-4)
@@ -150,7 +149,6 @@ static struct {
     int  voice_misses;
 } g_acct;
 
-static char g_settings[2048];
 
 static int account_save(void)
 {
@@ -182,23 +180,23 @@ void accounts_init(void)
         kv_get(buf, "pin_hash", g_acct.pin_hash, sizeof(g_acct.pin_hash));
         kv_get(buf, "voice", g_acct.voice, sizeof(g_acct.voice));
     }
-    n = vfs_read_file(SETTINGS_FILE, g_settings, sizeof(g_settings));
-    if (n < 0) g_settings[0] = 0;
+    reg_init();                     /* settings live in the registry (kernel/registry.c) */
     sync_kstate();
     terminal_printf("[AUTH] %s\n", !g_acct.exists ? "No account yet: first-run setup" :
                     account_has_sign_in() ? "Account found: sign-in required" : "Account found: no sign-in set");
 }
 
 /* ---- Settings ------------------------------------------------------------ */
+/* Settings are the values of HKCU\Software\JARVIS OS\Settings. */
 int setting_get(const char *key, char *out, size_t n)
 {
-    return kv_get(g_settings, key, out, n);
+    return reg_setting_get(key, out, n);
 }
 
 int setting_get_int(const char *key, int dflt)
 {
     char v[16];
-    if (!kv_get(g_settings, key, v, sizeof(v)) || !v[0]) return dflt;
+    if (!reg_setting_get(key, v, sizeof(v)) || !v[0]) return dflt;
     int r = 0, neg = v[0] == '-';
     for (const char *p = v + neg; *p >= '0' && *p <= '9'; p++) r = r * 10 + (*p - '0');
     return neg ? -r : r;
@@ -206,32 +204,14 @@ int setting_get_int(const char *key, int dflt)
 
 void setting_set(const char *key, const char *value)
 {
-    static char out[2048];
-    size_t kl = strlen(key), o = 0;
-    for (const char *p = g_settings; *p;) {                 /* copy every other key */
-        const char *eol = strchr(p, '\n');
-        if (!eol) eol = p + strlen(p);
-        int same = (size_t)(eol - p) > kl && !strncmp(p, key, kl) && p[kl] == '=';
-        if (!same && eol > p && o + (size_t)(eol - p) + 2 < sizeof(out)) {
-            memcpy(out + o, p, (size_t)(eol - p));
-            o += (size_t)(eol - p);
-            out[o++] = '\n';
-        }
-        p = *eol ? eol + 1 : eol;
-    }
-    int w = snprintf(out + o, sizeof(out) - o, "%s=%s\n", key, value);
-    if (w > 0) o += (size_t)w < sizeof(out) - o ? (size_t)w : sizeof(out) - o - 1;
-    out[o] = 0;
-    memcpy(g_settings, out, o + 1);
-    vfs_mkdir("/jarvis/system");
-    vfs_write_file(SETTINGS_FILE, g_settings, o);
+    reg_setting_set(key, value, 0);
 }
 
 void setting_set_int(const char *key, int value)
 {
     char v[16];
     snprintf(v, sizeof(v), "%d", value);
-    setting_set(key, v);
+    reg_setting_set(key, v, 1);
 }
 
 /* ---- Account queries ----------------------------------------------------- */
