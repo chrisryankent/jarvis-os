@@ -49,7 +49,7 @@
 #define PTE_ADDR      0x000FFFFFFFFFF000ULL
 
 #define VM_MAX_SPACES   32
-#define VM_MAX_REGIONS  8
+#define VM_MAX_REGIONS  256             /* Linux programs map many pieces (kernel/linux.c) */
 #define VM_USER_END     0x0000800000000000ULL
 #define SWAP_SLOTS      2048
 
@@ -376,6 +376,96 @@ int vm_unmap_page(int id, uint64_t virt, int free_frame)
     }
     vm_irq_restore(irq);
     return rc;
+}
+
+/* ---- Partial unmap / protect (Linux munmap, mprotect) -------------------- */
+/* Splits the region containing virt so that a region starts exactly there. */
+static void region_split_at(vm_space_t *s, uint64_t virt)
+{
+    vm_region_t *r = region_find(s, virt);
+    if (!r || r->start == virt) return;
+    for (int i = 0; i < VM_MAX_REGIONS; i++) {
+        if (s->regions[i].used) continue;
+        vm_region_t *n = &s->regions[i];
+        uint32_t first = (uint32_t)((virt - r->start) / PAGE_SIZE);
+        *n = *r;
+        n->start = virt;
+        n->pages = r->pages - first;
+        r->pages = first;
+        return;
+    }
+}
+
+/* Removes [virt, virt+pages) from the address space: regions are cut and
+ * the memory behind them is freed. */
+int vm_region_unmap(int id, uint64_t virt, uint32_t pages)
+{
+    uint64_t irq = vm_irq_save();
+    vm_space_t *s = space_get(id);
+    if (!s || (virt & (PAGE_SIZE - 1)) || !pages) { vm_irq_restore(irq); return -1; }
+    uint64_t end = virt + (uint64_t)pages * PAGE_SIZE;
+    region_split_at(s, virt);
+    region_split_at(s, end);
+    for (int i = 0; i < VM_MAX_REGIONS; i++) {
+        vm_region_t *r = &s->regions[i];
+        if (r->used && r->start >= virt && r->start + (uint64_t)r->pages * PAGE_SIZE <= end) r->used = 0;
+    }
+    for (uint64_t v = virt; v < end; v += PAGE_SIZE) {
+        uint64_t *pte = pte_walk(s->pml4, v, 0);
+        if (!pte) continue;
+        if (*pte & PTE_P) {
+            pmm_free_frame(*pte & PTE_ADDR);
+            if (s->resident) s->resident--;
+            flush_if_current(s, v);
+        } else if (*pte & PTE_SWAPPED) {
+            swap_free((uint32_t)((*pte & PTE_ADDR) >> 12));
+            if (s->swapped) s->swapped--;
+            if (g_stats.swapped_pages) g_stats.swapped_pages--;
+        }
+        *pte = 0;
+    }
+    vm_irq_restore(irq);
+    return 0;
+}
+
+/* Sets the protection of [virt, virt+pages), splitting regions as needed;
+ * pages not mapped by any region are left alone. */
+int vm_region_protect(int id, uint64_t virt, uint32_t pages, uint32_t flags)
+{
+    uint64_t irq = vm_irq_save();
+    vm_space_t *s = space_get(id);
+    if (!s || (virt & (PAGE_SIZE - 1))) { vm_irq_restore(irq); return -1; }
+    uint64_t end = virt + (uint64_t)pages * PAGE_SIZE;
+    region_split_at(s, virt);
+    region_split_at(s, end);
+    int any = 0;
+    for (int i = 0; i < VM_MAX_REGIONS; i++) {
+        vm_region_t *r = &s->regions[i];
+        if (r->used && r->start >= virt && r->start + (uint64_t)r->pages * PAGE_SIZE <= end) { r->flags = flags; any = 1; }
+    }
+    for (uint64_t v = virt; v < end; v += PAGE_SIZE) {
+        if (!region_find(s, v)) continue;
+        uint64_t *pte = pte_walk(s->pml4, v, 0);
+        if (pte && (*pte & PTE_P)) {
+            *pte = (*pte & PTE_ADDR) | pte_flags(flags) | (*pte & PTE_A);
+            flush_if_current(s, v);
+        }
+    }
+    vm_irq_restore(irq);
+    return any ? 0 : -1;
+}
+
+/* Is any page of [virt, virt+len) inside a region? */
+int vm_range_used(int id, uint64_t virt, uint64_t len)
+{
+    vm_space_t *s = space_get(id);
+    if (!s) return 0;
+    uint64_t end = virt + len;
+    for (int i = 0; i < VM_MAX_REGIONS; i++) {
+        vm_region_t *r = &s->regions[i];
+        if (r->used && r->start < end && r->start + (uint64_t)r->pages * PAGE_SIZE > virt) return 1;
+    }
+    return 0;
 }
 
 /* Change the protection of a range (and of the region it belongs to, so

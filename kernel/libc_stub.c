@@ -160,3 +160,20 @@ void *memchr(const void *s, int c, size_t n)
         if (p[i] == (unsigned char)c) return (void *)(p + i);
     return NULL;
 }
+
+char *strcat(char *dest, const char *src)
+{
+    char *d = dest;
+    while (*d) d++;
+    while ((*d++ = *src++)) { }
+    return dest;
+}
+
+char *strncat(char *dest, const char *src, size_t n)
+{
+    char *d = dest;
+    while (*d) d++;
+    while (n-- && *src) *d++ = *src++;
+    *d = 0;
+    return dest;
+}

@@ -31,6 +31,7 @@ static const char *const PO_BLOOM[] = { "theme", "purple", "forest", "sunset", "
 static const char *const PO_FIT[] = { "fill", "fit", "stretch", "center", "tile" };
 static const char *const PO_ALIGN[] = { "center", "left" };
 static const char *const PO_MOUSE[] = { "slow", "normal", "fast", "fastest" };
+static const char *const PO_SEARCH[] = { "bing", "google", "duckduckgo" };
 
 static const pref_t g_prefs[] = {
     /* Display */
@@ -61,6 +62,8 @@ static const pref_t g_prefs[] = {
     { "mouse_swap",       PK_BOOL, 0, 1, 0, NULL, 0, "Swap the left and right mouse buttons" },
     { "scroll_lines",     PK_INT,  1, 10, 3, NULL, 0, "Lines to scroll per mouse-wheel notch" },
     { "autoplay",         PK_BOOL, 0, 1, 1, NULL, 0, "Open This PC when a USB drive is plugged in" },
+    { "search_engine",    PK_ENUM, 0, 0, 0, PO_SEARCH, 3, "Browser search: bing, google (needs JavaScript, so it may not show results) or duckduckgo" },
+    { "home_page",        PK_TEXT, 0, 0, 0, NULL, 0, "Browser home page (empty = the built-in start page)" },
     /* System */
     { "dnd",              PK_BOOL, 0, 1, 0, NULL, 0, "Do not disturb: hide notification pop-ups" },
     { "lock_after_min",   PK_INT,  0, 240, 0, NULL, 0, "Lock after this many idle minutes (0 = never)" },
@@ -83,6 +86,7 @@ static const pref_t *pref_find(const char *name)
         { "accent_color", "accent" }, { "screen_timeout", "screen_off_min" }, { "lock_after", "lock_after_min" },
         { "do_not_disturb", "dnd" }, { "pc_name", "device_name" }, { "computer_name", "device_name" },
         { "resolution_mode", "resolution" }, { "display_resolution", "resolution" },
+        { "search", "search_engine" }, { "browser_search", "search_engine" }, { "homepage", "home_page" },
     };
     for (size_t i = 0; i < sizeof(alias) / sizeof(alias[0]); i++)
         if (!strcmp(alias[i][0], name)) return pref_find(alias[i][1]);

@@ -132,9 +132,11 @@ static int inf_codes(inf_t *s, const huff_t *lit, const huff_t *dist)
     }
 }
 
-static int inflate_raw(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_len, size_t *produced)
+/* Raw DEFLATE (RFC 1951). Reentrant: the dpkg worker (gzip members) and
+ * the desktop (PNG) may decode at the same time. */
+int inflate_raw(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_len, size_t *produced)
 {
-    static huff_t lit, dist;            /* desktop-only use; kept off the stack */
+    huff_t lit, dist;                   /* 1.2 KB: every caller has a 16 KB+ stack */
     inf_t s = { in, in_len, 0, 0, 0, out, out_len, 0, 0 };
     int last;
     do {

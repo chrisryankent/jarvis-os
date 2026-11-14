@@ -323,6 +323,10 @@ uint32_t user_exec(const char *path)
         return 0;
 
     const char *leaf = strrchr(path, '/');
+    if (linux_is_program(path)) {               /* kernel/linux.c */
+        char *argv[1] = { (char *)(leaf ? leaf + 1 : path) };
+        return linux_exec(path, 1, argv, NULL);
+    }
     uint64_t irq = um_irq_save();       /* the child must not run before its
                                            slot is filled in */
     int s = -1;

@@ -23,6 +23,14 @@ import socket
 import subprocess
 import sys
 import threading
+
+
+def _log(msg: str, **_kw) -> None:
+    """print() that cannot raise (non-blocking terminal, closed pipe)."""
+    try:
+        print(msg, flush=True)
+    except (BlockingIOError, OSError, ValueError):
+        pass
 import time
 from pathlib import Path
 
@@ -40,7 +48,7 @@ def _tool(name: str, description: str, props: dict | None = None, required: list
 S = {"type": "string"}
 I = {"type": "integer"}
 TOOLS = [
-    _tool("open_app", "Open an app (Files, Terminal, Settings, Calculator, Tasks, Notepad, Apps, Security, Disks, Device Manager, Photos, Clock, Run).", {"name": S}, ["name"]),
+    _tool("open_app", "Open an app (Files, Terminal, Settings, Calculator, Tasks, Notepad, Apps, Security, Disks, Device Manager, Photos, Clock, Run, Browser, Registry Editor). 'the computer' or 'my computer' means Files.", {"name": S}, ["name"]),
     _tool("close_app", "Close an open app window.", {"name": S}, ["name"]),
     _tool("list_apps", "List the apps on this PC and which are open."),
     _tool("list_files", "List the files and folders in a folder.", {"path": S}, ["path"]),
@@ -84,6 +92,8 @@ TOOLS = [
     _tool("device_action", "Device Manager: info, enable, disable, restart, uninstall (driver), scan (for hardware changes), events, driver.",
           {"action": {"type": "string", "enum": ["info", "enable", "disable", "restart", "uninstall", "scan", "events", "driver"]}, "name": S}, ["action"]),
     _tool("screenshot", "Take a screenshot (saved in Pictures/Screenshots)."),
+    _tool("browse", "Open a web page, or search the web, in the JARVIS OS Browser.", {"url": S}, ["url"]),
+    _tool("download", "Download a file from the internet into Downloads (https works).", {"url": S}, ["url"]),
     _tool("notify", "Show a notification.", {"title": S, "text": S}, ["text"]),
     _tool("lock_screen", "Lock the computer."),
     _tool("list_packages", "List apps installed from packages."),
@@ -296,7 +306,7 @@ class Brain:
                     result = HOST_TOOLS[tool](args)
                 except Exception as exc:
                     result = f"error: the internet request failed ({exc})"
-                print(f"[brain] {tool} {json.dumps(args)[:100]} -> {len(result)} chars", flush=True)
+                _log(f"[brain] {tool} {json.dumps(args)[:100]} -> {len(result)} chars", flush=True)
             else:
                 result = self.run_tool(tool, args)
             if tool in INFO_TOOLS and not result.startswith("error"):
@@ -329,7 +339,7 @@ class GuestLink:
         cid = str(next(self.ids))
         q: queue.Queue = queue.Queue()
         self.waiting[cid] = q
-        print(f"[brain] tool {name} {json.dumps(args)[:120]}", flush=True)
+        _log(f"[brain] tool {name} {json.dumps(args)[:120]}", flush=True)
         self.send(f"TOOL:{cid}:{name}:{json.dumps(args)}")
         try:
             return q.get(timeout=180)                 # long enough for the user to click Allow
@@ -355,7 +365,7 @@ def start_for_bridge(sock: socket.socket, sock_lock: threading.Lock, model: str 
     try:
         server = LlamaServer(Path(model) if model else DEFAULT_MODEL, threads=max(1, (os.cpu_count() or 4) // 2))
     except RuntimeError as exc:
-        print(f"[brain] not available: {exc}", flush=True)
+        _log(f"[brain] not available: {exc}", flush=True)
         return None
     link = GuestLink(sock, sock_lock)
     prefs = {"web": True}
@@ -375,8 +385,8 @@ def start_for_bridge(sock: socket.socket, sock_lock: threading.Lock, model: str 
             server.complete([{"role": "system", "content": DECIDE_PROMPT}, {"role": "user", "content": "hello"}],
                             schema=DECISION_SCHEMA, max_tokens=8)
         except Exception as exc:
-            print(f"[brain] warm-up failed: {exc}", flush=True)
-        print(f"[brain] {name} is ready (instructions loaded in {time.time() - started:.0f}s)", flush=True)
+            _log(f"[brain] warm-up failed: {exc}", flush=True)
+        _log(f"[brain] {name} is ready (instructions loaded in {time.time() - started:.0f}s)", flush=True)
         while True:
             try:
                 link.send(f"AI:ONLINE {name}")
@@ -384,24 +394,39 @@ def start_for_bridge(sock: socket.socket, sock_lock: threading.Lock, model: str 
                 return
             time.sleep(2)
 
+    def log(msg: str) -> None:
+        """Print without ever raising: the terminal may be in non-blocking mode
+        (QEMU sets it), and a failed print must not kill the brain."""
+        try:
+            print(msg, flush=True)
+        except (BlockingIOError, OSError, ValueError):
+            pass
+
     def worker() -> None:
         while True:
-            text = asks.get()
-            while not asks.empty():                  # newer request: the old one is stale
-                dropped, text = text, asks.get()
-                print(f"[brain] skipped an older request: {dropped}", flush=True)
-            started = time.time()
             try:
-                link.send("AI:THINKING")
-                answer = brain.ask(text)
-            except Exception as exc:                  # never leave the user without a reply
-                answer = f"My language model failed: {exc}"
-            print(f"[brain] answered in {time.time() - started:.1f}s: {answer}", flush=True)
-            try:
-                link.send("REPLY:" + answer)
-            except OSError:
-                return
+                text = asks.get()
+                while not asks.empty():              # newer request: the old one is stale
+                    dropped, text = text, asks.get()
+                    log(f"[brain] skipped an older request: {dropped}")
+                started = time.time()
+                try:
+                    link.send("AI:THINKING")
+                    answer = brain.ask(text)
+                except Exception as exc:              # never leave the user without a reply
+                    answer = f"My language model failed: {exc}"
+                log(f"[brain] answered in {time.time() - started:.1f}s: {answer}")
+                try:
+                    link.send("REPLY:" + answer)
+                except OSError:
+                    return
+            except Exception as exc:                  # keep answering whatever happens
+                log(f"[brain] request failed: {exc}")
 
+    try:                                              # QEMU leaves stdout non-blocking
+        os.set_blocking(sys.stdout.fileno(), True)
+    except (OSError, ValueError, AttributeError):
+        pass
     threading.Thread(target=heartbeat, daemon=True).start()
     threading.Thread(target=worker, daemon=True).start()
     return link, asks, prefs

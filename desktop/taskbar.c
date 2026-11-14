@@ -58,7 +58,7 @@ static struct {
 } g_start;
 
 /* ---- Pinned apps (setting "pins": names separated by commas) -------------- */
-static const char *g_default_pins = "Files,Terminal,JARVIS,Settings,Notepad,Photos";
+static const char *g_default_pins = "Files,Browser,Terminal,JARVIS,Settings,Notepad,Photos";
 
 int taskbar_is_pinned(int idx)
 {

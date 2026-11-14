@@ -12,7 +12,13 @@
  *   block 0            superblock
  *   bitmap blocks      one bit per block: 1 = in use     (space map)
  *   table blocks       512 file entries of 512 bytes     (path, size, extents)
- *   data blocks        file contents, in up to 14 contiguous extents per file
+ *   data blocks        file contents, in up to 14 contiguous extents per file;
+ *                      also more file table: when the first 512 entries are
+ *                      in use, chunks of 512 more (64 blocks each, up to 31)
+ *                      are taken from the data area and listed in the
+ *                      superblock. Such a disk is marked version 2, so an
+ *                      older kernel leaves it alone instead of overwriting
+ *                      the chunks; a disk that never grows stays version 1.
  *
  * Safety rules:
  *   - A disk is formatted only if it is completely blank. A disk that holds
@@ -34,10 +40,15 @@
 
 #define FS_BLOCK        4096
 #define FS_SPB          8                   /* sectors per block */
-#define FS_MAX_FILES    512
+#define FS_PRIMARY      512                 /* entries in the first table */
+#define FS_CHUNK        512                 /* entries per extension chunk */
+#define FS_CHUNK_BLOCKS (FS_CHUNK * 512 / 4096)
+#define FS_MAX_CHUNKS   31
+#define FS_MAX_FILES    (FS_PRIMARY + FS_MAX_CHUNKS * FS_CHUNK)    /* 16384 */
 #define FS_MAX_EXTENTS  14
 #define FS_MAX_BLOCKS   (1u << 20)          /* 4 GB */
 #define FS_VERSION      1
+#define FS_VERSION_EXT  2                   /* has extension chunks */
 
 typedef struct {
     char     magic[8];                      /* "JARVISFS" */
@@ -47,6 +58,8 @@ typedef struct {
     uint32_t bitmap_start, bitmap_blocks;
     uint32_t table_start, table_blocks;
     uint32_t data_start;
+    uint32_t chunk_count;                   /* version 2: extension chunks */
+    uint32_t chunk_start[FS_MAX_CHUNKS];
 } fs_super_t;
 
 typedef struct {
@@ -71,6 +84,7 @@ static int        g_mounted = 0;
 static uint64_t   g_used_blocks = 0;
 static int        g_full_reported = 0;
 static int        g_fs_lock = -1;           /* sync vs. the disk check */
+static int        g_nent = FS_PRIMARY;      /* entries in use: primary + chunks */
 
 static void fs_lock(void)   { if (g_fs_lock >= 0) kmutex_lock(g_fs_lock); }
 static void fs_unlock(void) { if (g_fs_lock >= 0) kmutex_unlock(g_fs_lock); }
@@ -125,10 +139,55 @@ static int alloc_extents(fs_entry_t *e, uint32_t blocks)
     return 0;
 }
 
+static int write_bitmap(void);
+
+/* Disk block holding entry idx (8 entries per block). */
+static uint32_t entry_block(int idx)
+{
+    if (idx < FS_PRIMARY) return g_super.table_start + (uint32_t)idx / 8;
+    int c = (idx - FS_PRIMARY) / FS_CHUNK, j = (idx - FS_PRIMARY) % FS_CHUNK;
+    return g_super.chunk_start[c] + (uint32_t)j / 8;
+}
+
 static int write_entry(int idx)
 {
-    int first = idx & ~7;                           /* 8 entries per block */
-    return wr(g_super.table_start + (uint32_t)idx / 8, 1, &g_table[first]);
+    int first = idx & ~7;
+    return wr(entry_block(idx), 1, &g_table[first]);
+}
+
+static int write_super(void)
+{
+    memset(g_io, 0, FS_BLOCK);
+    memcpy(g_io, &g_super, sizeof(g_super));
+    return wr(0, 1, g_io);
+}
+
+/* All entries in use: take 64 contiguous free blocks for 512 more. */
+static int add_chunk(void)
+{
+    if (g_super.chunk_count >= FS_MAX_CHUNKS) return -1;
+    uint32_t total = (uint32_t)g_super.total_blocks, b = g_super.data_start;
+    while (b + FS_CHUNK_BLOCKS <= total) {
+        uint32_t k = 0;
+        while (k < FS_CHUNK_BLOCKS && !bit_get(b + k)) k++;
+        if (k == FS_CHUNK_BLOCKS) break;
+        b += k + 1;
+    }
+    if (b + FS_CHUNK_BLOCKS > total) return -1;
+    int first = FS_PRIMARY + (int)g_super.chunk_count * FS_CHUNK;
+    memset(&g_table[first], 0, FS_CHUNK * sizeof(fs_entry_t));
+    if (wr(b, FS_CHUNK_BLOCKS, &g_table[first]) != 0) return -1;
+    for (uint32_t k = 0; k < FS_CHUNK_BLOCKS; k++) bit_set(b + k);
+    g_super.chunk_start[g_super.chunk_count++] = b;
+    g_super.version = FS_VERSION_EXT;
+    if (write_super() != 0 || write_bitmap() != 0) {
+        g_super.chunk_count--;
+        for (uint32_t k = 0; k < FS_CHUNK_BLOCKS; k++) bit_clr(b + k);
+        return -1;
+    }
+    g_nent = FS_PRIMARY + (int)g_super.chunk_count * FS_CHUNK;
+    terminal_printf("[FS] File table extended to %d entries\n", g_nent);
+    return first;
 }
 
 static int write_bitmap(void)
@@ -156,10 +215,11 @@ static int format(uint64_t total_blocks)
     g_super.bitmap_start = 1;
     g_super.bitmap_blocks = (uint32_t)((total_blocks + FS_BLOCK * 8 - 1) / (FS_BLOCK * 8));
     g_super.table_start = g_super.bitmap_start + g_super.bitmap_blocks;
-    g_super.table_blocks = FS_MAX_FILES * sizeof(fs_entry_t) / FS_BLOCK;
+    g_super.table_blocks = FS_PRIMARY * sizeof(fs_entry_t) / FS_BLOCK;
     g_super.data_start = g_super.table_start + g_super.table_blocks;
 
     memset(g_table, 0, sizeof(g_table));
+    g_nent = FS_PRIMARY;
     memset(g_io, 0, FS_BLOCK);
     memcpy(g_io, &g_super, sizeof(g_super));
 
@@ -176,7 +236,10 @@ static void rebuild_bitmap(void)
     g_used_blocks = 0;
     for (uint32_t b = 0; b < g_super.data_start; b++)
         bit_set(b);                                 /* metadata */
-    for (int i = 0; i < FS_MAX_FILES; i++)
+    for (uint32_t c = 0; c < g_super.chunk_count; c++)
+        for (uint32_t k = 0; k < FS_CHUNK_BLOCKS; k++)
+            bit_set(g_super.chunk_start[c] + k);    /* more file table */
+    for (int i = 0; i < g_nent; i++)
         if (g_table[i].used)
             for (uint32_t x = 0; x < g_table[i].extent_count && x < FS_MAX_EXTENTS; x++)
                 for (uint32_t k = 0; k < g_table[i].extents[x].count; k++)
@@ -241,22 +304,30 @@ void diskfs_mount(void)
             terminal_puts("[FS] Format failed\n");
             return;
         }
-    } else if (g_super.version != FS_VERSION || g_super.block_size != FS_BLOCK ||
+    } else if ((g_super.version != FS_VERSION && g_super.version != FS_VERSION_EXT) || g_super.block_size != FS_BLOCK ||
                g_super.total_blocks > total_blocks ||
-               g_super.table_blocks != FS_MAX_FILES * sizeof(fs_entry_t) / FS_BLOCK) {
+               g_super.table_blocks != FS_PRIMARY * sizeof(fs_entry_t) / FS_BLOCK ||
+               (g_super.version == FS_VERSION && g_super.chunk_count) || g_super.chunk_count > FS_MAX_CHUNKS) {
         terminal_puts("[FS] Unsupported file system version; leaving the disk untouched\n");
         return;
-    } else if (rd(g_super.table_start, g_super.table_blocks, g_table) != 0) {
-        terminal_puts("[FS] Could not read the file table\n");
-        return;
+    } else {
+        int bad = rd(g_super.table_start, g_super.table_blocks, g_table) != 0;
+        for (uint32_t c = 0; c < g_super.chunk_count && !bad; c++)
+            bad = g_super.chunk_start[c] < g_super.data_start || g_super.chunk_start[c] + FS_CHUNK_BLOCKS > g_super.total_blocks ||
+                  rd(g_super.chunk_start[c], FS_CHUNK_BLOCKS, &g_table[FS_PRIMARY + c * FS_CHUNK]) != 0;
+        if (bad) {
+            terminal_puts("[FS] Could not read the file table\n");
+            return;
+        }
     }
+    g_nent = FS_PRIMARY + (int)g_super.chunk_count * FS_CHUNK;
 
     rebuild_bitmap();
     g_mounted = 1;
     if (g_fs_lock < 0) g_fs_lock = kmutex_create("jarvisfs");
 
     int files = 0, bad = 0;
-    for (int i = 0; i < FS_MAX_FILES; i++) {
+    for (int i = 0; i < g_nent; i++) {
         if (!g_table[i].used) continue;
         g_table[i].path[sizeof(g_table[i].path) - 1] = 0;
         if (load_file(i) == 0) files++; else bad++;
@@ -274,8 +345,9 @@ static int save_slot(int slot, const vfs_slot_info_t *s)
 {
     int idx = s->disk_idx;
     if (idx < 0) {
-        for (int i = 0; i < FS_MAX_FILES; i++)
+        for (int i = 0; i < g_nent; i++)
             if (!g_table[i].used) { idx = i; break; }
+        if (idx < 0) idx = add_chunk();
         if (idx < 0) return -1;
     }
 
@@ -327,7 +399,7 @@ int diskfs_sync(void)
     fs_lock();
     int changed = 0, idx;
     while (vfs_take_deleted(&idx)) {
-        if (idx >= 0 && idx < FS_MAX_FILES && g_table[idx].used) {
+        if (idx >= 0 && idx < g_nent && g_table[idx].used) {
             free_extents(&g_table[idx]);
             memset(&g_table[idx], 0, sizeof(g_table[idx]));
             write_entry(idx);
@@ -369,7 +441,7 @@ int diskfs_get_stats(diskfs_stats_t *out)
     strncpy(out->model, info.model, sizeof(out->model) - 1);
     out->total_bytes = g_super.total_blocks * FS_BLOCK;
     out->used_bytes = g_used_blocks * FS_BLOCK;
-    for (int i = 0; i < FS_MAX_FILES; i++)
+    for (int i = 0; i < g_nent; i++)
         if (g_table[i].used) out->items++;
     return 0;
 }
@@ -437,7 +509,8 @@ int diskfs_resize(uint64_t new_blocks, char *err, size_t n)
  * -------------------------------------------------------------------------- */
 static diskfs_check_t g_chk;
 static int g_chk_surface, g_chk_repair;
-static fs_entry_t g_chk_disk_table[FS_MAX_FILES];
+static int g_chk_need_save[FS_MAX_FILES], g_chk_referenced[FS_MAX_FILES];
+static int32_t g_chk_seen[32768];          /* duplicate-path detection */
 static uint8_t g_chk_owned[FS_MAX_BLOCKS / 8];
 static uint8_t g_chk_buf[65536], g_chk_mem[65536];
 
@@ -459,10 +532,9 @@ static int chk_entry_blocks(const fs_entry_t *e)
 
 static void diskfs_check_process(void)
 {
-    int need_save[FS_MAX_FILES];
-    int referenced[FS_MAX_FILES];
-    memset(need_save, 0, sizeof(need_save));
-    memset(referenced, 0, sizeof(referenced));
+    int *need_save = g_chk_need_save, *referenced = g_chk_referenced;
+    memset(g_chk_need_save, 0, sizeof(g_chk_need_save));
+    memset(g_chk_referenced, 0, sizeof(g_chk_referenced));
     uint64_t total = g_super.total_blocks;
 
     /* 1. superblock and file table as stored on the disk */
@@ -470,26 +542,39 @@ static void diskfs_check_process(void)
     fs_lock();
     if (block_read(g_dev, 0, FS_SPB, g_chk_buf) != 0) { g_chk.read_errors++; chk_issue("The superblock cannot be read", 0, 0); }
     else if (memcmp(g_chk_buf, &g_super, sizeof(g_super)) != 0) chk_issue("The superblock on disk differs from the one in use", 0, 0);
-    if (block_read(g_dev, (uint64_t)g_super.table_start * FS_SPB, g_super.table_blocks * FS_SPB, g_chk_disk_table) != 0) {
-        g_chk.read_errors++;
-        chk_issue("The file table cannot be read", 0, 0);
-        memcpy(g_chk_disk_table, g_table, sizeof(g_table));
-    }
-    for (int i = 0; i < FS_MAX_FILES; i++)
-        if (memcmp(&g_chk_disk_table[i], &g_table[i], sizeof(fs_entry_t)) != 0) {
-            chk_issue("Entry %s%ld was not written correctly", "#", i);
-            if (g_table[i].used) need_save[i] = 1;
+    /* the table as stored, one block (8 entries) at a time */
+    for (int i = 0; i < g_nent; i += 8) {
+        if (block_read(g_dev, (uint64_t)entry_block(i) * FS_SPB, FS_SPB, g_chk_buf) != 0) {
+            g_chk.read_errors++;
+            chk_issue("The file table cannot be read (entry %s%ld)", "#", i);
+            continue;
         }
+        for (int k = 0; k < 8; k++)
+            if (memcmp(g_chk_buf + k * sizeof(fs_entry_t), &g_table[i + k], sizeof(fs_entry_t)) != 0) {
+                chk_issue("Entry %s%ld was not written correctly", "#", i + k);
+                if (g_table[i + k].used) need_save[i + k] = 1;
+            }
+    }
 
     /* 2. every entry: path, size, extents, overlaps */
     memset(g_chk_owned, 0, sizeof(g_chk_owned));
-    for (int i = 0; i < FS_MAX_FILES; i++) {
+    memset(g_chk_seen, 0, sizeof(g_chk_seen));
+    for (uint32_t c = 0; c < g_super.chunk_count; c++)          /* table chunks own their blocks */
+        for (uint32_t k = 0; k < FS_CHUNK_BLOCKS; k++)
+            g_chk_owned[(g_super.chunk_start[c] + k) / 8] |= (uint8_t)(1u << ((g_super.chunk_start[c] + k) % 8));
+    for (int i = 0; i < g_nent; i++) {
         fs_entry_t *e = &g_table[i];
         if (!e->used) continue;
         if (e->is_dir) g_chk.dirs++; else g_chk.files++;
         if (e->path[0] != '/' || !memchr(e->path, 0, sizeof(e->path))) { chk_issue("Entry #%s%ld has a damaged name", "", i); continue; }
-        for (int j = 0; j < i; j++)
-            if (g_table[j].used && !strcmp(g_table[j].path, e->path)) { chk_issue("%s is stored twice (%ld)", e->path, j); need_save[i] = 1; }
+        {   /* duplicates: paths hashed into an open-addressed table */
+            uint32_t h = 2166136261u;
+            for (const char *q = e->path; *q; q++) h = (h ^ (uint8_t)*q) * 16777619u;
+            for (uint32_t k = h & 32767;; k = (k + 1) & 32767) {
+                if (!g_chk_seen[k]) { g_chk_seen[k] = i + 1; break; }
+                if (!strcmp(g_table[g_chk_seen[k] - 1].path, e->path)) { chk_issue("%s is stored twice (%ld)", e->path, g_chk_seen[k] - 1); need_save[i] = 1; break; }
+            }
+        }
         if (e->is_dir && (e->size || e->extent_count)) { chk_issue("Folder %s claims data blocks", e->path, 0); need_save[i] = 1; }
         if (e->extent_count > FS_MAX_EXTENTS) { chk_issue("%s has %ld block runs (damaged)", e->path, (long)e->extent_count); need_save[i] = 1; continue; }
         if ((uint64_t)chk_entry_blocks(e) != (e->size + FS_BLOCK - 1) / FS_BLOCK) {
@@ -514,9 +599,9 @@ static void diskfs_check_process(void)
     int slots = vfs_slot_max();
     for (int s = 0; s < slots; s++) {
         vfs_slot_info_t si;
-        if (vfs_slot_info(s, &si) == 0 && si.disk_idx >= 0 && si.disk_idx < FS_MAX_FILES) referenced[si.disk_idx] = 1;
+        if (vfs_slot_info(s, &si) == 0 && si.disk_idx >= 0 && si.disk_idx < g_nent) referenced[si.disk_idx] = 1;
     }
-    for (int i = 0; i < FS_MAX_FILES; i++)
+    for (int i = 0; i < g_nent; i++)
         if (g_table[i].used && !referenced[i]) chk_issue("%s is on disk but no longer in use (entry %ld)", g_table[i].path, i);
 
     /* 4. the space map on disk against the file table */
@@ -547,7 +632,7 @@ static void diskfs_check_process(void)
     g_chk.phase = "Comparing file contents";
     for (int s = 0; s < slots; s++) {
         vfs_slot_info_t si;
-        if (vfs_slot_info(s, &si) != 0 || si.is_dir || si.dirty || si.disk_idx < 0 || si.disk_idx >= FS_MAX_FILES) continue;
+        if (vfs_slot_info(s, &si) != 0 || si.is_dir || si.dirty || si.disk_idx < 0 || si.disk_idx >= g_nent) continue;
         fs_lock();
         fs_entry_t e = g_table[si.disk_idx];
         int bad = 0, changed = 0;
@@ -597,7 +682,7 @@ static void diskfs_check_process(void)
     if (g_chk_repair) {
         g_chk.phase = "Repairing";
         fs_lock();
-        for (int i = 0; i < FS_MAX_FILES; i++) {
+        for (int i = 0; i < g_nent; i++) {
             if (g_table[i].used && !referenced[i]) {        /* release unused entries */
                 free_extents(&g_table[i]);
                 memset(&g_table[i], 0, sizeof(g_table[i]));
@@ -608,7 +693,7 @@ static void diskfs_check_process(void)
         rebuild_bitmap();                                   /* drops blocks of damaged entries too */
         for (int s = 0; s < slots; s++) {
             vfs_slot_info_t si;
-            if (vfs_slot_info(s, &si) == 0 && si.disk_idx >= 0 && si.disk_idx < FS_MAX_FILES && need_save[si.disk_idx]) {
+            if (vfs_slot_info(s, &si) == 0 && si.disk_idx >= 0 && si.disk_idx < g_nent && need_save[si.disk_idx]) {
                 memset(&g_table[si.disk_idx], 0, sizeof(fs_entry_t));      /* forget the bad blocks */
                 rebuild_bitmap();
                 if (save_slot(s, &si) == 0) g_chk.repaired++;

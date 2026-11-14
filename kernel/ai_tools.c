@@ -498,6 +498,8 @@ int  prefs_set(const char *name, const char *value, char *msg, size_t n);
 void prefs_describe(char *out, size_t n, int with_help);
 int  shell_run_capture(const char *line, char *out, size_t n);
 void desktop_take_screenshot(char *saved, size_t n);
+void browser_open_url(const char *url);
+int  browser_start_download(const char *url);
 
 /* A string argument, also when the model sent a number or true/false. */
 static void json_any(const char *args, const char *key, char *out, size_t n)
@@ -728,6 +730,16 @@ static int tool_dispatch(const char *name, const char *args, out_t *o)
         snprintf(cmd, sizeof(cmd), "device %s %s", act[0] ? act : "info", dev);
         shell_run_capture(cmd, b, sizeof(b));
         outf(o, "%s", b);
+    } else if (!strcmp(name, "browse")) {
+        char u[600];
+        json_any(args, "url", u, sizeof(u));
+        if (!u[0]) outf(o, "error: give a web address or search words");
+        else { browser_open_url(u); outf(o, "Opened %s in the Browser.", u); }
+    } else if (!strcmp(name, "download")) {
+        char u[600];
+        json_any(args, "url", u, sizeof(u));
+        if (strncmp(u, "http", 4)) outf(o, "error: give a full http or https address");
+        else { browser_start_download(u); outf(o, "Downloading %s into Downloads; it shows in the Browser's downloads bar.", u); }
     } else if (!strcmp(name, "screenshot")) {
         char saved[160];
         desktop_take_screenshot(saved, sizeof(saved));
@@ -771,7 +783,7 @@ const char *ai_tool_names(void)
            "             run_command change_setting get_settings screenshot\n"
            "  devices:   list_devices device_details set_device_enabled device_action\n"
            "  disks:     list_drives list_disks disk_action check_disk disk_check_status eject_drive\n"
-           "  network:   network_info\n"
+           "  network:   network_info browse download\n"
            "  desktop:   set_theme notify lock_screen\n"
            "  apps:      list_packages install_package uninstall_app run_program\n"
            "  power:     power";

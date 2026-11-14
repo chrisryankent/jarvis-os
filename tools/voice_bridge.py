@@ -657,6 +657,12 @@ def run_stdin_loop(sock: socket.socket) -> None:
 
 
 def main() -> int:
+    try:                                              # QEMU may leave the terminal non-blocking;
+        import os as _os, sys as _sys                 # a print must never crash the bridge
+        _os.set_blocking(_sys.stdout.fileno(), True)
+        _os.set_blocking(_sys.stderr.fileno(), True)
+    except (OSError, ValueError, AttributeError):
+        pass
     parser = argparse.ArgumentParser(description="Send host STT transcripts to JARVIS OS over QEMU COM2.")
     parser.add_argument("--socket", default="/tmp/jarvis-voice.sock", help="QEMU COM2 Unix socket.")
     parser.add_argument("--model", default=None,

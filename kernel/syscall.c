@@ -74,6 +74,10 @@ uint64_t syscall_handler(uint64_t nr,
     if (security_hook)
         security_hook(nr, args);
 
+    /* Linux programs get the Linux system call table (kernel/linux.c) */
+    if (linux_is_current())
+        return (uint64_t)linux_syscall(nr, a1, a2, a3, a4, a5, a6);
+
     switch (nr) {
     case 0: /* read(fd, buf, len) */
         if (!user_ok(a2, a3, 1)) return E_FAULT;

@@ -138,6 +138,9 @@ int      vm_region_add(int id, uint64_t start, uint32_t pages, uint32_t flags, c
 int      vm_map_page(int id, uint64_t virt, uint64_t phys, uint32_t flags);
 int      vm_unmap_page(int id, uint64_t virt, int free_frame);
 int      vm_protect(int id, uint64_t virt, uint32_t pages, uint32_t flags);
+int      vm_region_unmap(int id, uint64_t virt, uint32_t pages);
+int      vm_region_protect(int id, uint64_t virt, uint32_t pages, uint32_t flags);
+int      vm_range_used(int id, uint64_t virt, uint64_t len);
 int      vm_reclaim(int id, int max_pages, int force);     /* evict to swap */
 int      vm_handle_fault(int id, uint64_t addr, uint64_t error_code);
 void     vm_get_stats(vm_stats_t *out);
@@ -489,6 +492,21 @@ void     usermode_set_kernel_stack(uint64_t top);
 void     usermode_install_programs(void);
 uint32_t user_exec(const char *path);          /* run a program; returns PID or 0 */
 int      user_is_program(const char *path);
+/* Linux compatibility layer (kernel/linux.c) */
+int      inflate_raw(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_len, size_t *produced);   /* image.c */
+int      linux_is_program(const char *path);    /* a Linux x86-64 ELF program */
+void     linux_canon(const char *in, char *out, int follow_last);     /* merged /usr + symbolic links */
+const char *linux_link_get(const char *path);
+int      linux_link_set(const char *path, const char *target);
+int      linux_link_remove(const char *path);
+void     linux_links_save(void);
+uint32_t dpkg_start(int argc, char **argv, const char *cwd);   /* dpkg / apt (kernel/dpkg.c); returns the worker PID */
+int      linux_is_current(void);                /* current process is a Linux program */
+uint32_t linux_exec(const char *path, int argc, char **argv, const char *cwd);
+int64_t  linux_syscall(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6);
+void     linux_install_root(void);              /* creates /jarvis/linux */
+void     proc_set_fs_base(uint64_t v);
+uint64_t proc_get_fs_base(void);
 uint64_t user_brk(uint64_t want);
 void     user_console_write(const char *buf, size_t len);
 size_t   user_console_read(char *buf, size_t max);
@@ -790,6 +808,7 @@ int     vfs_mkdir(const char *path);
 void    vfs_seed_packaged_models(void);
 int     vfs_read_file(const char *path, char *buf, size_t max);
 int     vfs_list(const char *prefix, char *buf, size_t max);
+int     vfs_dir_entries(const char *dir, void (*fn)(void *ctx, const char *name, size_t len, int is_dir), void *ctx);
 void    vfs_append(const char *path, const char *data, size_t len);
 int     vfs_exists(const char *path);
 int     vfs_is_dir(const char *path);

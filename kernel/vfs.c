@@ -80,7 +80,7 @@ typedef struct {
 static fd_t fd_table[MAX_FDS];
 
 /* ---- RAMFS --------------------------------------------------------------- */
-#define RAMFS_MAX_FILES 512
+#define RAMFS_MAX_FILES 16384           /* matches the disk's file table (diskfs.c) */
 
 /*
  * RAMFS_MAX_SIZE bounds files staying on the small kernel heap only — see
@@ -105,10 +105,11 @@ typedef struct {
     int      dirty;   /* changed since it was last written to disk */
     int      disk_idx;/* its entry in the on-disk file table, -1 = none yet */
     uint32_t gen;     /* bumped on every change (detects a change mid-save) */
+    int      hnext;   /* next slot + 1 in the same hash bucket, 0 = end */
 } ramfs_file_t;
 
 /* On-disk entries whose file was deleted; cleared by the next disk sync. */
-static int ramfs_deleted[512];
+static int ramfs_deleted[RAMFS_MAX_FILES];
 static int ramfs_deleted_count = 0;
 
 static void ramfs_touch(ramfs_file_t *f)
@@ -120,14 +121,51 @@ static void ramfs_touch(ramfs_file_t *f)
 static ramfs_file_t ramfs_files[RAMFS_MAX_FILES];
 static int          ramfs_count = 0;
 
+/* Exact-path lookups go through a hash index (slot + 1 per bucket head). */
+#define RAMFS_BUCKETS 16384
+static int ramfs_bucket[RAMFS_BUCKETS];
+
+static uint32_t ramfs_hash(const char *p)
+{
+    uint32_t h = 2166136261u;
+    for (; *p; p++) h = (h ^ (uint8_t)*p) * 16777619u;
+    return h & (RAMFS_BUCKETS - 1);
+}
+
+static void ramfs_rehash(ramfs_file_t *f)
+{
+    uint32_t b = ramfs_hash(f->path);
+    f->hnext = ramfs_bucket[b];
+    ramfs_bucket[b] = (int)(f - ramfs_files) + 1;
+}
+
+static void ramfs_unhash(ramfs_file_t *f)
+{
+    int me = (int)(f - ramfs_files) + 1;
+    int *link = &ramfs_bucket[ramfs_hash(f->path)];
+    while (*link) {
+        if (*link == me) { *link = f->hnext; f->hnext = 0; return; }
+        link = &ramfs_files[*link - 1].hnext;
+    }
+}
+
 static ramfs_file_t *ramfs_find(const char *path)
 {
-    for (int i = 0; i < ramfs_count; i++) {
-        if (ramfs_files[i].used &&
-            strcmp(ramfs_files[i].path, path) == 0)
-            return &ramfs_files[i];
-    }
+    for (int i = ramfs_bucket[ramfs_hash(path)]; i; i = ramfs_files[i - 1].hnext)
+        if (ramfs_files[i - 1].used && strcmp(ramfs_files[i - 1].path, path) == 0)
+            return &ramfs_files[i - 1];
     return NULL;
+}
+
+/* File contents of a page or more come from whole pages (PMM), not from
+ * the 16 MB kernel heap, so thousands of library files (the Linux layer)
+ * do not exhaust it. Smaller files stay on the heap. */
+#define RAMFS_PAGE_ALLOC 4096
+static uint8_t *ramfs_alloc(size_t cap, int *large)
+{
+    *large = cap >= RAMFS_PAGE_ALLOC;
+    if (!cap) return NULL;
+    return *large ? (uint8_t *)kmalloc_large(cap) : (uint8_t *)kmalloc(cap);
 }
 
 static ramfs_file_t *ramfs_create_node(const char *path, size_t initial_cap, int is_dir)
@@ -149,13 +187,13 @@ static ramfs_file_t *ramfs_create_node(const char *path, size_t initial_cap, int
     f->disk_idx = -1;
     f->dirty = 1;
     strncpy(f->path, path, sizeof(f->path) - 1);
-    f->capacity = initial_cap ? initial_cap : 4096;
-    f->large    = f->capacity >= LARGE_ALLOC_THRESHOLD;
-    f->data     = f->large ? (uint8_t *)kmalloc_large(f->capacity)
-                           : (uint8_t *)kmalloc(f->capacity);
+    f->capacity = is_dir ? 0 : initial_cap;     /* folders and new files: no buffer yet */
+    f->data     = ramfs_alloc(f->capacity, &f->large);
+    if (f->capacity && !f->data) { memset(f, 0, sizeof(*f)); return NULL; }
     f->size     = 0;
     f->used     = 1;
     f->is_dir   = is_dir;
+    ramfs_rehash(f);
     return f;
 }
 
@@ -191,8 +229,10 @@ static int ramfs_write(vfs_node_t *node, uint64_t offset,
          * this growth is held to RAMFS_MAX_SIZE; large files are bounded
          * only by available physical memory, exactly like a real model
          * file should be. */
-        size_t new_cap = end * 2;
-        int new_cap_is_large = new_cap >= LARGE_ALLOC_THRESHOLD;
+        /* a file written in one go gets exactly its size; growing files double */
+        size_t new_cap = (f->size == 0 && offset == 0) ? end : (end > f->capacity * 2 ? end : f->capacity * 2);
+        if (new_cap < 64) new_cap = 64;
+        int new_cap_is_large = new_cap >= RAMFS_PAGE_ALLOC;
 
         if (!new_cap_is_large && new_cap > RAMFS_MAX_SIZE) {
             terminal_printf("[VFS] ramfs_write: %s would exceed the %d MB "
@@ -205,14 +245,16 @@ static int ramfs_write(vfs_node_t *node, uint64_t offset,
                                              : (uint8_t *)kmalloc(new_cap);
         if (!new_buf) return -1;
 
-        memcpy(new_buf, f->data, f->size);
+        if (f->size) memcpy(new_buf, f->data, f->size);
 
         /* Free the OLD buffer with whichever allocator actually produced
          * it — these two allocators are not interchangeable. */
-        if (f->large)
-            kfree_large(f->data, f->capacity);
-        else
-            kfree(f->data);
+        if (f->data) {
+            if (f->large)
+                kfree_large(f->data, f->capacity);
+            else
+                kfree(f->data);
+        }
 
         f->data     = new_buf;
         f->capacity = new_cap;
@@ -310,7 +352,7 @@ int vfs_open(const char *path, uint32_t flags)
     /* Lookup file in ramfs */
     ramfs_file_t *rf = ramfs_find(path);
     if (!rf && (flags & VFS_FLAG_CREATE)) {
-        rf = ramfs_create(path, 4096);
+        rf = ramfs_create(path, 0);
     }
     if (!rf) return -1;
 
@@ -438,6 +480,44 @@ static int vfs_on_mount(const char *path)
     return path && fatfs_owns(path);
 }
 
+/* Calls fn once for every entry directly inside `dir`: files, folders, and
+ * folders that exist only because something lives beneath them. Returns
+ * the number of entries, or -1 if `dir` is on a USB drive (use vfs_list). */
+int vfs_dir_entries(const char *dir, void (*fn)(void *ctx, const char *name, size_t len, int is_dir), void *ctx)
+{
+    if (vfs_on_mount(dir)) return -1;
+    static int32_t seen[8192];                  /* implied folders already reported: slot + 1 */
+    static uint16_t seen_len[8192];
+    memset(seen, 0, sizeof(seen));
+    size_t dl = strlen(dir);
+    while (dl > 1 && dir[dl - 1] == '/') dl--;
+    if (dl == 1) dl = 0;                        /* the root */
+    int n = 0;
+    for (int i = 0; i < ramfs_count; i++) {
+        ramfs_file_t *f = &ramfs_files[i];
+        if (!f->used || strncmp(f->path, dir, dl) != 0 || f->path[dl] != '/' || !f->path[dl + 1]) continue;
+        const char *name = f->path + dl + 1;
+        const char *slash = strchr(name, '/');
+        size_t nl = slash ? (size_t)(slash - name) : strlen(name);
+        int is_dir = slash ? 1 : f->is_dir;
+        /* report each folder name once (it may appear explicitly and implied) */
+        if (is_dir) {
+            uint32_t h = 2166136261u;
+            for (size_t k = 0; k < nl; k++) h = (h ^ (uint8_t)name[k]) * 16777619u;
+            int dup = 0;
+            for (uint32_t k = h & 8191, tries = 0; tries < 8192; k = (k + 1) & 8191, tries++) {
+                if (!seen[k]) { seen[k] = i + 1; seen_len[k] = (uint16_t)nl; break; }
+                const char *other = ramfs_files[seen[k] - 1].path + dl + 1;
+                if (seen_len[k] == nl && !strncmp(other, name, nl)) { dup = 1; break; }
+            }
+            if (dup) continue;
+        }
+        fn(ctx, name, nl, is_dir);
+        n++;
+    }
+    return n;
+}
+
 int vfs_list(const char *prefix, char *buf, size_t max)
 {
     size_t out = 0;
@@ -507,7 +587,8 @@ static int path_is_under(const char *path, const char *dir, size_t dlen)
 
 static void ramfs_free_node(ramfs_file_t *f)
 {
-    if (f->disk_idx >= 0 && ramfs_deleted_count < 512)
+    ramfs_unhash(f);
+    if (f->disk_idx >= 0 && ramfs_deleted_count < RAMFS_MAX_FILES)
         ramfs_deleted[ramfs_deleted_count++] = f->disk_idx;
     if (f->data) {
         if (f->large) kfree_large(f->data, f->capacity);
@@ -519,6 +600,7 @@ static void ramfs_free_node(ramfs_file_t *f)
 int vfs_exists(const char *path)
 {
     if (vfs_on_mount(path)) return fatfs_stat(path, NULL, NULL) == 0;
+    if (ramfs_find(path)) return 1;
     size_t plen = strlen(path);
     for (int i = 0; i < ramfs_count; i++)
         if (ramfs_files[i].used && path_is_under(ramfs_files[i].path, path, plen))
@@ -551,6 +633,8 @@ long vfs_size(const char *path)
         uint32_t sz;
         return fatfs_stat(path, NULL, &sz) == 0 ? (long)sz : -1;
     }
+    ramfs_file_t *rf = ramfs_find(path);
+    if (rf && !rf->is_dir) return (long)rf->size;
     size_t plen = strlen(path);
     long total = -1;
     for (int i = 0; i < ramfs_count; i++) {
@@ -630,7 +714,9 @@ int vfs_rename(const char *from, const char *to)
         char tail[sizeof(f->path)];
         strncpy(tail, f->path + flen, sizeof(tail) - 1);
         tail[sizeof(tail) - 1] = '\0';
+        ramfs_unhash(f);
         snprintf(f->path, sizeof(f->path), "%s%s", to, tail);
+        ramfs_rehash(f);
         ramfs_touch(f);
     }
     return 0;
@@ -739,7 +825,7 @@ int vfs_copy(const char *from, const char *to)
         size_t size = src->size;
         int is_dir = src->is_dir;
         ramfs_file_t *dst = ramfs_create_node(dst_path, is_dir ? 0 : size, is_dir);
-        if (!dst || !dst->data) return -1;
+        if (!dst || (!is_dir && size && !dst->data)) return -1;
 
         src = &ramfs_files[i];
         if (!is_dir && size) {
@@ -850,23 +936,25 @@ int vfs_take_deleted(int *disk_idx)
  * with `size` bytes of content (NULL on failure). */
 uint8_t *vfs_restore_node(const char *path, int is_dir, size_t size, int disk_idx)
 {
-    ramfs_file_t *f = ramfs_create_node(path, size ? size : 4096, is_dir);
-    if (!f || !f->data) return NULL;
+    static uint8_t empty_buf[1];            /* folders and empty files: nothing to fill */
+    if (is_dir) size = 0;
+    ramfs_file_t *f = ramfs_create_node(path, size, is_dir);
+    if (!f || (size && !f->data)) return NULL;
 
     if (f->capacity < size) {               /* existed already, but smaller */
-        uint8_t *bigger = size >= LARGE_ALLOC_THRESHOLD ? (uint8_t *)kmalloc_large(size)
-                                                        : (uint8_t *)kmalloc(size);
+        int large;
+        uint8_t *bigger = ramfs_alloc(size, &large);
         if (!bigger) return NULL;
-        if (f->large) kfree_large(f->data, f->capacity); else kfree(f->data);
+        if (f->data) { if (f->large) kfree_large(f->data, f->capacity); else kfree(f->data); }
         f->data = bigger;
         f->capacity = size;
-        f->large = size >= LARGE_ALLOC_THRESHOLD;
+        f->large = large;
     }
     f->is_dir = is_dir;
     f->size = is_dir ? 0 : size;
     f->disk_idx = disk_idx;
     f->dirty = 0;
-    return f->data;
+    return f->data ? f->data : empty_buf;
 }
 
 /* Memory-map a model file into the model pool (zero-copy for large weights) */

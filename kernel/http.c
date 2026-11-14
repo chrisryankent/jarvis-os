@@ -214,17 +214,17 @@ static int fetch_once(http_req_t *r)
 
     snprintf(r->phase, sizeof(r->phase), "Waiting for %s", host);
     static uint8_t buf[16384];
-    static char head[16384];
+    static char head[65536];
     size_t hlen = 0;
     int chunked = 0, have_len = 0;
     uint64_t clen = 0;
     char *body_start = NULL;
     /* headers */
     while (!body_start) {
-        int n = t ? tls_read(t, buf, sizeof(buf), 30000) : tcp_recv(sock, buf, sizeof(buf), 30000);
+        size_t room = sizeof(head) - 1 - hlen;
+        if (!room) { snprintf(r->err, sizeof(r->err), "the reply headers are too long"); goto fail; }
+        int n = t ? tls_read(t, head + hlen, room, 30000) : tcp_recv(sock, head + hlen, room, 30000);
         if (n <= 0) { if (!r->err[0]) snprintf(r->err, sizeof(r->err), "the server sent no answer"); goto fail; }
-        if (hlen + (size_t)n >= sizeof(head)) { snprintf(r->err, sizeof(r->err), "the reply headers are too long"); goto fail; }
-        memcpy(head + hlen, buf, (size_t)n);
         hlen += (size_t)n;
         head[hlen] = 0;
         char *e = strstr(head, "\r\n\r\n");
@@ -302,6 +302,10 @@ static void http_worker(void)
         if (rc != 1) break;
     }
     if (rc == 1) snprintf(r->err, sizeof(r->err), "too many redirects");
+    if (rc == 0 && r->save_path[0] && r->status >= 400) {
+        snprintf(r->err, sizeof(r->err), "the server answered HTTP %d%s", r->status, r->status == 404 ? " (not found)" : r->status == 403 ? " (forbidden)" : "");
+        rc = -1;
+    }
     if (rc == 0 && r->save_path[0]) {
         snprintf(r->phase, sizeof(r->phase), "Saving");
         if (vfs_write_file(r->save_path, r->data ? r->data : (uint8_t *)"", r->len) != 0) { snprintf(r->err, sizeof(r->err), "could not save %s", r->save_path); rc = -1; }

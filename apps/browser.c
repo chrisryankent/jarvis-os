@@ -30,7 +30,24 @@
 #define BR_LINK       0x001A0DAB
 #define BR_DIM        0x005F6368
 #define BR_HOME       "about:home"
-#define BR_SEARCH     "https://html.duckduckgo.com/html/?q="
+/* Search engines (setting "search_engine"). Google answers browsers that
+ * run no JavaScript with a redirect page instead of results, so Bing is
+ * the default. */
+static const char *br_search_base(void)
+{
+    switch (setting_get_int("search_engine", 0)) {
+    case 1:  return "https://www.google.com/search?gbv=1&hl=en&q=";
+    case 2:  return "https://html.duckduckgo.com/html/?q=";
+    default: return "https://www.bing.com/search?q=";
+    }
+}
+static const char *br_search_name(void)
+{
+    static const char *const n[3] = { "Bing", "Google", "DuckDuckGo" };
+    int i = setting_get_int("search_engine", 0);
+    return n[i >= 0 && i < 3 ? i : 0];
+}
+#define BR_SEARCH br_search_base()
 
 enum { BI_TEXT = 0, BI_RULE, BI_IMAGE, BI_INPUT, BI_BUTTON, BI_BULLET };
 
@@ -78,6 +95,7 @@ static struct {
     br_form_t forms[16];
     int nforms;
     int page_h, layout_w, scroll;
+    int full_page, has_main;                /* show everything, or only <main> */
     int hover_link;
     /* history */
     char back[24][512]; int nback;
@@ -89,6 +107,7 @@ static struct {
 } br;
 
 void apps_store_show_install(const char *path);
+static int strncasecmp_br(const char *a, const char *b, int n);
 
 /* ---- text pool and items ------------------------------------------------------------ */
 static uint32_t br_pool_add(const char *s, size_t n)
@@ -125,7 +144,9 @@ static struct {
     int form;
     /* the run being built */
     char run[600]; int run_len, run_x, run_font; uint32_t run_color; int run_link;
-    int in_textarea, in_select, in_option;
+    int in_textarea, in_select, in_option, in_button;
+    char hide_tag[16]; int hide_depth;      /* inside a hidden element */
+    const char *after;                      /* html just after the current tag */
 } L;
 
 static int br_font(void)
@@ -236,8 +257,7 @@ static int br_map_cp(uint32_t cp, char *out)
         static const char ext[] = "AaAaAaCcCcCcCcDdDdEeEeEeEeEeGgGgGgGgHhHhIiIiIiIiIiJjJjKkkLlLlLlLlLlNnNnNnnNnOoOoOoOoRrRrRrSsSsSsSsTtTtTtUuUuUuUuUuUuWwYyYZzZzZzs";
         if (cp - 0x100 < sizeof(ext) - 1) { out[0] = ext[cp - 0x100]; return 1; }
     }
-    out[0] = '?';
-    return 1;
+    return 0;           /* a script the font has no letters for: left out */
 }
 
 static const struct { const char *n; uint32_t cp; } g_entities[] = {
@@ -294,7 +314,7 @@ static int br_decode(const char *src, int n, char *dst, int cap)
 /* Text between tags: words, or the whole thing in <pre>. */
 static void br_text(const char *s, int n)
 {
-    if (L.skip) return;
+    if (L.skip || L.hide_depth || L.in_button) return;
     static char buf[8192];
     if (n > (int)sizeof(buf) - 4) n = (int)sizeof(buf) - 4;
     int len = br_decode(s, n, buf, sizeof(buf));
@@ -360,10 +380,37 @@ static int br_attr(const char *tag, int tl, const char *name, char *out, int cap
     return 0;
 }
 
+/* Bing wraps results as https://www.bing.com/ck/a?...&u=a1<base64url>
+ * (followed with JavaScript): use the address inside instead. */
+static int br_unwrap_bing(const char *u, char *out, size_t n)
+{
+    if (strncmp(u, "https://www.bing.com/ck/a?", 26)) return 0;
+    const char *p = strstr(u, "&u=a1");
+    if (!p) p = strstr(u, "?u=a1");
+    if (!p) return 0;
+    p += 5;
+    uint32_t acc = 0;
+    int bits = 0;
+    size_t o = 0;
+    for (; *p && *p != '&' && o < n - 1; p++) {
+        char c = *p;
+        int v = c >= 'A' && c <= 'Z' ? c - 'A' : c >= 'a' && c <= 'z' ? c - 'a' + 26 : c >= '0' && c <= '9' ? c - '0' + 52 :
+                (c == '-' || c == '+') ? 62 : (c == '_' || c == '/') ? 63 : -1;
+        if (v < 0) break;
+        acc = acc << 6 | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) { bits -= 8; out[o++] = (char)((acc >> bits) & 255); }
+    }
+    out[o] = 0;
+    return !strncmp(out, "http", 4);
+}
+
 static int br_link_add(const char *href)
 {
     if (br.nlinks >= BR_MAX_LINKS) return -1;
     http_resolve_url(br.url, href, br.links[br.nlinks], sizeof(br.links[0]));
+    char real[256];
+    if (br_unwrap_bing(br.links[br.nlinks], real, sizeof(real))) snprintf(br.links[br.nlinks], sizeof(br.links[0]), "%s", real);
     return br.nlinks++;
 }
 
@@ -476,6 +523,31 @@ static void br_tag(const char *tag, int tl)
         }
     if (tag_is(name, "title")) { L.in_title = !closing; if (!closing) br.title[0] = 0; return; }
     if (L.skip) return;
+    /* hidden elements: skip until the matching end tag */
+    if (L.hide_depth) {
+        if (tag_is(name, L.hide_tag)) L.hide_depth += closing ? -1 : 1;
+        return;
+    }
+    if (!closing) {
+        char a[64];
+        static const char *const voids[] = { "br", "hr", "img", "input", "meta", "link", "source", "wbr", "area", "col" };
+        int is_void = 0;
+        for (size_t i = 0; i < sizeof(voids) / sizeof(voids[0]); i++) if (tag_is(name, voids[i])) is_void = 1;
+        static const char *const hidden_classes[] = { "dropdown", "visually-hidden", "sr-only", "screen-reader", "noprint",
+                                                      "mw-editsection", "navbox", "vector-menu", "vector-page-toolbar", "vector-column-end",
+                                                      "vector-sticky", "vector-header", "skip-link", "cookie", "modal" };
+        char cls[160];
+        int hidden_class = 0;
+        if (br_attr(tag, tl, "class", cls, sizeof(cls)))
+            for (size_t i = 0; i < sizeof(hidden_classes) / sizeof(hidden_classes[0]); i++) if (strstr(cls, hidden_classes[i])) hidden_class = 1;
+        int hidden = hidden_class || br_attr(tag, tl, "hidden", a, sizeof(a)) ||
+                     (br_attr(tag, tl, "aria-hidden", a, sizeof(a)) && !strcmp(a, "true")) ||
+                     (br_attr(tag, tl, "style", a, sizeof(a)) && (strstr(a, "display:none") || strstr(a, "display: none")));
+        if (hidden && !tag_is(name, "input")) {
+            if (!is_void && tl > 0 && tag[tl - 1] != '/') { snprintf(L.hide_tag, sizeof(L.hide_tag), "%s", name); L.hide_depth = 1; }
+            return;
+        }
+    }
     if (tag_is(name, "br")) { br_newline(L.line_empty ? br_font_h(br_font()) : 0); return; }
     if (tag_is(name, "hr")) {
         br_block(8);
@@ -557,7 +629,38 @@ static void br_tag(const char *tag, int tl)
     }
     if (tag_is(name, "input") && !closing) { br_input(tag, tl, 0); return; }
     if (tag_is(name, "button")) {
-        if (!closing) { br_input(tag, tl, 1); L.skip++; L.skip--; }
+        if (closing) { L.in_button = 0; return; }
+        /* the button's own text is its label */
+        char label[64] = "";
+        if (L.after) {
+            const char *e = strstr(L.after, "</button");
+            if (!e) e = strstr(L.after, "</BUTTON");
+            if (e && e - L.after < 2000) {
+                static char raw[2048];
+                int k = 0, intag = 0;
+                for (const char *c = L.after; c < e && k < (int)sizeof(raw) - 1; c++) {
+                    if (*c == '<') intag = 1; else if (*c == '>') intag = 0; else if (!intag) raw[k++] = *c == '\n' ? ' ' : *c;
+                }
+                raw[k] = 0;
+                br_decode(raw, k, label, sizeof(label));
+                char *s = label;
+                while (*s == ' ') s++;
+                memmove(label, s, strlen(s) + 1);
+                for (int z = (int)strlen(label) - 1; z >= 0 && label[z] == ' '; z--) label[z] = 0;
+            }
+        }
+        char v[8];
+        br_input(tag, tl, 1);
+        if (br.ninputs && !br_attr(tag, tl, "value", v, sizeof(v)) && label[0]) {
+            br_input_t *in = &br.inputs[br.ninputs - 1];
+            snprintf(in->value, sizeof(in->value), "%s", label);
+            if (br.nitems && br.items[br.nitems - 1].kind == BI_BUTTON && br.items[br.nitems - 1].ref == br.ninputs - 1) {
+                int nw = fb_text_width(label) + 28;
+                L.x += nw - br.items[br.nitems - 1].w;
+                br.items[br.nitems - 1].w = nw;
+            }
+        }
+        L.in_button = 1;
         return;
     }
     if (tag_is(name, "textarea")) {
@@ -590,6 +693,48 @@ static void br_layout(int width)
     const char *h = (const char *)br.html;
     size_t n = br.html_len;
     if (!h) { br.page_h = 0; return; }
+    /* Without CSS, menus and sidebars come first: show the page's <main>
+     * content when it has one (the title is read from the whole page). */
+    br.has_main = 0;
+    if (!br.is_text) {
+        const char *ts = strstr(h, "<title");
+        if (!ts) ts = strstr(h, "<TITLE");
+        if (ts) {
+            const char *a = strchr(ts, '>'), *e = a ? strstr(a, "</title") : NULL;
+            if (!e && a) e = strstr(a, "</TITLE");
+            if (a && e && e - a < 400) {
+                br_decode(a + 1, (int)(e - a - 1), br.title, sizeof(br.title));
+                /* collapse white space */
+                char *w = br.title, *r = br.title;
+                int sp = 1;
+                for (; *r; r++) {
+                    int ws = *r == ' ' || *r == '\n' || *r == '\r' || *r == '\t';
+                    if (ws) { if (!sp) *w++ = ' '; sp = 1; } else { *w++ = *r; sp = 0; }
+                }
+                if (w > br.title && w[-1] == ' ') w--;
+                *w = 0;
+            }
+        }
+        const char *m = strstr(h, "<main");
+        const char *me = NULL;
+        for (const char *q = m; q && (q = strstr(q, "</main>")); q += 7) me = q;
+        if (m && me && me > m) {
+            br.has_main = 1;
+            if (!br.full_page) {
+                br_item_t *it = br_item(BI_TEXT);
+                if (it) {
+                    static const char note[] = "Showing the main content. Show the whole page";
+                    it->x = L.left; it->y = 4; it->font = FONT_SMALL; it->color = BR_LINK; it->underline = 1;
+                    it->link = (int16_t)br_link_add("about:fullpage");
+                    it->off = br_pool_add(note, sizeof(note) - 1); it->len = sizeof(note) - 1;
+                    it->w = fb_text_width_font(note, FONT_SMALL); it->h = 18;
+                }
+                L.y = 26;
+                h = m;
+                n = (size_t)(me - m);
+            }
+        }
+    }
     if (br.is_text) {
         L.pre = L.mono = 1;
         br_text(h, (int)(n > 400000 ? 400000 : n));
@@ -609,6 +754,7 @@ static void br_layout(int width)
                     else if (q && h[j] == q) q = 0;
                     j++;
                 }
+                L.after = j + 1 < n ? h + j + 1 : NULL;
                 if (h[i + 1] != '!' && h[i + 1] != '?') br_tag(h + i + 1, (int)(j - i - 1));
                 /* raw text elements: jump to their end tag */
                 if (L.skip) {
@@ -656,6 +802,7 @@ static void br_set_html(const char *s, size_t n, int text)
     br.img_loading = -1;
     br.scroll = 0;
     br.layout_w = 0;
+    br.full_page = 0;
     br.focus_input = -1;
     br.hover_link = -1;
 }
@@ -675,14 +822,18 @@ static void br_home_page(void)
     static char page[8192];
     int n = snprintf(page, sizeof(page),
         "<title>New tab</title><h1>JARVIS Browser</h1>"
-        "<form action=\"https://html.duckduckgo.com/html/\" method=\"get\"><input type=\"text\" name=\"q\" placeholder=\"Search the web\"> <input type=\"submit\" value=\"Search\"></form>"
+        "<form action=\"%.*s\" method=\"get\">%s<input type=\"text\" name=\"q\" placeholder=\"Search with %s\"> <input type=\"submit\" value=\"Search\"></form>"
+        "<p><small>Search engine: %s. Change it with: set search_engine bing / google / duckduckgo (Google needs JavaScript and may not show results).</small></p>"
         "<h3>Go to</h3><ul>"
         "<li><a href=\"https://en.wikipedia.org/wiki/Main_Page\">Wikipedia</a></li>"
         "<li><a href=\"https://www.debian.org/\">Debian</a> - <a href=\"https://packages.debian.org/stable/\">Debian packages</a></li>"
         "<li><a href=\"https://github.com/\">GitHub</a></li>"
         "<li><a href=\"https://news.ycombinator.com/\">Hacker News</a></li>"
         "<li><a href=\"https://lite.cnn.com/\">CNN (text edition)</a></li>"
-        "<li><a href=\"https://example.com/\">example.com</a></li></ul>");
+        "<li><a href=\"https://example.com/\">example.com</a></li></ul>",
+        (int)(strchr(br_search_base(), '?') - br_search_base()), br_search_base(),
+        setting_get_int("search_engine", 0) == 1 ? "<input type=\"hidden\" name=\"gbv\" value=\"1\">" : "",
+        br_search_name(), br_search_name());
     /* favorites from the registry */
     int k = reg_open_key("HKCU\\Software\\JARVIS OS\\Browser\\Favorites", 0);
     char nm[64], val[512];
@@ -1125,7 +1276,7 @@ static void br_draw_downloads(int x, int y, int w)
         char b[120];
         if (d->req.state == HTTP_DONE) {
             int jpk = strstr(d->name, ".jpk") != NULL;
-            snprintf(b, sizeof(b), "%s", d->name);
+            snprintf(b, sizeof(b), "%s " SYM_CHECK, d->name);
             ui_text_fit(dx + 8, y + 12, bw - (jpk ? 70 : 16), b, T(TEXT));
             if (jpk) { fb_fill_rounded_rect(dx + bw - 62, y + 8, 56, 24, 4, T(ACCENT)); ui_text_center(dx + bw - 62, y + 12, 56, "Install", T(ACCENT_TEXT)); }
         } else if (d->req.state == HTTP_FAILED) {
@@ -1312,6 +1463,7 @@ void browser_event(wm_window_t *win, wm_input_event_t *e)
         if (it->kind == BI_BUTTON) { br_submit(br.inputs[it->ref].form, it->ref); return; }
         if (it->link >= 0) {
             const char *l = br.links[it->link];
+            if (!strcmp(l, "about:fullpage")) { br.full_page = 1; br.layout_w = 0; return; }
             if (!strncmp(l, "mailto:", 7) || !strncmp(l, "javascript:", 11)) { snprintf(br.msg, sizeof(br.msg), "This kind of link cannot be opened here."); return; }
             char u[512];
             snprintf(u, sizeof(u), "%s", l);

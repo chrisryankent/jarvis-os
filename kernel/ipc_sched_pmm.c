@@ -180,6 +180,7 @@ typedef struct process {
     int            wait_id;         /* mutex / semaphore index */
     int            vm_space;        /* address space id, 0 = kernel's */
     uint64_t       cr3;             /* its page table, 0 = kernel's   */
+    uint64_t       fs_base;         /* user TLS pointer (Linux arch_prctl) */
     struct { uint32_t from; uint64_t value; } mailbox[MAILBOX_SIZE];
     int            mail_head, mail_count;
     uint8_t        stack[PROC_STACK_SIZE];
@@ -253,6 +254,11 @@ void context_switch(void *from_void, void *to_void)
     process_t *from = (process_t *)from_void;
     process_t *to   = (process_t *)to_void;
     if (!from || !to || from == to) return;
+    /* FS base (thread-local storage of user programs) belongs to the process */
+    uint32_t lo, hi;
+    __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000100));
+    from->fs_base = (uint64_t)hi << 32 | lo;
+    __asm__ volatile ("wrmsr" :: "c"(0xC0000100), "a"((uint32_t)to->fs_base), "d"((uint32_t)(to->fs_base >> 32)));
     context_switch_asm(&from->rsp, &to->rsp);
 }
 
@@ -523,6 +529,18 @@ void proc_set_note(const char *note)
 {
     process_t *p = proc_by_pid(kthread_current_pid());
     if (p) p->note = note;
+}
+
+/* Thread-local storage base of the current process (Linux arch_prctl). */
+void proc_set_fs_base(uint64_t v)
+{
+    if (current_proc) current_proc->fs_base = v;
+    __asm__ volatile ("wrmsr" :: "c"(0xC0000100), "a"((uint32_t)v), "d"((uint32_t)(v >> 32)));
+}
+
+uint64_t proc_get_fs_base(void)
+{
+    return current_proc ? current_proc->fs_base : 0;
 }
 
 uint32_t proc_parent(uint32_t pid)
@@ -1131,7 +1149,7 @@ uint64_t pmm_alloc_contiguous(uint64_t pages)
  *      This is what actually makes it possible to stage a multi-GB model
  *      file in ramfs without needing a multi-GB static C array.
  */
-#define HEAP_SIZE        (16 * 1024 * 1024) /* 16 MB — for small/metadata allocations only */
+#define HEAP_SIZE        (32 * 1024 * 1024) /* 32 MB — for small/metadata allocations only */
 #define HEAP_ALIGN       16UL
 #define HEAP_MIN_SPLIT   32UL
 /* LARGE_ALLOC_THRESHOLD is defined once, in kernel.h, and shared with vfs.c */
@@ -1160,7 +1178,7 @@ void *kmalloc(size_t size)
     if (size == 0) return NULL;
     if (size >= LARGE_ALLOC_THRESHOLD) {
         terminal_printf("[HEAP] kmalloc(%zu): use kmalloc_large() for "
-                         "allocations this size — refusing\n", size);
+                         "allocations this size — refusing (caller %p)\n", size, __builtin_return_address(0));
         return NULL;
     }
 
@@ -1236,7 +1254,7 @@ void heap_get_stats(uint64_t *used_bytes, uint64_t *free_bytes, uint64_t *total_
     if (total_bytes) *total_bytes = HEAP_SIZE;
 }
 
-#define MAX_LARGE_ALLOCS 64
+#define MAX_LARGE_ALLOCS 16384     /* every file of a page or more is one (vfs.c) */
 typedef struct { void *ptr; uint64_t pages; } large_alloc_t;
 static large_alloc_t large_allocs[MAX_LARGE_ALLOCS];
 
@@ -1268,8 +1286,7 @@ void *kmalloc_large(size_t size)
     for (uint64_t i = 0; i < pages; i++)
         pmm_free_frame(phys + i * PAGE_SIZE);
     irq_restore(irqf);
-    terminal_puts("[HEAP] kmalloc_large: tracking table full (max 64 "
-                  "concurrent large allocations)\n");
+    terminal_puts("[HEAP] kmalloc_large: tracking table full\n");
     return NULL;
 }
 

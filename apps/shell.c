@@ -1317,11 +1317,81 @@ static int c_run(int argc, char **argv)
         sh_err("run: %s is not a program\n", argv[1]);
         return 1;
     }
-    uint32_t pid = user_exec(p);
+    uint32_t pid;
+    if (linux_is_program(p)) {
+        /* a Linux program: arguments and the current folder go with it */
+        char *lav[64];
+        int lac = 0;
+        lav[lac++] = (char *)sh_basename(p);
+        for (int i = 2; i < argc && lac < 63; i++) lav[lac++] = argv[i];
+        pid = linux_exec(p, lac, lav, sh.cwd);
+    } else pid = user_exec(p);
     if (!pid) { sh_err("run: could not start %s\n", argv[1]); return 1; }
     if (sh_background || sh.root) sh_printf("[%u] %s started in the background\n", pid, sh_basename(p));
     else { sh_printf("Started %s as PID %u (Ctrl+C ends it)\n", sh_basename(p), pid); user_set_foreground(pid); }
     return 0;
+}
+
+/* apt / apt-get / apt-cache / dpkg: a worker process (kernel/dpkg.c) that
+ * prints into the Terminal and owns the keyboard (for "continue? [Y/n]"). */
+static int c_pkgcmd(int argc, char **argv);
+
+static int c_apt(int argc, char **argv)
+{
+    /* "apt install app.jpk" still installs a JARVIS app */
+    if (argc > 2 && !strcmp(argv[0], "apt") && !strcmp(argv[1], "install")) {
+        const char *dot = strrchr(argv[argc - 1], '.');
+        if (dot && !strcasecmp_s(dot, ".jpk")) return c_pkgcmd(argc, argv);
+    }
+    uint32_t pid = dpkg_start(argc, argv, sh.cwd);
+    if (!pid) return 1;
+    if (sh.root) {
+        desktop_app_launch(desktop_app_find("Terminal"));
+        sh_printf("Started '%s' (PID %u); its output appears in the Terminal window.%s\n", argv[0], pid,
+                  !strcmp(argv[0], "dpkg") ? "" : " Add -y so it does not wait for a yes/no answer.");
+    } else if (!sh_background) user_set_foreground(pid);
+    return 0;
+}
+
+/* run <path> with the words after the command as its arguments */
+static int sh_run_with(const char *p, int argc, char **argv)
+{
+    char *a[66];
+    int n = 0;
+    a[n++] = (char *)"run";
+    a[n++] = (char *)p;
+    for (int i = 1; i < argc && n < 65; i++) a[n++] = argv[i];
+    a[n] = NULL;
+    return c_run(n, a);
+}
+
+/* Looks a name up on the Linux PATH inside /jarvis/linux. */
+static int sh_linux_find(const char *name, char *out, size_t n)
+{
+    static const char *const dirs[] = { "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin" };
+    if (strchr(name, '/')) return 0;
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        snprintf(out, n, "/jarvis/linux%s/%s", dirs[i], name);
+        if (user_is_program(out)) return 1;
+    }
+    return 0;
+}
+
+/* linux <program> [args]: runs a Linux program (found on the Linux PATH, or
+ * by path), even when a JARVIS command has the same name. */
+static int c_linux(int argc, char **argv)
+{
+    if (argc < 2) {
+        sh_printf("Linux compatibility layer: runs Linux x86-64 programs (PIE and static-PIE, glibc).\n"
+                  "Files: / for a Linux program is /jarvis/linux; /jarvis is shared.\n"
+                  "usage: linux <program> [args]      e.g. linux hello, linux ./a.out\n");
+        return 0;
+    }
+    char p[256];
+    if (strchr(argv[1], '/') || argv[1][0] == '.') sh_path(argv[1], p, sizeof(p));
+    else if (!sh_linux_find(argv[1], p, sizeof(p))) { sh_err("linux: %s: not found on the Linux PATH (/jarvis/linux/usr/bin, /bin ...)\n", argv[1]); return 127; }
+    if (!linux_is_program(p)) { sh_err("linux: %s is not a Linux program\n", argv[1]); return 1; }
+    return sh_run_with(p, argc - 1, argv + 1);
 }
 
 static int c_spawn(int argc, char **argv)
@@ -1681,6 +1751,85 @@ static int c_netcmd(int argc, char **argv)
     return 0;
 }
 
+/* curl / wget: HTTP and HTTPS through kernel/http.c. They run in a network
+ * process; the Terminal prints the result when it arrives. */
+static struct { http_req_t req; int active, save, quiet, head_only; char path[256]; } g_sh_dl[4];
+
+void shell_poll_downloads(void)
+{
+    for (int i = 0; i < 4; i++) {
+        if (!g_sh_dl[i].active || (g_sh_dl[i].req.state != HTTP_DONE && g_sh_dl[i].req.state != HTTP_FAILED)) continue;
+        http_req_t *r = &g_sh_dl[i].req;
+        char line[400];
+        if (r->state == HTTP_FAILED) { snprintf(line, sizeof(line), "curl: %s: %s\n", r->url, r->err); terminal_app_write_err(line); }
+        else if (g_sh_dl[i].head_only) {
+            snprintf(line, sizeof(line), "HTTP %d  %s\ncontent-type: %s\ncontent-length: %u\n%s%s\n", r->status, r->url, r->ctype,
+                     (unsigned)r->len, r->tls[0] ? "security: " : "", r->tls);
+            terminal_app_write(line);
+        } else if (g_sh_dl[i].save) {
+            snprintf(line, sizeof(line), "Saved %u bytes to %s (HTTP %d%s%s)\n", (unsigned)r->len, g_sh_dl[i].path, r->status, r->tls[0] ? ", " : "", r->tls);
+            terminal_app_write(line);
+            desktop_files_changed();
+        } else {
+            size_t show = r->len > 16384 ? 16384 : r->len;
+            static char text[16384 + 64];
+            size_t o = 0;
+            for (size_t k = 0; k < show; k++) { char c = (char)r->data[k]; text[o++] = (c == '\n' || c == '\t' || ((unsigned char)c >= 32 && (unsigned char)c < 127)) ? c : '.'; }
+            text[o] = 0;
+            terminal_app_write(text);
+            if (r->len > show) { snprintf(line, sizeof(line), "\n[%u more bytes; use -o FILE to save everything]\n", (unsigned)(r->len - show)); terminal_app_write(line); }
+            else terminal_app_write("\n");
+        }
+        http_free(r);
+        g_sh_dl[i].active = 0;
+        desktop_invalidate();
+    }
+}
+
+static int c_curl(int argc, char **argv)
+{
+    int wget = !strcmp(argv[0], "wget");
+    const char *url = NULL, *out = NULL;
+    int remote_name = wget, head = 0, quiet = 0;
+    for (int i = 1; i < argc; i++) {
+        if ((!strcmp(argv[i], "-o") || !strcmp(argv[i], "-O") || !strcmp(argv[i], "--output")) && i + 1 < argc && (!wget || !strcmp(argv[i], "-O"))) {
+            if (!wget && !strcmp(argv[i], "-O")) { remote_name = 1; continue; }
+            out = argv[++i];
+        } else if (!strcmp(argv[i], "-O") && !wget) remote_name = 1;
+        else if (!strcmp(argv[i], "-I") || !strcmp(argv[i], "--head")) head = 1;
+        else if (!strcmp(argv[i], "-s") || !strcmp(argv[i], "-q") || !strcmp(argv[i], "-L") || !strcmp(argv[i], "-k")) quiet = 1;
+        else if (argv[i][0] != '-') url = argv[i];
+    }
+    if (!url) { sh_err("usage: %s <url> %s\n", argv[0], wget ? "[-O file]" : "[-o file | -O] [-I]"); return 1; }
+    char full[1024];
+    if (!strstr(url, "://")) snprintf(full, sizeof(full), "https://%s", url); else snprintf(full, sizeof(full), "%s", url);
+    if (net_is_offline()) { sh_err("%s: the network is off (airplane mode or adapter disabled)\n", argv[0]); return 1; }
+    int slot = -1;
+    for (int i = 0; i < 4; i++) if (!g_sh_dl[i].active) { slot = i; break; }
+    if (slot < 0) { sh_err("%s: four transfers are already running\n", argv[0]); return 1; }
+    memset(&g_sh_dl[slot], 0, sizeof(g_sh_dl[slot]));
+    http_req_t *r = &g_sh_dl[slot].req;
+    snprintf(r->url, sizeof(r->url), "%s", full);
+    if (out || remote_name) {
+        char p[256];
+        if (out) sh_path(out, p, sizeof(p));
+        else {
+            char name[96];
+            http_suggest_name(r, name, sizeof(name));
+            snprintf(p, sizeof(p), "%s/%s", sh.cwd, name);
+        }
+        snprintf(g_sh_dl[slot].path, sizeof(g_sh_dl[slot].path), "%s", p);
+        snprintf(r->save_path, sizeof(r->save_path), "%s", p);
+        g_sh_dl[slot].save = 1;
+    }
+    g_sh_dl[slot].head_only = head;
+    g_sh_dl[slot].quiet = quiet;
+    g_sh_dl[slot].active = 1;
+    if (http_start(r) != 0) { sh_err("%s: %s\n", argv[0], r->err); g_sh_dl[slot].active = 0; return 1; }
+    sh_printf("%s %s ...%s\n", g_sh_dl[slot].save ? "Downloading" : "Fetching", full, sh.root ? " (the result appears in the Terminal)" : "");
+    return 0;
+}
+
 static int c_route(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -1831,7 +1980,7 @@ static int c_uninstall(int argc, char **argv)
     return 0;
 }
 
-static int c_apt(int argc, char **argv)          /* apt/pkg list|install|remove */
+static int c_pkgcmd(int argc, char **argv)       /* pkg list|install|remove (JARVIS apps) */
 {
     if (argc < 2 || !strcmp(argv[1], "list")) return c_packages(argc, argv);
     if (!strcmp(argv[1], "install") && argc > 2) return c_install(argc - 1, argv + 1);
@@ -2039,7 +2188,8 @@ static const sh_cmd_t g_cmds[] = {
     { "suspend",   c_suspres,   "suspend <pid>", "Pause a process", "Processes" },
     { "resume",    c_suspres,   "resume <pid>", "Resume a process", "Processes" },
     { "nice",      c_nice,      "nice <pid> low|normal|high", "Change priority", "Processes" },
-    { "run",       c_run,       "run <program> [&]", "Run a program (Ctrl+C ends it)", "Processes" },
+    { "run",       c_run,       "run <program> [args] [&]", "Run a program (Ctrl+C ends it)", "Processes" },
+    { "linux",     c_linux,     "linux <program> [args]", "Run a Linux program (from /jarvis/linux)", "Processes" },
     { "spawn",     c_spawn,     "spawn cpu|sleeper|deadlock|memory|isolate", "Start a test process", "Processes" },
     { "uname",     c_uname,     "uname [-a]", "System name", "System" },
     { "hostname",  c_hostname,  "hostname [new name]", "Show or set the PC name", "System" },
@@ -2087,8 +2237,14 @@ static const sh_cmd_t g_cmds[] = {
     { "dig",       c_netcmd,    "dig <host>", "Look up a name (DNS)", "Network" },
     { "host",      c_netcmd,    "host <host>", "Look up a name (DNS)", "Network" },
     { "http",      c_netcmd,    "http <url> [file]", "Fetch a plain-http page", "Network" },
-    { "curl",      c_netcmd,    "curl <url>", "Fetch a plain-http page", "Network" },
-    { "wget",      c_netcmd,    "wget <url> [file]", "Download over plain http", "Network" },
+    { "curl",      c_curl,      "curl <url> [-o file | -O] [-I]", "Fetch a page or file over http/https", "Network" },
+    { "apt",       c_apt,       "apt update | install <pkg> | remove <pkg> | search <word> | show <pkg> | list --installed | upgrade", "Debian packages for the Linux layer", "Linux" },
+    { "apt-get",   c_apt,       "apt-get update | install <pkg> | remove <pkg>", "Debian packages (same as apt)", "Linux" },
+    { "apt-cache", c_apt,       "apt-cache search <word> | show <pkg> | policy <pkg>", "Search the Debian package index", "Linux" },
+    { "dpkg",      c_apt,       "dpkg -i <file.deb> | -r <pkg> | -l | -L <pkg> | -s <pkg> | -c <file.deb>", "Install or inspect Debian packages", "Linux" },
+    { "dpkg-query",c_apt,       "dpkg-query -l | -L <pkg> | -s <pkg>", "Query installed Debian packages", "Linux" },
+    { "dpkg-deb",  c_apt,       "dpkg-deb -c|-I <file.deb>", "Inspect a .deb file", "Linux" },
+    { "wget",      c_curl,      "wget <url> [-O file]", "Download a file over http/https", "Network" },
     { "scan",      c_netcmd,    "scan", "Find devices on the local network", "Network" },
     { "nmap",      c_netcmd,    "nmap", "Find devices on the local network", "Network" },
     { "arp-scan",  c_netcmd,    "arp-scan", "Find devices on the local network", "Network" },
@@ -2112,8 +2268,7 @@ static const sh_cmd_t g_cmds[] = {
     { "packages",  c_packages,  "packages", "Installed apps", "Apps" },
     { "install",   c_install,   "install <file.jpk>", "Install an app", "Apps" },
     { "uninstall", c_uninstall, "uninstall <name>", "Remove an app", "Apps" },
-    { "apt",       c_apt,       "apt list|install|remove", "Manage apps", "Apps" },
-    { "pkg",       c_apt,       "pkg list|install|remove", "Manage apps", "Apps" },
+    { "pkg",       c_pkgcmd,    "pkg list|install|remove", "Manage JARVIS apps (.jpk)", "Apps" },
     { "apps",      c_apps,      "apps", "Apps on this PC", "Apps" },
     { "close",     c_close,     "close <app>", "Close an app window", "Apps" },
     { "screenshot", c_screenshot, "screenshot", "Save a picture of the screen", "Desktop" },
@@ -2375,7 +2530,7 @@ static int sh_run_simple(char **argv, int *quoted, int argc)
     if (argv[0][0] == '.' || argv[0][0] == '/') {
         char p[256];
         sh_path(argv[0], p, sizeof(p));
-        if (user_is_program(p)) { char *a[3] = { (char *)"run", p, NULL }; return c_run(2, a); }
+        if (user_is_program(p)) return sh_run_with(p, argc, argv);
         if (sh_isdir(p)) { char *a[2] = { (char *)"cd", p }; return c_cd(2, a); }
     }
     /* alias */
@@ -2394,8 +2549,10 @@ static int sh_run_simple(char **argv, int *quoted, int argc)
     /* a program in /jarvis/bin, or an installed app */
     char p[256];
     snprintf(p, sizeof(p), "/jarvis/bin/%s", argv[0]);
-    if (user_is_program(p)) { char *a[3] = { (char *)"run", argv[0], NULL }; return c_run(2, a); }
+    if (user_is_program(p)) return sh_run_with(p, argc, argv);
     if (pkg_run(argv[0])) return 0;
+    /* a Linux program on the Linux PATH (installed with apt or dpkg) */
+    if (sh_linux_find(argv[0], p, sizeof(p))) return sh_run_with(p, argc, argv);
     if (desktop_app_find(argv[0]) >= 0) { desktop_app_launch(desktop_app_find(argv[0])); return 0; }
     sh_err("%s: command not found. Type 'help'.\n", argv[0]);
     return 127;

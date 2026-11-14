@@ -46,6 +46,7 @@ void ui_shell_login_click(int x, int y);
 #include "../apps/photos.c"
 #include "../apps/clock.c"
 #include "../apps/regedit.c"
+#include "../apps/browser.c"
 
 /* ---- App registry -------------------------------------------------------- */
 typedef wm_window_t *(*app_open_fn)(int x, int y, int w, int h);
@@ -73,6 +74,7 @@ static app_entry_t g_apps[] = {
     { { "Clock",      ICON_CLOCK,    NULL }, clock_app_open,      520, 460, "clock alarm alarms timer stopwatch" },
     { { "Run",        ICON_TERMINAL, NULL }, run_app_open,        480, 170, "run" },
     { { "Registry Editor", ICON_REGEDIT, NULL }, regedit_app_open, 1000, 600, "regedit registry editor reg" },
+    { { "Browser",    ICON_BROWSER,  NULL }, browser_app_open,    1060, 640, "browser web internet chrome edge firefox www" },
 };
 #define APP_COUNT ((int)(sizeof(g_apps) / sizeof(g_apps[0])))
 
@@ -248,9 +250,6 @@ void desktop_system_open_app(const char *app)
     int idx = desktop_app_find(app);
     if (idx >= 0) {
         desktop_app_launch(idx);
-    } else if (word_ieq(app, "browser", 7) || word_ieq(app, "web", 3)) {
-        notification_show("Browser", "No web browser yet. In Terminal, 'http <url>' fetches plain http pages.",
-                          NOTIF_WARNING, 5000);
     } else {
         terminal_printf("[DESKTOP] Unknown app: %s\n", app);
     }
@@ -522,6 +521,7 @@ void desktop_system_render(void)
 
     if (notifications_tick())
         g_ds.dirty = 1;
+    shell_poll_downloads();
     static uint64_t last_pref_tick;
     if (now - last_pref_tick >= 50) { last_pref_tick = now; prefs_tick(); clock_tick(); }
     if (now - g_ds.last_draw_tick >= 50)
