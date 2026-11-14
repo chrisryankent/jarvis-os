@@ -1029,17 +1029,20 @@ int64_t linux_syscall(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64
         if (a1 >= LX_FDS) return -EBADF;
         int t = L->fd[a1].type;
         if (t != FD_STDIN && t != FD_STDOUT) return -ENOTTY;
-        if (a2 == 0x5401) {                                 /* TCGETS: a terminal */
-            uint8_t tio[60] = { 0 };
+        if (a2 == 0x5401) {                                 /* TCGETS: struct termios (kernel layout, 36 bytes) */
+            uint8_t tio[36] = { 0 };
             uint32_t iflag = 0x500, oflag = 0x5, cflag = 0xbf, lflag = 0x8a3b;
             memcpy(tio, &iflag, 4); memcpy(tio + 4, &oflag, 4); memcpy(tio + 8, &cflag, 4); memcpy(tio + 12, &lflag, 4);
+            static const uint8_t cc[17] = { 3, 0x1c, 0x7f, 0x15, 4, 0, 1, 0, 0x11, 0x13, 0x1a, 0, 0x12, 0x0f, 0x17, 0x16, 0 };
+            memcpy(tio + 17, cc, sizeof(cc));               /* c_line at 16, c_cc[19] from 17 */
             return copy_out(a3, tio, sizeof(tio));
         }
         if (a2 == 0x5413) {                                 /* TIOCGWINSZ */
             uint16_t ws[4] = { 30, 100, 0, 0 };
             return copy_out(a3, ws, sizeof(ws));
         }
-        if (a2 == 0x5402 || a2 == 0x5403 || a2 == 0x5404 || a2 == 0x540F || a2 == 0x5410) return 0;   /* TCSETS*, TIOCGPGRP, TIOCSPGRP */
+        if (a2 == 0x540F) { uint32_t pg = kthread_current_pid(); return copy_out(a3, &pg, 4); }   /* TIOCGPGRP */
+        if (a2 == 0x5402 || a2 == 0x5403 || a2 == 0x5404 || a2 == 0x5410) return 0;               /* TCSETS*, TIOCSPGRP */
         return -ENOTTY;
     }
     case 21: case 269: case 439: {                          /* access, faccessat, faccessat2 */
@@ -1323,7 +1326,38 @@ int64_t linux_syscall(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64
     case 57: case 58: case 56: case 435: case 59: case 322: /* fork, vfork, clone, clone3, execve, execveat */
         return unsupported(L, nr);
     case 436: return 0;                                     /* close_range */
-    case 332: return -ENOSYS;                               /* statx: libc falls back to newfstatat */
+    case 332: {                                             /* statx(dirfd, path, flags, mask, buf) */
+        if (ustr(lp, sizeof(lp), a2)) return -EFAULT;
+        int64_t r;
+        const char *t;
+        if (!lp[0] && (a3 & 0x1000)) r = (int)a1 == -100 ? stat_path(L->cwd, 0, &st) : stat_fd(L, (int)a1, &st);
+        else if ((a3 & 0x100) && (t = lx_is_link(L, (int)a1, lp, jp2))) { stat_link(jp2, t, &st); r = 0; }
+        else { int sp = lx_path(L, (int)a1, lp, jp); r = stat_path(jp, sp, &st); }
+        if (r) return r;
+        uint8_t sx[256];
+        memset(sx, 0, sizeof(sx));
+        uint32_t mask = 0x7FF, blksize = (uint32_t)st.blksize, nlink = (uint32_t)st.nlink;   /* STATX_BASIC_STATS */
+        uint16_t mode = (uint16_t)st.mode;
+        memcpy(sx + 0, &mask, 4);
+        memcpy(sx + 4, &blksize, 4);
+        memcpy(sx + 16, &nlink, 4);
+        memcpy(sx + 28, &mode, 2);
+        memcpy(sx + 32, &st.ino, 8);
+        memcpy(sx + 40, &st.size, 8);
+        memcpy(sx + 48, &st.blocks, 8);
+        int64_t tm = (int64_t)st.mtime;
+        memcpy(sx + 64, &tm, 8);                            /* atime */
+        memcpy(sx + 96, &tm, 8);                            /* ctime */
+        memcpy(sx + 112, &tm, 8);                           /* mtime */
+        uint32_t rmaj = (uint32_t)(st.rdev >> 8), rmin = (uint32_t)(st.rdev & 0xFF), dmaj = 8, dmin = 1;
+        memcpy(sx + 128, &rmaj, 4); memcpy(sx + 132, &rmin, 4);
+        memcpy(sx + 136, &dmaj, 4); memcpy(sx + 140, &dmin, 4);
+        return copy_out(a5, sx, sizeof(sx));
+    }
+    case 221: return 0;                                     /* fadvise64: advice only */
+    case 191: case 192: case 193: return -95;               /* getxattr ...: EOPNOTSUPP (no extended attributes) */
+    case 194: case 195: case 196: return 0;                 /* listxattr ...: none */
+    case 188: case 189: case 190: return -95;               /* setxattr ... */
     case 324: return -ENOSYS;                               /* membarrier */
     case 157: return 0;                                     /* prctl */
     case 22: case 293: return unsupported(L, nr);           /* pipe, pipe2 */
