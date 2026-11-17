@@ -17,6 +17,8 @@
  */
 
 #include "kernel.h"
+#include "../wm/wm.h"
+#include "../desktop/ui.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -39,6 +41,86 @@ static void kernel_handle_command(const char *cmd);
 static int kernel_try_voice_command(const char *text);
 static void kernel_show_devices(void);
 static void kernel_verify_models(void);
+
+/* ---- Boot options ----------------------------------------------------------
+ * boot/multiboot2.asm leaves the kernel command line, the firmware type and
+ * the installer payload ranges in low memory. They are copied here once,
+ * before the memory manager starts.
+ *
+ *   kryzen.mode=installer   live installer
+ *   kryzen.mode=safe        safe mode and recovery (default display mode, no
+ *                           startup apps, no network, no AI services)
+ *   kryzen.mode=tty         full-screen console instead of the desktop
+ */
+static char g_boot_cmdline[256];
+static int  g_boot_mode = KBOOT_NORMAL;
+static int  g_boot_uefi;
+static int  g_boot_captured;
+static struct { uint32_t start, end; } g_boot_payload[2];
+
+int kernel_boot_option(const char *key, char *out, size_t n)
+{
+    size_t kl = strlen(key);
+    if (out && n) out[0] = 0;
+    for (const char *p = g_boot_cmdline; *p;) {
+        while (*p == ' ') p++;
+        const char *end = p;
+        while (*end && *end != ' ') end++;
+        if ((size_t)(end - p) >= kl && !strncmp(p, key, kl) && (p[kl] == '=' || p + kl == end)) {
+            if (out && n) {
+                const char *v = p[kl] == '=' ? p + kl + 1 : end;
+                size_t l = (size_t)(end - v);
+                if (l >= n) l = n - 1;
+                memcpy(out, v, l);
+                out[l] = 0;
+            }
+            return 1;
+        }
+        p = end;
+    }
+    return 0;
+}
+
+static void boot_params_capture(void)
+{
+    if (g_boot_captured) return;
+    g_boot_captured = 1;
+    const char *src = (const char *)0x7C00;
+    size_t i = 0;
+    for (; i < sizeof(g_boot_cmdline) - 1 && src[i]; i++) g_boot_cmdline[i] = src[i];
+    g_boot_cmdline[i] = 0;
+    g_boot_uefi = (*(volatile uint32_t *)0x7B10 & 1) != 0;
+    volatile uint32_t *range = (volatile uint32_t *)0x7B14;
+    for (int k = 0; k < 2; k++) {
+        g_boot_payload[k].start = range[k * 2];
+        g_boot_payload[k].end = range[k * 2 + 1];
+    }
+    char mode[24];
+    if (kernel_boot_option("kryzen.mode", mode, sizeof(mode))) {
+        if (!strcmp(mode, "installer")) g_boot_mode = KBOOT_INSTALLER;
+        else if (!strcmp(mode, "safe")) g_boot_mode = KBOOT_SAFE;
+        else if (!strcmp(mode, "tty"))  g_boot_mode = KBOOT_TTY;
+    }
+}
+
+const char *kernel_cmdline(void)     { boot_params_capture(); return g_boot_cmdline; }
+int kernel_boot_mode(void)           { boot_params_capture(); return g_boot_mode; }
+int kernel_installer_boot_mode(void) { return kernel_boot_mode() == KBOOT_INSTALLER; }
+int kernel_safe_mode(void)           { return kernel_boot_mode() == KBOOT_SAFE; }
+int kernel_tty_mode(void)            { return kernel_boot_mode() == KBOOT_TTY; }
+int kernel_booted_uefi(void)         { boot_params_capture(); return g_boot_uefi; }
+
+/* which: 1 = kernel image, 2 = boot bundle (tar: boot loaders, menu, theme) */
+int kernel_installer_payload(int which, const void **data, size_t *size)
+{
+    boot_params_capture();
+    if (!data || !size || (which != 1 && which != 2)) return -1;
+    uint32_t start = g_boot_payload[which - 1].start, end = g_boot_payload[which - 1].end;
+    if (!start || end <= start) return -1;
+    *data = (const void *)(uintptr_t)start;
+    *size = end - start;
+    return 0;
+}
 static const char *skip_spaces(const char *s);
 void ai_scheduler_tick(void);  /* Called from IRQ0 timer handler */
 
@@ -100,6 +182,9 @@ void jarvis_kernel_main(void)
      */
     terminal_init();
     terminal_puts("[JARVIS] Kernel entry\n");
+    boot_params_capture();
+    terminal_printf("[BOOT] Firmware: %s, command line: \"%s\"\n",
+                    g_boot_uefi ? "UEFI" : "BIOS", g_boot_cmdline);
 
     load_e820_from_bootloader();   /* must run before memory_init() */
     memory_init();        /* physical frame allocator + virtual memory map   */
@@ -108,11 +193,12 @@ void jarvis_kernel_main(void)
     vfs_init();           /* ramfs, model slots, user data folders */
     devmgr_init();                 /* table of every device and its driver */
     net_init();                    /* network process: DHCP, then ready for use */
-    diskfs_mount();                /* files saved on disk by earlier sessions */
-    fatfs_mount_all();             /* USB flash drives -> /jarvis/usb0, ... */
+    if (!kernel_installer_boot_mode())
+        diskfs_mount();            /* installer media must not claim the target disk */
+    fatfs_mount_all();             /* USB flash drives -> /kryzen/usb0, ... */
     usb_start_hotplug();           /* notice drives plugged in / removed later */
-    usermode_install_programs();   /* bundled user programs -> /jarvis/bin */
-    linux_install_root();          /* /jarvis/linux: the Linux programs' root */
+    usermode_install_programs();   /* bundled user programs -> /kryzen/bin */
+    linux_install_root();          /* /kryzen/linux: the Linux programs' root */
     pkg_place_samples();           /* sample .jpk packages -> Downloads */
     accounts_init();               /* the owner's account and settings (from disk) */
     desktop_apply_settings();      /* theme, clock, mouse, network ... */
@@ -135,7 +221,10 @@ void jarvis_kernel_main(void)
     terminal_puts("[JARVIS] Boot complete. Running desktop loop.\n");
     terminal_puts("[JARVIS] Foreground runtime active until preemptive IDT scheduling is complete.\n");
 
-    ai_brain_on_desktop_ready();
+    /* The assistant loads now and stays quiet: it greets whoever signs in
+     * (kernel_session_started). Safe Mode runs without the AI services. */
+    if (!kernel_safe_mode()) ai_brain_start();
+    else terminal_puts("[AI] Safe Mode: assistant not started\n");
     kernel_desktop_loop();
 }
 
@@ -194,6 +283,18 @@ static void memory_init(void)
     uint64_t kernel_phys_end = (uint64_t)&_kernel_phys_base +
                                (uint64_t)(&_kernel_end - &_kernel_start);
     pmm_reserve_range(0x100000, kernel_phys_end - 0x100000 + PAGE_SIZE - 1);
+
+    /* GRUB modules remain live until the installer has copied the boot
+     * payloads. Keep those physical pages out of the allocator in the live
+     * environment, where they are needed by the install wizard. */
+    for (int i = 0; i < 2; i++) {
+        uint32_t start = g_boot_payload[i].start, end = g_boot_payload[i].end;
+        if (start && end > start) {
+            pmm_reserve_range(start, (uint64_t)end - start);
+            terminal_printf("[BOOT] Install payload %d: 0x%x - 0x%x (%u KB)\n", i + 1,
+                            start, end, (end - start) / 1024);
+        }
+    }
 
     /*
      * Carve out MODEL_POOL — contiguous physical pages for LLM weight tensors.
@@ -307,10 +408,14 @@ static void ipc_dispatch(ipc_message_t *msg)
         /* Simple commands ("open terminal") stay instant and work offline.
          * Anything else goes to the language model when it is running;
          * without it, the built-in replies answer. */
-        if (kernel_try_voice_command((const char *)msg->payload) || !ai_host_online())
-            ai_core_infer((const char *)msg->payload, msg->payload_len);
-        else
-            ai_host_ask((const char *)msg->payload);
+        {
+            int r = kernel_try_voice_command((const char *)msg->payload);
+            if (r == 2) { ui_shell_set_status("READY"); break; }   /* done, and already answered */
+            if (r || !ai_host_online())
+                ai_core_infer((const char *)msg->payload, msg->payload_len);
+            else
+                ai_host_ask((const char *)msg->payload);
+        }
         break;
 
     case IPC_AI_RESPONSE:
@@ -370,15 +475,34 @@ static void device_init(void)
 static void first_boot_setup(void)
 {
     g_kstate.setup_complete = 1;
-    if (!account_exists()) {
+    if (kernel_installer_boot_mode()) {
+        terminal_puts("[INSTALL] Live installer mode: persistent storage is not mounted yet\n");
+        ui_shell_show_installer_wizard();
+    } else if (!account_exists()) {
         terminal_puts("[JARVIS] First run: account setup\n");
         ui_shell_show_setup_wizard();
-    } else if (account_has_sign_in()) {
-        terminal_printf("[JARVIS] Sign-in required for %s\n", account_name());
+    } else if (user_count() > 1 || account_has_sign_in()) {
+        terminal_printf("[JARVIS] Sign-in required (%d user account(s))\n", user_count());
         ui_shell_show_lock_screen();
     } else {
         ui_shell_unlock_desktop();
     }
+}
+
+/* A user's session has just started (first sign-in, or another user took
+ * over). The assistant wakes up for them: it greets by name if this user
+ * lets JARVIS listen, and yesterday's conversation is not carried over to
+ * someone else. */
+void kernel_session_started(void)
+{
+    desktop_send_host_prefs();
+    if (kernel_safe_mode()) return;
+    if (!setting_get_int("voice_input", 1)) {
+        ui_shell_set_status("READY");
+        terminal_puts("[AI] Session started: assistant is switched off for this user\n");
+        return;
+    }
+    ai_brain_greet_user();
 }
 
 static void kernel_service_ipc(void)
@@ -454,6 +578,68 @@ static int kernel_voice_has(const char *text, const char *needle)
     return strstr(text, needle) != NULL;
 }
 
+/* Strips one leading word from the list; 1 if it did. */
+static int kernel_strip_word(char **p, const char *const *words, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        size_t l = strlen(words[i]);
+        if (!strncmp(*p, words[i], l) && ((*p)[l] == ' ' || (*p)[l] == 0)) {
+            *p += l;
+            while (**p == ' ') (*p)++;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* "open notepad", "Jarvis, please close the browser": a request that is
+ * nothing but opening or closing one app runs at once, without waiting for
+ * the language model (and with it offline). Returns 2 when handled. */
+static int kernel_try_app_command(const char *cmd_in)
+{
+    static const char *const polite[] = { "jarvis", "hey", "ok", "okay", "please", "can", "could", "would", "you", "now", "just" };
+    static const char *const open_w[] = { "open", "launch", "start", "run", "show" };
+    static const char *const close_w[] = { "close", "exit", "quit" };
+    static const char *const filler[] = { "the", "my", "a", "up", "app", "application", "program", "window" };
+    char buf[192];
+    snprintf(buf, sizeof(buf), "%s", cmd_in);
+    char *p = buf;
+    while (kernel_strip_word(&p, polite, sizeof(polite) / sizeof(polite[0]))) { }
+    int open = kernel_strip_word(&p, open_w, sizeof(open_w) / sizeof(open_w[0]));
+    int close = !open && kernel_strip_word(&p, close_w, sizeof(close_w) / sizeof(close_w[0]));
+    if (!open && !close) return 0;
+    while (kernel_strip_word(&p, filler, sizeof(filler) / sizeof(filler[0]))) { }
+    size_t l = strlen(p);
+    static const char *const tail[] = { " please", " for me", " app", " application", " window", " now" };
+    for (int again = 1; again;) {
+        again = 0;
+        for (size_t i = 0; i < sizeof(tail) / sizeof(tail[0]); i++) {
+            size_t tl = strlen(tail[i]);
+            if (l > tl && !strcmp(p + l - tl, tail[i])) { l -= tl; p[l] = 0; again = 1; }
+        }
+    }
+    if (!*p || strlen(p) > 24) return 0;                 /* more than an app name: ask the model */
+    int i = desktop_app_find(p);
+    if (i < 0) return 0;
+    desktop_app_t *app = desktop_app_get(i);
+    char said[96];
+    if (open) {
+        int was = app->window != NULL;
+        desktop_app_launch(i);
+        if (app->window) wm_set_focused(app->window);
+        snprintf(said, sizeof(said), app->window ? (was ? "%s is in front." : "Opened %s.") : "%s could not be opened.", app->name);
+    } else if (!app->window) {
+        snprintf(said, sizeof(said), "%s is not open.", app->name);
+    } else {
+        wm_request_close(app->window);
+        snprintf(said, sizeof(said), app->window ? "%s is asking about unsaved changes." : "Closed %s.", app->name);
+    }
+    terminal_printf("[VOICE] Instant command: %s\n", said);
+    ui_shell_display(said);
+    tts_speak(said, strlen(said));
+    return 2;
+}
+
 static int kernel_try_voice_command(const char *text)
 {
     char cmd[192];
@@ -461,6 +647,10 @@ static int kernel_try_voice_command(const char *text)
     kernel_normalize_voice_text(text, cmd, sizeof(cmd));
     if (cmd[0] == '\0')
         return 0;
+    {
+        int r = kernel_try_app_command(cmd);
+        if (r) return r;
+    }
 
     if (strcmp(cmd, "status") == 0 ||
         kernel_voice_has(cmd, "system status") ||
@@ -591,11 +781,11 @@ static void kernel_show_devices(void)
 
 static void kernel_verify_models(void)
 {
-    int brain = vfs_stat("/jarvis/models/brain/model.gguf") == 0;
-    int stt = vfs_stat("/jarvis/models/stt/ggml-medium.en.bin") == 0;
-    int tts = vfs_stat("/jarvis/models/tts/kokoro-v1.0.onnx") == 0 ||
-              vfs_stat("/jarvis/models/tts/kokoro-v1_0.pth") == 0;
-    int wake = vfs_stat("/jarvis/models/wake/wake_word.onnx") == 0;
+    int brain = vfs_stat("/kryzen/models/brain/model.gguf") == 0;
+    int stt = vfs_stat("/kryzen/models/stt/ggml-medium.en.bin") == 0;
+    int tts = vfs_stat("/kryzen/models/tts/kokoro-v1.0.onnx") == 0 ||
+              vfs_stat("/kryzen/models/tts/kokoro-v1_0.pth") == 0;
+    int wake = vfs_stat("/kryzen/models/wake/wake_word.onnx") == 0;
 
     ui_shell_display(brain ? "Brain model: visible to kernel VFS." : "Brain model: not visible to kernel VFS.");
     ui_shell_display(stt ? "STT model: visible to kernel VFS." : "STT model: not visible to kernel VFS.");
@@ -656,7 +846,7 @@ static void kernel_handle_command(const char *cmd)
             ui_shell_display("Network test failed: NIC not ready.");
     } else if (strncmp(cmd, "ls", 2) == 0 && (cmd[2] == '\0' || cmd[2] == ' ')) {
         const char *path = skip_spaces(cmd + 2);
-        if (*path == '\0') path = "/jarvis";
+        if (*path == '\0') path = "/kryzen";
         if (vfs_list(path, buf, sizeof(buf)) >= 0)
             ui_shell_display(buf);
         else
@@ -700,7 +890,7 @@ static void kernel_handle_command(const char *cmd)
                 ui_shell_display("Write failed.");
             }
         } else {
-            ui_shell_display("Usage: write /jarvis/data/file.txt hello");
+            ui_shell_display("Usage: write /kryzen/data/file.txt hello");
         }
     } else if (strncmp(cmd, "read ", 5) == 0) {
         const char *path = skip_spaces(cmd + 5);
@@ -801,7 +991,7 @@ static void kernel_handle_voice_serial_line(const char *line)
 
 static void kernel_service_voice_serial(void)
 {
-    static char line_buf[512];
+    static char line_buf[8192];   /* TOOL lines carry text to type or save */
     static size_t line_len = 0;
     char c;
 
@@ -896,12 +1086,12 @@ static void kernel_desktop_loop(void)
 /* ==========================================================================
  * AI CORE INIT
  * Spawns the LLM inference kernel thread. The actual model is a HuggingFace
- * .safetensors file placed in /jarvis/models/brain/. The C++ ai_runtime
+ * .safetensors file placed in /kryzen/models/brain/. The C++ ai_runtime
  * (ai_core/runtime.cpp) handles tensor loading and forward pass.
  *
  * [MODEL_SLOT:LLM_BRAIN]
  * Expected model: any CausalLM (Llama 3, Mistral, Qwen, Phi-3…)
- * Drop model files in /jarvis/models/brain/ — runtime auto-detects.
+ * Drop model files in /kryzen/models/brain/ — runtime auto-detects.
  * ========================================================================== */
 static void ai_core_init(void)
 {

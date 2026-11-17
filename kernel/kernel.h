@@ -242,14 +242,44 @@ int         account_set_password(const char *password);        /* "" removes */
 int         account_set_pin(const char *pin, char *err, size_t errn);
 int         account_set_voice(const char *phrase, char *err, size_t errn);
 int         auth_check_typed(const char *secret);              /* password or PIN */
-int         auth_check_voice(const char *transcript);          /* 1 ok, 0 no, -1 paused */
+int         auth_check_admin(const char *secret);              /* any administrator's */
+int         auth_recovery_clear(const char *name);             /* Safe Mode only */
+
+/* Users (kernel/accounts.c). The account_* calls above refer to the selected
+ * user: whoever is signing in, or the signed-in user. */
+#define USER_ACCOUNT_MAX 8
+typedef struct {
+    int  uid, admin;
+    char name[32];
+    char home[64];                  /* /kryzen/users/<folder> */
+    int  has_password, has_pin, has_voice;
+    int  signed_in;
+} user_info_t;
+int         user_count(void);
+int         user_info(int index, user_info_t *out);
+int         user_find(const char *name);                       /* index or -1 */
+int         user_selected(void);
+int         user_select(int index);
+int         user_current(void);                                /* signed-in user's index, -1 nobody */
+int         user_is_admin(void);                               /* 1 also when nobody is signed in */
+int         user_uid(void);
+int         user_add(const char *name, const char *password, const char *pin, const char *voice,
+                     int admin, char *err, size_t errn);
+int         user_remove(const char *name, char *err, size_t errn);
+int         user_set_admin(const char *name, int admin, char *err, size_t errn);
+int         user_reset_password(const char *name, const char *password, char *err, size_t errn);
+int         user_session_begin(void);                          /* 1: another user's session was ended */
+void        user_session_end(void);
+/* Per-user view of /kryzen/data, /kryzen/desktop and /kryzen/trash (kernel/vfs.c). */
+void        vfs_set_session(const char *home, int admin);
+int         auth_check_voice(const char *transcript);          /* 1 ok, 0 no, -1 paused, -2 noise */
 int         auth_wait_seconds(void);
 int         setting_get(const char *key, char *out, size_t n);
 int         setting_get_int(const char *key, int dflt);
 void        setting_set(const char *key, const char *value);
 void        setting_set_int(const char *key, int value);
 void        sha256(const void *data, size_t len, uint8_t out[32]);
-int         vfs_is_private(const char *path);                  /* /jarvis/system */
+int         vfs_is_private(const char *path);                  /* /kryzen/system */
 void        ui_shell_voice_attempt(const char *text);
 void        ui_shell_login_click(int x, int y);
 void        ui_shell_voice_prompt(void);
@@ -335,6 +365,7 @@ enum { REG_HKCR = 0, REG_HKCU, REG_HKLM, REG_HKCC, REG_HIVES };
 extern volatile uint32_t g_reg_generation;
 void reg_init(void);
 void reg_flush(void);                       /* save changed keys (called every few seconds) */
+int  reg_flush_checked(void);                /* save and report serialization/VFS errors */
 void reg_refresh_live(void);                /* rebuild HKLM\HARDWARE etc. */
 int  reg_open_key(const char *path, int create);    /* key index, -1 */
 int  reg_key_path(int key, char *out, size_t n);
@@ -360,15 +391,17 @@ const char *reg_type_name(int type);
 int  reg_type_parse(const char *s);
 int  reg_export(const char *path, char *out, size_t n, int include_volatile);
 int  reg_import(const char *text, int *keys, int *values, char *err, size_t en);
+void reg_settings_reset(void);              /* HKCU was replaced: forget cached keys */
 int  reg_setting_get(const char *key, char *out, size_t n);
 void reg_setting_set(const char *key, const char *value, int numeric);
 
 /* ---- Disk management (kernel/diskmgmt.c) ----------------------------------- */
-#define DM_MAX_PARTS 8
+#define DM_MAX_PARTS 128
 enum { DM_EMPTY = 0, DM_MBR, DM_GPT, DM_WHOLE, DM_UNREADABLE };
 typedef struct {
     int      num;                   /* 1-4 (MBR), GPT index, 0 = whole disk */
     uint8_t  type;                  /* MBR type byte */
+    int      efi_system;            /* GPT EFI System Partition type GUID */
     int      bootable;
     uint64_t start, sectors;
     char     fs[16], label[16], mount[24];
@@ -384,11 +417,41 @@ typedef struct {
 } dm_disk_t;
 int dm_disk_info(int dev, dm_disk_t *out);
 int dm_init_mbr(int dev, char *err, size_t n);
+int dm_create_gpt_layout(int dev, uint64_t efi_size_mb,
+                         uint64_t *bios_start, uint64_t *bios_sectors,
+                         uint64_t *efi_start, uint64_t *efi_sectors,
+                         uint64_t *data_start, uint64_t *data_sectors,
+                         int *efi_partition_num,
+                         char *err, size_t n);
+int dm_create_gpt_layout_in_gap(int dev, uint64_t gap_start, uint64_t gap_end,
+                                uint64_t efi_size_mb, uint64_t data_size_mb,
+                                uint64_t *efi_start, uint64_t *efi_sectors,
+                                uint64_t *data_start, uint64_t *data_sectors,
+                                int *efi_partition_num,
+                                char *err, size_t n);
+int dm_create_gpt_data_in_gap(int dev, int efi_partition_num,
+                              uint64_t gap_start, uint64_t gap_end,
+                              uint64_t data_size_mb,
+                              uint64_t *efi_start, uint64_t *efi_sectors,
+                              uint64_t *data_start, uint64_t *data_sectors,
+                              char *err, size_t n);
 int dm_create_partition(int dev, uint64_t size_mb, const char *fs, const char *label, int *out_num, char *err, size_t n);
 int dm_delete_partition(int dev, int num, char *err, size_t n);
 int dm_format(int dev, int num, const char *fs, const char *label, char *err, size_t n);
 int dm_set_label(int dev, int num, const char *label, char *err, size_t n);
 int dm_resize(int dev, int num, uint64_t new_mb, char *err, size_t n);     /* 0 = largest */
+
+typedef struct {
+    int phase, percent, complete, error;
+    char detail[96];
+} installer_status_t;
+int  installer_install_disk(int dev, int manual, uint64_t gap_start,
+                            uint64_t gap_end, uint64_t efi_size_mb,
+                            uint64_t data_size_mb, int existing_efi_partition_num,
+                            char *err, size_t n);
+void installer_get_status(installer_status_t *out);
+int  installer_media_check(int *kernel_ok, int *uefi_ok, int *bios_ok);   /* 1 if installable */
+
 void vfs_mount_point(const char *path);
 void vfs_unmount_point(const char *path);
 
@@ -432,7 +495,10 @@ typedef struct {
     int      items;
 } diskfs_stats_t;
 void diskfs_mount(void);            /* load saved files; formats a blank disk */
+int  diskfs_mount_partition(int dev, uint64_t start_sector, uint64_t sector_count);
+int  diskfs_format_partition(int dev, uint64_t start_sector, uint64_t sector_count);
 int  diskfs_sync(void);             /* write changes; returns items written   */
+int  diskfs_sync_verified(void);    /* sync, flush, then read back persistent state */
 int  diskfs_get_stats(diskfs_stats_t *out);
 #define DISKFS_CHECK_ISSUES 8
 typedef struct {
@@ -504,7 +570,7 @@ uint32_t dpkg_start(int argc, char **argv, const char *cwd);   /* dpkg / apt (ke
 int      linux_is_current(void);                /* current process is a Linux program */
 uint32_t linux_exec(const char *path, int argc, char **argv, const char *cwd);
 int64_t  linux_syscall(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6);
-void     linux_install_root(void);              /* creates /jarvis/linux */
+void     linux_install_root(void);              /* creates /kryzen/linux */
 void     proc_set_fs_base(uint64_t v);
 uint64_t proc_get_fs_base(void);
 uint64_t user_brk(uint64_t want);
@@ -558,6 +624,7 @@ void    irq4_serial_handler(void);
 #define KMOD_CAPS   0x08
 #define KMOD_SUPER  0x10   /* Windows / Super key */
 int input_current_mods(void);       /* modifiers held right now */
+int input_caps_lock(void);          /* Caps Lock is on */
 
 /* Unified WM input event queue (input/input_events.c) */
 void    input_key_press(uint32_t key, int mods);
@@ -725,16 +792,30 @@ void    security_daemon_thread(void);
 
 /* AI APIs */
 void    ai_core_infer(const char *prompt, size_t len);
-void    ai_brain_on_desktop_ready(void);
+void    ai_brain_start(void);               /* boot: load the model, no greeting */
+void    ai_brain_greet_user(void);          /* a user's session started */
+void    kernel_session_started(void);       /* kernel/kernel.c: AI + services for the new session */
+void    desktop_sign_out(void);             /* desktop/desktop_init.c */
 void    tts_speak(const char *text, size_t len);
 void    speech_service_stt_once(void);
 void    speech_service_tts_once(void);
 void    ui_shell_init(void);
+enum { KBOOT_NORMAL = 0, KBOOT_INSTALLER, KBOOT_SAFE, KBOOT_TTY };
+int     kernel_boot_mode(void);                 /* KBOOT_* from kryzen.mode= */
+int     kernel_installer_boot_mode(void);
+int     kernel_safe_mode(void);
+int     kernel_tty_mode(void);
+int     kernel_booted_uefi(void);               /* started by UEFI firmware */
+const char *kernel_cmdline(void);
+int     kernel_boot_option(const char *key, char *out, size_t n);
+int     kernel_installer_payload(int which, const void **data, size_t *size);
 void    ui_shell_display(const char *text);
 void    ui_shell_draw_frame(void);
 void    ui_shell_show_loading_desktop(void);
 void    ui_shell_show_lock_screen(void);
 void    ui_shell_show_setup_wizard(void);
+void    ui_shell_show_installer_wizard(void);
+void    ui_shell_show_installer_complete(void);
 void    ui_shell_unlock_desktop(void);
 void    ui_shell_set_setup_step(const char *title, const char *detail);
 void    ui_shell_set_status(const char *status);
@@ -761,6 +842,8 @@ int     desktop_system_is_initialized(void);
 void    desktop_invalidate(void);           /* request a redraw next frame */
 void    desktop_system_shutdown(void);
 void    desktop_system_restart(void);
+void    desktop_apply_settings(void);
+int     prefs_set(const char *name, const char *value, char *message, size_t n);
 
 /* Read-only view of the UI shell state for the desktop / JARVIS app */
 int     ui_shell_is_desktop(void);

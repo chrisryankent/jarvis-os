@@ -286,7 +286,7 @@ tls_conn_t *tls_connect(int sock, const char *host, char *err, size_t en)
             e += 4 + xl;
         }
     }
-    if (version != 0x0304) { snprintf(err, en, "the server only supports TLS 1.2 or older, which JARVIS OS does not speak yet"); goto fail; }
+    if (version != 0x0304) { snprintf(err, en, "the server only supports TLS 1.2 or older, which Kryzen OS does not speak yet"); goto fail; }
     if (!spub) { snprintf(err, en, "the server did not send an X25519 key"); goto fail; }
     switch (t->suite) {
     case 0x1301: t->alg = HASH_SHA256; t->keylen = 16; break;

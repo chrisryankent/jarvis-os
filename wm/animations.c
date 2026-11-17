@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Animation Framework (wm/animations.c)
+ * Kryzen OS — Animation Framework (wm/animations.c)
  * Language: C17
  *
  * Easing functions and animation system for smooth transitions.

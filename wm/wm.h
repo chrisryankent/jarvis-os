@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Window Manager Header (wm/wm.h)
+ * Kryzen OS — Window Manager Header (wm/wm.h)
  * Language: C17
  *
  * Floating windows with a Windows-style frame: drag by the title bar, resize

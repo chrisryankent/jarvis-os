@@ -4,7 +4,7 @@
  * Language: C17
  *
  * Lets the language model act on the PC. The model runs on the host
- * (tools/jarvis_brain.py, llama.cpp) and talks to this file over the voice
+ * (tools/kryzen_brain.py, llama.cpp) and talks to this file over the voice
  * bridge serial line (COM2), one text line per message:
  *
  *   host -> guest   AI:ONLINE <model>        heartbeat (every 2 s)
@@ -153,15 +153,40 @@ int kernel_voice_bridge_connected(void);
 static void resolve(const char *in, char *out, size_t n)
 {
     static const struct { const char *name; const char *path; } alias[] = {
-        { "/jarvis/data/documents", "/jarvis/data" },  { "/jarvis/documents", "/jarvis/data" },
-        { "documents", "/jarvis/data" },               { "my documents", "/jarvis/data" },
-        { "/jarvis/downloads", "/jarvis/data/Downloads" }, { "downloads", "/jarvis/data/Downloads" },
-        { "desktop", "/jarvis/desktop" },              { "recycle bin", "/jarvis/trash" },
-        { "home", "/jarvis" },                         { "~", "/jarvis" },
+        { "/kryzen/data/documents", "/kryzen/data" },  { "/kryzen/documents", "/kryzen/data" },
+        { "documents", "/kryzen/data" },               { "my documents", "/kryzen/data" },
+        { "/kryzen/downloads", "/kryzen/data/Downloads" }, { "downloads", "/kryzen/data/Downloads" },
+        { "desktop", "/kryzen/desktop" },              { "recycle bin", "/kryzen/trash" },
+        { "pictures", "/kryzen/data/Pictures" },       { "screenshots", "/kryzen/data/Pictures/Screenshots" },
+        { "music", "/kryzen/data/Music" },             { "videos", "/kryzen/data/Videos" },
+        { "home", "/kryzen" },                         { "~", "/kryzen" },
     };
     char tmp[200];
     snprintf(tmp, sizeof(tmp), "%s", in);
     while (tmp[0] == ' ') memmove(tmp, tmp + 1, strlen(tmp));
+    for (char *c = tmp; *c; c++) if (*c == '\\') *c = '/';
+    /* "C:/..." -> "/..." : people (and models) think in Windows drives */
+    if (((tmp[0] | 32) >= 'a' && (tmp[0] | 32) <= 'z') && tmp[1] == ':') memmove(tmp, tmp + 2, strlen(tmp + 2) + 1);
+    /* "/Users/<name>/Documents/x", "/home/<name>/x" -> "Documents/x", "x" */
+    if (!strncmp(tmp, "/Users/", 7) || !strncmp(tmp, "/users/", 7) || !strncmp(tmp, "/home/", 6)) {
+        char *rest = strchr(tmp + 1, '/');
+        rest = rest ? strchr(rest + 1, '/') : NULL;
+        if (rest) memmove(tmp, rest + 1, strlen(rest + 1) + 1);
+        else snprintf(tmp, sizeof(tmp), "documents");
+    }
+    /* a bare file name ("eddy.txt") belongs in Documents, unless it names
+     * something that is already in the home folder */
+    if (tmp[0] && tmp[0] != '/' && tmp[0] != '~' && !strchr(tmp, '/')) {
+        char home[220];
+        snprintf(home, sizeof(home), "/kryzen/%s", tmp);
+        int known = 0;
+        for (size_t i = 0; i < 10; i++) {                       /* folder words handled below */
+            static const char *const words[] = { "documents", "my documents", "downloads", "desktop", "recycle bin", "home",
+                                                 "pictures", "music", "videos", "screenshots" };
+            if (ci_contains(tmp, words[i]) && strlen(tmp) == strlen(words[i])) known = 1;
+        }
+        if (!known && !vfs_exists(home)) { snprintf(out, n, "/kryzen/data/%s", tmp); goto trim; }
+    }
 
     for (size_t i = 0; i < sizeof(alias) / sizeof(alias[0]); i++) {
         size_t l = strlen(alias[i].name);
@@ -176,10 +201,10 @@ static void resolve(const char *in, char *out, size_t n)
             goto trim;
         }
     }
-    if (!tmp[0])                          snprintf(out, n, "/jarvis");
+    if (!tmp[0])                          snprintf(out, n, "/kryzen");
     else if (tmp[0] == '/')               snprintf(out, n, "%s", tmp);
     else if (!strncmp(tmp, "jarvis/", 7)) snprintf(out, n, "/%s", tmp);
-    else                                  snprintf(out, n, "/jarvis/%s", tmp);
+    else                                  snprintf(out, n, "/kryzen/%s", tmp);
 trim:;
     size_t len = strlen(out);
     while (len > 1 && out[len - 1] == '/') out[--len] = 0;
@@ -249,7 +274,7 @@ static void tool_find_files(const char *args, out_t *o)
     if (!q[0]) { outf(o, "error: give a name to search for"); return; }
     for (char *c = q; *c; c++) if (*c >= 'A' && *c <= 'Z') *c = (char)(*c + 32);
     int found = 0;
-    const char *roots[5] = { "/jarvis", NULL, NULL, NULL, NULL };
+    const char *roots[5] = { "/kryzen", NULL, NULL, NULL, NULL };
     drive_info_t drives[4];
     int nd = storage_list(drives, 4), nr = 1;
     for (int i = 0; i < nd && nr < 5; i++) if (drives[i].removable && drives[i].mount[0]) roots[nr++] = drives[i].mount;
@@ -259,8 +284,8 @@ static void tool_find_files(const char *args, out_t *o)
             const char *eol = strchr(p, '\n');
             if (!eol) eol = p + strlen(p);
             const char *full = strchr(p, '/');
-            if (full && full < eol && strncmp(full, "/jarvis/models", 14) && strncmp(full, "/jarvis/trash", 13) &&
-                strncmp(full, "/jarvis/system", 14)) {
+            if (full && full < eol && strncmp(full, "/kryzen/models", 14) && strncmp(full, "/kryzen/trash", 13) &&
+                strncmp(full, "/kryzen/system", 14)) {
                 const char *leaf = full;
                 for (const char *s = full; s < eol; s++) if (*s == '/') leaf = s + 1;
                 char low[128];
@@ -429,7 +454,7 @@ void ai_tools_disk_check_done(void)
     g_ai_check_pid = 0;
 }
 
-/* A USB drive by its name, device (usb0) or folder (/jarvis/usb0). */
+/* A USB drive by its name, device (usb0) or folder (/kryzen/usb0). */
 static int find_usb_drive(const char *want, char *label, size_t n)
 {
     drive_info_t dr[8];
@@ -530,6 +555,342 @@ static void disk_word(const char *in, char *out, size_t n)
     if (ci_contains(in, "system") || ci_contains(in, "jarvis") || ci_contains(in, "local")) snprintf(out, n, "0");
 }
 
+
+/* ==========================================================================
+ * Driving any app: windows, keyboard, reading the screen, clicking
+ * ========================================================================== */
+void desktop_dispatch_event(wm_input_event_t *event);      /* desktop/desktop_init.c */
+int  notepad_ai(const char *action, const char *text, const char *path, int discard, char *out, size_t n);
+int  browser_ai(const char *action, const char *arg, char *out, size_t n);
+uint32_t terminal_ai_mark(void);
+void terminal_ai_since(uint32_t mark, char *out, size_t n);
+void settings_show_page(const char *name);
+
+/* The app's window, opened if asked; NULL if the app is unknown or closed. */
+static wm_window_t *app_window(const char *name, int open, char *label, size_t ln)
+{
+    if (label && ln) label[0] = 0;
+    if (!name || !name[0]) {
+        wm_window_t *f = g_wm_ctx.focused;
+        if (label && f) snprintf(label, ln, "%s", f->title);
+        return f;
+    }
+    int i = desktop_app_find(name);
+    if (i < 0) {                                            /* a window title, e.g. "eddy.txt - Notepad" */
+        for (wm_window_t *w = g_wm_ctx.windows_head; w; w = w->next)
+            if (ci_contains(w->title, name)) { if (label) snprintf(label, ln, "%s", w->title); return w; }
+        return NULL;
+    }
+    desktop_app_t *app = desktop_app_get(i);
+    if (!app->window && open) desktop_app_launch(i);
+    if (label) snprintf(label, ln, "%s", app->name);
+    return app->window;
+}
+
+static void bring_front(wm_window_t *w)
+{
+    if (!w) return;
+    if (w->minimized) wm_set_minimized(w, 0);
+    wm_raise_window(w);
+    wm_set_focused(w);
+}
+
+static void send_event(int type, uint32_t key, int mods, char ch)
+{
+    wm_input_event_t e;
+    memset(&e, 0, sizeof(e));
+    e.type = (input_event_type_t)type;
+    e.timestamp = (uint32_t)g_kstate.uptime_ticks;
+    if (type == IE_TEXT_INPUT) e.data.text.ch = ch;
+    else { e.data.keyboard.key = key; e.data.keyboard.mods = mods; }
+    desktop_dispatch_event(&e);
+}
+
+/* One character as the keyboard would deliver it: key down, text, key up. */
+static void type_char(char c)
+{
+    uint32_t key = c == '\n' ? WM_KEY_ENTER : c == '\t' ? WM_KEY_TAB : (uint32_t)(unsigned char)c;
+    int mods = (c >= 'A' && c <= 'Z') ? KMOD_SHIFT : 0;
+    send_event(IE_KEY_DOWN, key, mods, 0);
+    if (c == '\n' || c == '\t' || ((unsigned char)c >= 32 && (unsigned char)c <= 126)) send_event(IE_TEXT_INPUT, 0, 0, c);
+    send_event(IE_KEY_UP, key, mods, 0);
+}
+
+/* "ctrl+s", "enter", "alt+f4", "ctrl+shift+s": one combination. */
+static int parse_combo(const char *s, uint32_t *key, int *mods)
+{
+    static const struct { const char *name; uint32_t key; } names[] = {
+        { "enter", WM_KEY_ENTER }, { "return", WM_KEY_ENTER }, { "tab", WM_KEY_TAB }, { "esc", WM_KEY_ESC },
+        { "escape", WM_KEY_ESC }, { "backspace", WM_KEY_BACKSPACE }, { "delete", WM_KEY_DELETE }, { "del", WM_KEY_DELETE },
+        { "up", WM_KEY_UP }, { "down", WM_KEY_DOWN }, { "left", WM_KEY_LEFT }, { "right", WM_KEY_RIGHT },
+        { "home", WM_KEY_HOME }, { "end", WM_KEY_END }, { "pageup", WM_KEY_PGUP }, { "pagedown", WM_KEY_PGDN },
+        { "pgup", WM_KEY_PGUP }, { "pgdn", WM_KEY_PGDN }, { "space", ' ' }, { "insert", WM_KEY_INSERT },
+        { "plus", '+' }, { "minus", '-' }, { "printscreen", WM_KEY_PRTSC },
+    };
+    *key = 0; *mods = 0;
+    char part[24];
+    while (*s) {
+        size_t l = 0;
+        while (s[l] && s[l] != '+' && l < sizeof(part) - 1) { part[l] = (char)(s[l] >= 'A' && s[l] <= 'Z' ? s[l] + 32 : s[l]); l++; }
+        part[l] = 0;
+        s += l;
+        if (*s == '+') s++;
+        if (!part[0]) { *key = '+'; continue; }               /* "ctrl++" */
+        if (!strcmp(part, "ctrl") || !strcmp(part, "control")) *mods |= KMOD_CTRL;
+        else if (!strcmp(part, "shift")) *mods |= KMOD_SHIFT;
+        else if (!strcmp(part, "alt")) *mods |= KMOD_ALT;
+        else if (!strcmp(part, "win") || !strcmp(part, "super") || !strcmp(part, "windows") || !strcmp(part, "meta")) *mods |= KMOD_SUPER;
+        else if (part[0] == 'f' && part[1] >= '1' && part[1] <= '9' && (!part[2] || (part[2] >= '0' && part[2] <= '2' && !part[3]))) {
+            int f = part[1] - '0';
+            if (part[2]) f = f * 10 + (part[2] - '0');
+            if (f < 1 || f > 12) return -1;
+            *key = WM_KEY_F1 + (uint32_t)(f - 1);
+        } else if (!part[1]) *key = (uint32_t)(unsigned char)part[0];
+        else {
+            size_t i;
+            for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) if (!strcmp(part, names[i].name)) { *key = names[i].key; break; }
+            if (i == sizeof(names) / sizeof(names[0])) return -1;
+        }
+    }
+    if (!*key && (*mods & KMOD_SUPER)) { *key = WM_KEY_SUPER_TAP; *mods = 0; }
+    return *key ? 0 : -1;
+}
+
+/* ---- Reading a window: the text it draws, line by line --------------------- */
+static fb_text_item_t g_cap_items[1200];
+
+static int capture_window(wm_window_t *w)
+{
+    fb_capture_begin(g_cap_items, (int)(sizeof(g_cap_items) / sizeof(g_cap_items[0])));
+    wm_draw_window(w, fb_get_base());                     /* the next frame repaints everything */
+    int n = fb_capture_end();
+    desktop_invalidate();
+    /* reading order: top to bottom, left to right (same line within 6 px) */
+    for (int i = 1; i < n; i++) {
+        fb_text_item_t t = g_cap_items[i];
+        int j = i - 1;
+        while (j >= 0 && (g_cap_items[j].y > t.y + 6 || (g_cap_items[j].y >= t.y - 6 && g_cap_items[j].x > t.x &&
+                          g_cap_items[j].y + 6 >= t.y))) {
+            g_cap_items[j + 1] = g_cap_items[j];
+            j--;
+        }
+        g_cap_items[j + 1] = t;
+    }
+    return n;
+}
+
+static void describe_window(wm_window_t *w, out_t *o)
+{
+    int n = capture_window(w);
+    outf(o, "Window \"%s\"%s:\n", w->title, w == g_wm_ctx.focused ? " (focused)" : "");
+    int line_y = -1000;
+    for (int i = 0; i < n && o->len + 8 < o->n; i++) {
+        fb_text_item_t *t = &g_cap_items[i];
+        if (!strcmp(t->text, w->title) && t->y < w->y + WM_TITLEBAR_HEIGHT) continue;   /* the title bar */
+        if (t->y > line_y + 6) { if (line_y > -1000) outf(o, "\n"); line_y = t->y; }
+        else outf(o, "  |  ");
+        outf(o, "%s", t->text);
+    }
+    if (!n) outf(o, "(no text visible)");
+}
+
+/* Clicks the visible control or text that best matches `want`. */
+static int click_text(wm_window_t *w, const char *want, int dbl, int right, char *what, size_t wn)
+{
+    int n = capture_window(w);
+    int best = -1, best_score = 0;
+    size_t wl = strlen(want);
+    for (int i = 0; i < n; i++) {
+        fb_text_item_t *t = &g_cap_items[i];
+        if (t->y < w->y + WM_TITLEBAR_HEIGHT && !strcmp(t->text, w->title)) continue;
+        size_t tl = strlen(t->text);
+        int score = 0;
+        if (tl == wl && ci_contains(t->text, want)) score = 3;                     /* the same words */
+        else if (ci_contains(t->text, want)) score = tl < wl + 12 ? 2 : 1;        /* contains them  */
+        if (score > best_score) { best_score = score; best = i; }
+    }
+    if (best < 0) return -1;
+    fb_text_item_t *t = &g_cap_items[best];
+    /* the words inside a longer run: aim at them, not at the run's middle */
+    int cx = t->x + t->w / 2, cy = t->y + t->h / 2;
+    size_t tl = strlen(t->text);
+    for (size_t k = 0; tl > wl && k + wl <= tl; k++)
+        if (ci_contains(t->text + k, want) && !ci_contains(t->text + k + 1, want)) {
+            cx = t->x + (int)((long)t->w * (long)(2 * k + wl) / (long)(2 * tl));
+            break;
+        }
+    snprintf(what, wn, "%s", t->text);
+    int b = right ? 2 : 1;
+    for (int c = 0; c < (dbl ? 2 : 1); c++) {
+        wm_input_event_t e;
+        memset(&e, 0, sizeof(e));
+        e.timestamp = (uint32_t)g_kstate.uptime_ticks;
+        e.type = IE_MOUSE_MOVE; e.data.mouse.x = cx; e.data.mouse.y = cy;
+        desktop_dispatch_event(&e);
+        e.type = IE_MOUSE_DOWN; e.data.mouse.button = b;
+        desktop_dispatch_event(&e);
+        e.type = IE_MOUSE_UP;
+        desktop_dispatch_event(&e);
+    }
+    desktop_invalidate();
+    return 0;
+}
+
+static void list_windows(out_t *o)
+{
+    int any = 0;
+    for (wm_window_t *w = g_wm_ctx.windows_head; w; w = w->next) {
+        outf(o, "%s\"%s\"%s%s", any ? ", " : "Open windows: ", w->title, w == g_wm_ctx.focused ? " (focused)" : "",
+             w->minimized ? " (minimized)" : "");
+        any = 1;
+    }
+    if (!any) outf(o, "No windows are open.");
+}
+
+static void tool_screen(const char *args, out_t *o, int click)
+{
+    char a[96], label[96], target[160];
+    json_str(args, "app", a, sizeof(a));
+    wm_window_t *w = app_window(a, click, label, sizeof(label));
+    if (!w) {
+        if (a[0]) outf(o, "error: %s is not open. ", a);
+        else outf(o, "No window is focused. ");
+        list_windows(o);
+        return;
+    }
+    bring_front(w);
+    if (!click) {
+        /* apps with documents longer than the window: give all of it */
+        static char doc[3200];
+        if (strstr(w->title, "Notepad")) {
+            notepad_ai("read", NULL, NULL, 0, doc, sizeof(doc));
+            outf(o, "Window \"%s\" (focused). Document %s", w->title, doc);
+            return;
+        }
+        if (strstr(w->title, "Browser")) {
+            browser_ai("read", NULL, doc, sizeof(doc));
+            outf(o, "Window \"%s\" (focused). Page text: %s", w->title, doc);
+            return;
+        }
+        describe_window(w, o);
+        outf(o, "\n");
+        list_windows(o);
+        return;
+    }
+    json_str(args, "text", target, sizeof(target));
+    if (!target[0]) { outf(o, "error: say which button or text to click"); return; }
+    char hit[120];
+    if (click_text(w, target, json_bool(args, "double", 0), json_bool(args, "right", 0), hit, sizeof(hit)) != 0) {
+        outf(o, "error: nothing labelled \"%s\" is visible in %s. ", target, w->title);
+        describe_window(w, o);
+        return;
+    }
+    outf(o, "Clicked \"%s\" in %s.", hit, w->title);
+}
+
+static void tool_type(const char *args, out_t *o)
+{
+    static char text[3000];
+    char a[96], label[96];
+    json_str(args, "app", a, sizeof(a));
+    json_str(args, "text", text, sizeof(text));
+    if (!text[0]) { outf(o, "error: give the text to type"); return; }
+    wm_window_t *w = app_window(a, 1, label, sizeof(label));
+    if (!w) { outf(o, "error: no app called %s. ", a); list_windows(o); return; }
+    bring_front(w);
+    if (strstr(w->title, "Notepad")) {                  /* straight into the document: one Undo step */
+        static char r[300];
+        notepad_ai("type", text, NULL, 0, r, sizeof(r));
+        outf(o, "Typed %u characters into Notepad. %s", (unsigned)strlen(text), r);
+        return;
+    }
+    for (const char *c = text; *c; c++) type_char(*c);
+    outf(o, "Typed %u characters into %s.", (unsigned)strlen(text), w->title);
+}
+
+static void tool_keys(const char *args, out_t *o)
+{
+    char a[96], label[96], keys[160];
+    json_str(args, "app", a, sizeof(a));
+    json_any(args, "keys", keys, sizeof(keys));
+    if (!keys[0]) { outf(o, "error: give the keys, e.g. ctrl+s or enter"); return; }
+    if (a[0]) {
+        wm_window_t *w = app_window(a, 1, label, sizeof(label));
+        if (!w) { outf(o, "error: no app called %s", a); return; }
+        bring_front(w);
+    }
+    int count = 0;
+    for (char *p = keys; *p;) {                         /* "ctrl+a, delete" or "ctrl+a delete" */
+        while (*p == ' ' || *p == ',') p++;
+        if (!*p) break;
+        char one[40];
+        size_t l = 0;
+        while (p[l] && p[l] != ' ' && p[l] != ',' && l < sizeof(one) - 1) { one[l] = p[l]; l++; }
+        one[l] = 0;
+        p += l;
+        uint32_t key; int mods;
+        if (parse_combo(one, &key, &mods) != 0) { outf(o, "error: unknown key \"%s\"", one); return; }
+        send_event(IE_KEY_DOWN, key, mods, 0);
+        if (!mods && ((key >= 32 && key <= 126) || key == WM_KEY_ENTER || key == WM_KEY_TAB || key == WM_KEY_BACKSPACE))
+            send_event(IE_TEXT_INPUT, 0, 0, (char)(key == WM_KEY_ENTER ? '\n' : key));
+        send_event(IE_KEY_UP, key, mods, 0);
+        count++;
+    }
+    wm_window_t *f = g_wm_ctx.focused;
+    outf(o, "Pressed %s. Focused window now: %s.", keys, f ? f->title : "none (the desktop)");
+}
+
+static void tool_terminal(const char *args, out_t *o)
+{
+    static char cmd[400], text[3600];
+    char label[32];
+    json_any(args, "command", cmd, sizeof(cmd));
+    if (!cmd[0]) { outf(o, "error: give a command"); return; }
+    wm_window_t *w = app_window("Terminal", 1, label, sizeof(label));
+    if (!w) { outf(o, "error: the Terminal could not be opened"); return; }
+    bring_front(w);
+    uint32_t mark = terminal_ai_mark();
+    for (const char *c = cmd; *c; c++) type_char(*c);       /* exactly as if typed */
+    type_char('\n');
+    terminal_ai_since(mark, text, sizeof(text));
+    outf(o, "Ran in the Terminal: %s\n%s", cmd, text[0] ? text : "(no output yet)");
+    static proc_info_t pl[64];
+    int np = proc_list(pl, 64), busy = 0;
+    for (int i = 0; i < np; i++)
+        if ((pl[i].flags & PROC_FLAG_USER) || !strcmp(pl[i].name, "apt") || !strcmp(pl[i].name, "dpkg")) busy = 1;
+    if (busy) outf(o, "\n(A program is still running; read the Terminal window later for the rest of its output.)");
+}
+
+static void tool_window(const char *args, out_t *o)
+{
+    char act[24], a[96], label[96];
+    json_any(args, "action", act, sizeof(act));
+    json_str(args, "name", a, sizeof(a));
+    if (!strcmp(act, "list") || !act[0]) { list_windows(o); return; }
+    if (!strcmp(act, "open")) {
+        int i = desktop_app_find(a);
+        if (i < 0) { outf(o, "error: no app called \"%s\". ", a); tool_apps(o); return; }
+        int was = desktop_app_get(i)->window != NULL;
+        desktop_app_launch(i);
+        wm_window_t *w = desktop_app_get(i)->window;
+        if (!w) { outf(o, "error: %s did not open", desktop_app_get(i)->name); return; }
+        bring_front(w);
+        outf(o, was ? "%s was already open; it is now in front." : "Opened %s.", desktop_app_get(i)->name);
+        return;
+    }
+    if (!strcmp(act, "show_desktop")) { wm_minimize_all(); outf(o, "Minimized every window."); return; }
+    wm_window_t *w = app_window(a, 0, label, sizeof(label));
+    if (!w) { outf(o, "error: %s is not open. ", a[0] ? a : "No window"); list_windows(o); return; }
+    if (!strcmp(act, "close")) { wm_request_close(w); outf(o, "Asked %s to close%s.", label, app_window(a, 0, NULL, 0) ? " (it is still open: it may be asking to save changes)" : ""); }
+    else if (!strcmp(act, "focus") || !strcmp(act, "switch")) { bring_front(w); outf(o, "%s is in front.", label); }
+    else if (!strcmp(act, "minimize")) { wm_set_minimized(w, 1); outf(o, "Minimized %s.", label); }
+    else if (!strcmp(act, "maximize")) { bring_front(w); wm_set_maximized(w, 1); outf(o, "Maximized %s.", label); }
+    else if (!strcmp(act, "restore")) { bring_front(w); wm_restore_window(w); outf(o, "Restored %s.", label); }
+    else if (!strcmp(act, "snap_left") || !strcmp(act, "snap_right")) {
+        bring_front(w); wm_snap_shortcut(act[5] == 'l' ? 0 : 1); outf(o, "Snapped %s to the %s.", label, act + 5);
+    } else outf(o, "error: action is open, close, focus, minimize, maximize, restore, snap_left, snap_right, show_desktop or list");
+}
+
 static int tool_dispatch(const char *name, const char *args, out_t *o)
 {
     char a[200], b[200], p1[200], p2[200], why[160];
@@ -538,7 +899,13 @@ static int tool_dispatch(const char *name, const char *args, out_t *o)
         json_str(args, "name", a, sizeof(a));
         int i = desktop_app_find(a);
         if (i < 0) { outf(o, "No app called \"%s\". ", a); tool_apps(o); }
-        else { desktop_app_launch(i); outf(o, "Opened %s.", desktop_app_get(i)->name); }
+        else {
+            int was = desktop_app_get(i)->window != NULL;
+            desktop_app_launch(i);
+            bring_front(desktop_app_get(i)->window);
+            outf(o, !desktop_app_get(i)->window ? "error: %s did not open" : was ? "%s was already open; it is now in front." : "Opened %s.",
+                 desktop_app_get(i)->name);
+        }
     } else if (!strcmp(name, "close_app")) {
         json_str(args, "name", a, sizeof(a));
         int i = desktop_app_find(a);
@@ -730,6 +1097,43 @@ static int tool_dispatch(const char *name, const char *args, out_t *o)
         snprintf(cmd, sizeof(cmd), "device %s %s", act[0] ? act : "info", dev);
         shell_run_capture(cmd, b, sizeof(b));
         outf(o, "%s", b);
+    } else if (!strcmp(name, "window")) {
+        tool_window(args, o);
+    } else if (!strcmp(name, "read_screen")) {
+        tool_screen(args, o, 0);
+    } else if (!strcmp(name, "click")) {
+        tool_screen(args, o, 1);
+    } else if (!strcmp(name, "type_text")) {
+        tool_type(args, o);
+    } else if (!strcmp(name, "press_keys")) {
+        tool_keys(args, o);
+    } else if (!strcmp(name, "terminal")) {
+        tool_terminal(args, o);
+    } else if (!strcmp(name, "notepad")) {
+        static char text[3000], r[3600];
+        char act[24], raw[200], path[200];
+        json_any(args, "action", act, sizeof(act));
+        json_str(args, "text", text, sizeof(text));
+        json_str(args, "path", raw, sizeof(raw));
+        path[0] = 0;
+        if (raw[0]) resolve(raw, path, sizeof(path));
+        notepad_ai(act[0] ? act : "status", text, path, json_bool(args, "discard", 0), r, sizeof(r));
+        outf(o, "%s", r);
+    } else if (!strcmp(name, "browser")) {
+        static char arg[600], r[3600];
+        char act[24];
+        json_any(args, "action", act, sizeof(act));
+        json_str(args, "text", arg, sizeof(arg));
+        if (!arg[0]) json_str(args, "url", arg, sizeof(arg));
+        browser_ai(act[0] ? act : "status", arg, r, sizeof(r));
+        outf(o, "%s", r);
+    } else if (!strcmp(name, "open_settings")) {
+        json_str(args, "page", a, sizeof(a));
+        for (char *c = a; *c; c++) if (*c >= 'A' && *c <= 'Z') *c = (char)(*c + 32);
+        desktop_app_launch(desktop_app_find("Settings"));
+        settings_show_page(a[0] ? a : "home");
+        desktop_invalidate();
+        outf(o, "Opened Settings%s%s.", a[0] ? " at " : "", a);
     } else if (!strcmp(name, "browse")) {
         char u[600];
         json_any(args, "url", u, sizeof(u));
@@ -777,7 +1181,8 @@ static int path_args_private(const char *args)
 /* Every tool name, for "jarvis tools" in the Terminal. */
 const char *ai_tool_names(void)
 {
-    return "  apps:      open_app close_app list_apps\n"
+    return "  apps:      open_app close_app list_apps window read_screen click type_text press_keys\n"
+           "             notepad browser terminal open_settings\n"
            "  files:     list_files find_files read_file write_file create_folder delete move copy open_file\n"
            "  system:    system_status list_processes kill_process suspend_process resume_process set_priority\n"
            "             run_command change_setting get_settings screenshot\n"
@@ -934,8 +1339,10 @@ int ai_host_line(const char *line)
             else text[k++] = *p;
         }
         text[k] = 0;
-        ui_shell_display(text);
-        tts_speak(text, k);
+        if (k) {                                    /* empty: not meant for JARVIS (noise, other people) */
+            ui_shell_display(text);
+            tts_speak(text, k);
+        }
         ui_shell_set_status("READY");
         return 1;
     }

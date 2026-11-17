@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Photos (apps/photos.c)
+ * Kryzen OS — Photos (apps/photos.c)
  * Language: C17
  *
  * Picture viewer for PNG, JPEG and BMP files: fit to window or zoom
@@ -141,7 +141,7 @@ static void ph_gallery_load(void)
 {
     if (ph.thumbs_loaded) return;
     ph.thumbs_loaded = 1;
-    snprintf(ph.dir, sizeof(ph.dir), "/jarvis/data/Pictures");
+    snprintf(ph.dir, sizeof(ph.dir), "/kryzen/data/Pictures");
     if (!vfs_is_dir(ph.dir)) mkdir_p(ph.dir);
     ph.path[0] = 0;
     /* Pictures and the folders inside it (Screenshots ...), newest names last */

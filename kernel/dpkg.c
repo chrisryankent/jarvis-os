@@ -3,7 +3,7 @@
  * JARVIS AI OS — dpkg and apt for the Linux layer (kernel/dpkg.c)
  * Language: C17
  *
- * Installs real Debian packages (.deb) into the Linux root /jarvis/linux,
+ * Installs real Debian packages (.deb) into the Linux root /kryzen/linux,
  * where the Linux compatibility layer (kernel/linux.c) runs them.
  *
  *   dpkg -i file.deb     unpack and register a package
@@ -37,7 +37,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 
-#define LXR          "/jarvis/linux"
+#define LXR          "/kryzen/linux"
 #define DPKG_DIR     LXR "/var/lib/dpkg"
 #define STATUS_FILE  DPKG_DIR "/status"
 #define APT_LISTS    LXR "/var/lib/apt/lists"
@@ -1071,7 +1071,7 @@ typedef struct {
     size_t len, cap;
     char line[32768];
     size_t ll;
-    char fld[F_COUNT][1024];
+    char fld[F_COUNT][4096];
     int have, count, fail;
     uint64_t in_bytes;
 } idxb_t;
@@ -1422,12 +1422,18 @@ static int resolve(const char *name, const dep_t *want, int requested, int upgra
     }
     if (g_nvisit >= PLAN_MAX || g_nplan >= PLAN_MAX) { snprintf(why, wn, "too many packages"); return -1; }
     snprintf(g_visiting[g_nvisit++], 96, "%s", name);
-    static char deps[16384];
+    /* One buffer per recursion depth: the dependency list being walked must
+     * survive the recursive calls for its members (a single static buffer
+     * was overwritten by the child's list, and the parent then parsed the
+     * leftovers: "dpkg depends on .4)"). Static, not on the process stack. */
+    static char deps_at[42][8192];
+    static dep_t alts_at[42][8];
+    char *deps = deps_at[depth];
+    dep_t *alts = alts_at[depth];
     for (int f = F_PREDEP; f <= F_DEP; f++) {
-        snprintf(deps, sizeof(deps), "%.*s", (int)r.l[f], r.f[f]);
+        snprintf(deps, sizeof(deps_at[0]), "%.*s", (int)r.l[f], r.f[f]);
         const char *p = deps, *end = deps + strlen(deps);
         while (p < end) {
-            dep_t alts[8];
             int na = 0;
             for (;;) {
                 dep_t d;
@@ -1647,7 +1653,7 @@ static int cmd_apt(int argc, char **argv)
         else if (nn < 64) names[nn++] = argv[i];
     }
     if (!op) {
-        say("apt 2.6 (JARVIS OS Linux layer)\nUsage: apt [options] command\n\n"
+        say("apt 2.6 (Kryzen OS Linux layer)\nUsage: apt [options] command\n\n"
             "  update      download the package lists\n  install     install packages (and what they depend on)\n"
             "  remove      remove packages\n  purge       remove packages and their configuration\n"
             "  upgrade     upgrade installed packages\n  search      search package names and descriptions\n"
@@ -1799,7 +1805,7 @@ uint32_t dpkg_start(int argc, char **argv, const char *cwd)
     }
     g_argv[g_argc] = NULL;
     if (!strcmp(g_argv[0], "apt-get") || !strcmp(g_argv[0], "apt-cache")) g_argv[0] = (char *)"apt";
-    snprintf(g_cwd, sizeof(g_cwd), "%s", cwd ? cwd : "/jarvis/data");
+    snprintf(g_cwd, sizeof(g_cwd), "%s", cwd ? cwd : "/kryzen/data");
     uint64_t irq;
     __asm__ volatile ("pushfq; pop %0; cli" : "=r"(irq) :: "memory");
     g_worker = proc_spawn(!strcmp(g_argv[0], "apt") ? "apt" : "dpkg", dpkg_worker, PRIO_USER, 0);

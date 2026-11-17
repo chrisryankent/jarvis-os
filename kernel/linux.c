@@ -11,8 +11,8 @@
  *               (ld-linux-x86-64.so.2), which then loads the shared
  *               libraries with mmap. The initial stack carries argv, envp
  *               and the auxiliary vector exactly as Linux lays it out.
- *   files       a Linux root at /jarvis/linux (/lib, /usr, /etc, /tmp ...);
- *               paths under /jarvis are the JARVIS files themselves;
+ *   files       a Linux root at /kryzen/linux (/lib, /usr, /etc, /tmp ...);
+ *               paths under /kryzen are the JARVIS files themselves;
  *               /dev/null, /dev/zero, /dev/urandom, /dev/tty, /proc/self/exe
  *   memory      mmap (anonymous and file), munmap, mprotect, brk, with
  *               demand paging; arch_prctl sets the FS base for thread-local
@@ -35,7 +35,7 @@ void usermode_enter(uint64_t entry, uint64_t user_stack);
 void proc_set_fs_base(uint64_t v);
 uint64_t proc_get_fs_base(void);
 
-#define LX_ROOT        "/jarvis/linux"
+#define LX_ROOT        "/kryzen/linux"
 #define LX_MAX         16
 #define LX_FDS         64
 #define LX_MAIN_BASE   0x0000555555554000ULL
@@ -128,10 +128,10 @@ static void lx_norm(char *p)
  * The Linux root follows current Debian: /bin, /sbin, /lib, /lib64 are
  * aliases of the folders under /usr. Symbolic links (from packages, or made
  * by programs with symlink()) are kept in a table saved at
- * /jarvis/linux/var/lib/dpkg/jarvis-symlinks; the JARVIS file system itself
+ * /kryzen/linux/var/lib/dpkg/kryzen-symlinks; the JARVIS file system itself
  * has no links. Paths are resolved component by component, like Linux. */
 #define LX_LINKS     8192
-#define LX_LINK_FILE LX_ROOT "/var/lib/dpkg/jarvis-symlinks"
+#define LX_LINK_FILE LX_ROOT "/var/lib/dpkg/kryzen-symlinks"
 
 typedef struct { char path[200]; char target[200]; int next; } lx_link_t;
 static lx_link_t g_link[LX_LINKS];
@@ -279,7 +279,7 @@ void linux_canon(const char *in, char *out, int follow_last)
                 break;
             }
         }
-        if (!strncmp(cur, "/jarvis", 7) && (cur[7] == 0 || cur[7] == '/')) break;
+        if (!strncmp(cur, "/kryzen", 7) && (cur[7] == 0 || cur[7] == '/')) break;
         int changed = 0;
         size_t n = strlen(cur);
         for (size_t e = 1; e <= n && !changed; e++) {
@@ -336,7 +336,7 @@ static int lx_path_f(lx_proc_t *L, int dirfd, const char *in, char *out, int fol
     if (!strcmp(full, "/dev/tty") || !strcmp(full, "/dev/stdout") || !strcmp(full, "/dev/stderr")) { snprintf(out, 256, "%s", full); return FD_STDOUT; }
     if (!strcmp(full, "/dev/stdin")) { snprintf(out, 256, "%s", full); return FD_STDIN; }
     if (!strcmp(full, "/proc/self/exe")) { snprintf(out, 256, "%s", L->exe); return 0; }
-    if (!strncmp(full, "/jarvis", 7) && (full[7] == 0 || full[7] == '/')) { snprintf(out, 256, "%s", full); return 0; }
+    if (!strncmp(full, "/kryzen", 7) && (full[7] == 0 || full[7] == '/')) { snprintf(out, 256, "%s", full); return 0; }
     snprintf(out, 256, "%s%s", LX_ROOT, strcmp(full, "/") ? full : "");
     return 0;
 }
@@ -619,7 +619,7 @@ static int64_t lx_getdents64(lx_proc_t *L, int fd, uint64_t ubuf, size_t count)
         linux_links_in(lv, dents_link, &d);
     }
     /* hide the protected system folder */
-    if (!strcmp(f->path, "/jarvis"))
+    if (!strcmp(f->path, "/kryzen"))
         for (int i = 0; i < d.n; i++) if (!strcmp(pool + off[i], "system")) type[i] = 0;
     size_t o = 0;
     uint8_t *out = (uint8_t *)ubuf;
@@ -828,7 +828,7 @@ static void lx_main(void)
     snprintf(pwd, sizeof(pwd), "PWD=%s", cwdv);
     setting_get("device_name", host, sizeof(host));
     char hostenv[96];
-    snprintf(hostenv, sizeof(hostenv), "HOSTNAME=%s", host[0] ? host : "JARVIS-PC");
+    snprintf(hostenv, sizeof(hostenv), "HOSTNAME=%s", host[0] ? host : "Kryzen-PC");
     const char *envs[] = { "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "HOME=/root", "USER=root",
                            "LOGNAME=root", "SHELL=/bin/sh", "TERM=dumb", "LANG=C.UTF-8", "COLUMNS=100", "LINES=30", pwd, hostenv };
     int envc = 0;
@@ -898,7 +898,7 @@ uint32_t linux_exec(const char *path, int argc, char **argv, const char *cwd)
     lx_proc_t *L = &g_lx[s];
     memset(L, 0, sizeof(*L));
     snprintf(L->exe, sizeof(L->exe), "%s", path);
-    snprintf(L->cwd, sizeof(L->cwd), "%s", cwd && *cwd ? cwd : "/jarvis/data");
+    snprintf(L->cwd, sizeof(L->cwd), "%s", cwd && *cwd ? cwd : "/kryzen/data");
     size_t o = 0;
     for (int i = 0; i < argc && o < sizeof(L->args) - 2; i++) {
         size_t l = strlen(argv[i]);
@@ -1117,9 +1117,9 @@ int64_t linux_syscall(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3, uint64
         char host[64];
         setting_get("device_name", host, sizeof(host));
         snprintf(u, 65, "Linux");
-        snprintf(u + 65, 65, "%s", host[0] ? host : "JARVIS-PC");
+        snprintf(u + 65, 65, "%s", host[0] ? host : "Kryzen-PC");
         snprintf(u + 130, 65, "6.1.0-jarvis");
-        snprintf(u + 195, 65, "#1 SMP JARVIS OS Linux compatibility layer");
+        snprintf(u + 195, 65, "#1 SMP Kryzen OS Linux compatibility layer");
         snprintf(u + 260, 65, "x86_64");
         snprintf(u + 325, 65, "(none)");
         return copy_out(a1, u, sizeof(u));
@@ -1405,19 +1405,20 @@ void linux_install_root(void)
     }
     char host[64], hostfile[80];
     setting_get("device_name", host, sizeof(host));
-    snprintf(hostfile, sizeof(hostfile), "%s\n", host[0] ? host : "JARVIS-PC");
+    snprintf(hostfile, sizeof(hostfile), "%s\n", host[0] ? host : "Kryzen-PC");
     struct { const char *path, *text; } files[] = {
         { "/etc/passwd", "root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n" },
         { "/etc/group", "root:x:0:\nnogroup:x:65534:\n" },
-        { "/etc/os-release", "PRETTY_NAME=\"JARVIS OS (Linux compatibility, Debian 12 packages)\"\nNAME=\"JARVIS OS\"\nID=jarvis\nID_LIKE=debian\n"
-                             "VERSION_ID=\"12\"\nVERSION_CODENAME=bookworm\n" },
+        { "/etc/os-release", "PRETTY_NAME=\"Kryzen OS 2026 (Linux compatibility, Debian 12 packages)\"\n"
+                             "NAME=\"Kryzen OS\"\nID=kryzen\nVERSION_ID=\"2026\"\nID_LIKE=debian\n"
+                             "VERSION_CODENAME=bookworm\n" },
         { "/etc/debian_version", "12.0\n" },
         { "/etc/hostname", hostfile },
         { "/etc/hosts", "127.0.0.1 localhost\n" },
         { "/etc/resolv.conf", "nameserver 10.0.2.3\n" },
         { "/etc/nsswitch.conf", "passwd: files\ngroup: files\nhosts: files dns\n" },
         { "/etc/ld.so.conf", "/usr/local/lib\n/usr/lib/x86_64-linux-gnu\n" },
-        { "/etc/apt/sources.list", "# Debian packages for the JARVIS OS Linux layer (apt update reads this)\n"
+        { "/etc/apt/sources.list", "# Debian packages for the Kryzen OS Linux layer (apt update reads this)\n"
                                    "deb https://deb.debian.org/debian bookworm main\n" },
         /* like Debian's minimal images: no manuals, translations or docs */
         { "/etc/dpkg/dpkg.cfg.d/excludes", "# files dpkg does not unpack (remove a line to keep them)\n"

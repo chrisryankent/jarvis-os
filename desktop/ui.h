@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Shared desktop UI definitions (desktop/ui.h)
+ * Kryzen OS — Shared desktop UI definitions (desktop/ui.h)
  *
  * Theme palette, icon set, small widgets and system helpers used by the
  * window manager, the shell (taskbar / Start / notifications) and every app.
@@ -77,6 +77,9 @@ typedef enum {
     ICON_CLOCK,         /* Clock */
     ICON_REGEDIT,       /* Registry Editor */
     ICON_BROWSER,       /* Browser */
+    ICON_NEURAL,        /* Neural Studio / AI engine */
+    ICON_COPILOT,       /* AI Copilot sparkle assistant */
+    ICON_CODE,          /* VS Code / Hybrid IDE */
 } icon_id_t;
 
 typedef enum {
@@ -100,8 +103,31 @@ typedef enum {
     GLYPH_PLANE,        /* airplane mode */
     GLYPH_CONTRAST,     /* dark mode */
     GLYPH_CAMERA,       /* screenshot */
+    GLYPH_BOLT,         /* quick prompt / telemetry bolt */
+    GLYPH_BATTERY,      /* status battery */
+    /* line glyphs (anti-aliased strokes) */
+    GLYPH_MENU,         /* three bars */
+    GLYPH_COG,          /* settings gear, one colour */
+    GLYPH_ACCESS,       /* accessibility figure */
+    GLYPH_CHECK,
+    GLYPH_ARROW_RIGHT,
+    GLYPH_CHEVRON_RIGHT,
+    GLYPH_CHEVRON_LEFT,
+    GLYPH_CHEVRON_UP,
+    GLYPH_WARNING,      /* triangle with ! */
+    GLYPH_HISTORY,      /* clock with a turn-back arrow */
+    GLYPH_DISPLAY,      /* monitor */
+    GLYPH_SQUARE,       /* rounded square: show desktop */
+    GLYPH_PADLOCK,      /* outline padlock */
+    GLYPH_PROFILE,      /* person in a circle */
+    GLYPH_FOLDER_LINE,
+    GLYPH_CLOSE,
+    GLYPH_KEYBOARD,
+    GLYPH_DISK,
 } glyph_id_t;
 
+void icon_kryzen_logo(int x, int y, int size);          /* the Kryzen K */
+void ui_orb(int cx, int cy, int r, int level);          /* the assistant orb */
 /* Full-colour app icon in a size x size box. */
 void icon_draw(icon_id_t icon, int x, int y, int size);
 /* Single-colour UI glyph; bg is the colour it sits on (used for cut-outs). */
@@ -117,6 +143,12 @@ void ui_progress(int x, int y, int w, int h, int percent,
 /* Draws at most max_w pixels of text, ending in ".." when truncated. */
 void ui_text_fit(int x, int y, int max_w, const char *text, uint32_t fg);
 void ui_text_center(int x, int y, int w, const char *text, uint32_t fg);
+void ui_switch(int x, int y, int on, uint32_t accent_color);
+void ui_slider(int x, int y, int w, int h, int val, int min, int max, uint32_t track_col, uint32_t fill_col);
+void ui_badge(int x, int y, const char *text, uint32_t bg, uint32_t fg);
+void ui_tooltip(int x, int y, const char *text);
+void ui_pill_button(int x, int y, int w, int h, const char *label, int active, uint32_t bg, uint32_t fg);
+void ui_sparkline(int x, int y, int w, int h, const uint32_t *values, int count, uint32_t line_col, uint32_t fill_col);
 
 /* ---- System helpers ------------------------------------------------------ */
 typedef struct {
@@ -131,6 +163,7 @@ void sys_set_clock_24h(int on);
 int  sys_clock_24h(void);
 void sys_cpu_name(char *out, size_t n);
 void sys_format_date(char *buf, size_t n);          /* "Thu 12 Nov 2026"     */
+void sys_format_date_long(char *buf, size_t n);     /* "Monday, November 16, 2026" */
 void sys_format_uptime(char *buf, size_t n);        /* "1h 04m 09s"          */
 void sys_poweroff(void);
 void sys_reboot(void);
@@ -178,7 +211,11 @@ int      notifications_get_count(void);
 int      notifications_get_unread_count(void);
 
 /* ---- Taskbar + Start menu (desktop/taskbar.c) ---------------------------- */
-#define TASKBAR_H 48
+#define TASKBAR_H 76            /* the dock (64) with its margins */
+#define TOPBAR_H  24            /* the slim bar along the top */
+int  desktop_panel_right(void);                 /* right edge of the app panel */
+int  desktop_panel_hover(int x, int y);
+int  desktop_cpu_percent(void);                 /* processor load, last sample */
 void taskbar_init(void);
 void taskbar_draw(void);
 int  taskbar_hover(int x, int y);               /* 1 if highlight changed    */
@@ -217,6 +254,13 @@ int  desktop_handle_click(int x, int y);
 const char *desktop_get_icon_target(int index);
 void desktop_wallpaper_invalidate(void);
 void wallpaper_paint_backdrop(int dim);           /* desktop/wallpaper.c */
+/* Frosted glass cut from the blurred picture behind (wallpaper or backdrop). */
+#define UI_NEON_CYAN    0x005CE6FF
+#define UI_NEON_VIOLET  0x009B7BFF
+#define UI_TEXT_SOFT    0x00A9B4D0
+void ui_glass(int x, int y, int w, int h, int r);
+void ui_glass_tinted(int x, int y, int w, int h, int r, uint32_t tint, int tint_alpha);
+void ui_neon_frame(int x, int y, int w, int h, int r, int thickness, int glow);
 int  wallpaper_style(void);
 const char *wallpaper_style_name(int i);
 const char *wallpaper_style_title(int i);

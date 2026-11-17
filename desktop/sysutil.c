@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — System helpers for the desktop (desktop/sysutil.c)
+ * Kryzen OS — System helpers for the desktop (desktop/sysutil.c)
  *
  * Real-time clock (CMOS), power off / reboot, and time formatting.
  * =============================================================================
@@ -131,6 +131,18 @@ void sys_cpu_name(char *out, size_t n)
     while (i < 48 && s[i] == ' ') i++;
     for (; i < 48 && s[i] && k < n - 1; i++) out[k++] = s[i];    /* (no %.*s in the kernel printf) */
     out[k] = 0;
+}
+
+void sys_format_date_long(char *buf, size_t n)
+{
+    static const char *const days[7] =
+        { "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday" };
+    static const char *const months[12] =
+        { "January", "February", "March", "April", "May", "June",
+          "July", "August", "September", "October", "November", "December" };
+    sys_time_t t;
+    sys_get_time(&t);
+    snprintf(buf, n, "%s, %s %d, %d", days[t.weekday % 7], months[(t.month + 11) % 12], t.day, t.year);
 }
 
 void sys_format_date(char *buf, size_t n)

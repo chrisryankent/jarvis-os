@@ -24,6 +24,17 @@ NASMFLAGS := -f elf64
 LDFLAGS := -T kernel/linker.ld
 ISO_DIR := iso
 ISO_OUT := build/jarvis.iso
+# Boot loaders of an installed system and the bundle the installer unpacks.
+INSTALLER_EFI := build/boot/BOOTX64.EFI
+BIOS_CORE     := build/boot/core.img
+BIOS_BOOT     := /usr/lib/grub/i386-pc/boot.img
+BOOT_BUNDLE   := build/kryzen-boot.tar
+THEME_SRC     := configs/grub-theme
+# Everything the installed boot menu uses is built into the loaders: nothing
+# is loaded from a module folder at boot.
+GRUB_BOOT_MODS := part_gpt part_msdos fat normal configfile search search_fs_file \
+                  multiboot2 video video_fb gfxterm gfxmenu png jpeg font echo test \
+                  sleep reboot halt minicmd ls cat
 
 KERNEL_CORE := kernel/kernel_core.o
 BOOT_OBJS := boot/multiboot2.o
@@ -38,7 +49,7 @@ INPUT_OBJS :=
 AI_OBJS := ai_core/runtime.o
 SECURITY_OBJS := security/security.o
 SPEECH_OBJS := speech/speech_engine.o
-EXTRA_OBJS := kernel/syscall_entry.o user/programs.o
+EXTRA_OBJS := kernel/syscall_entry.o user/programs.o desktop/assets.o
 
 # User-mode programs (ring 3). Built as static ELF files and bundled into
 # the kernel image, which installs them in /jarvis/bin at boot.
@@ -70,9 +81,10 @@ QEMU_DISK := -device ahci,id=ahci \
              -drive id=hd0,file=$(DISK_IMG),if=none,format=raw \
              -device ide-hd,drive=hd0,bus=ahci.0
 # Window: the guest is scaled to fit the window (resize or maximise it
-# freely; Ctrl+Alt+F for full screen). The menu bar is hidden to leave room
-# for the taskbar; Ctrl+Alt+M shows it.
-QEMU_DISPLAY ?= -display gtk,zoom-to-fit=on,show-menubar=off
+# freely; Ctrl+Alt+F for full screen, Ctrl+Alt+G releases the mouse). The
+# menu bar must stay visible: QEMU's GTK window loses every Ctrl+Alt hot key,
+# including Ctrl+Alt+G, when it is hidden with show-menubar=off.
+QEMU_DISPLAY ?= -display gtk,zoom-to-fit=on
 # Network: QEMU's built-in router shares the host's connection (Wi-Fi or
 # cable) with the guest's Ethernet card and runs a DHCP server for it.
 QEMU_NET  := -netdev user,id=net0 -device e1000,netdev=net0
@@ -81,9 +93,20 @@ QEMU_NET  := -netdev user,id=net0 -device e1000,netdev=net0
 QEMU_USB  := -device qemu-xhci,id=xhci $(QEMU_USB_EXTRA)
 # Control socket used by tools/usb_stick.py to plug USB drives in and out.
 QEMU_MONITOR := -monitor unix:/tmp/jarvis-qemu-monitor-$(shell id -u).sock,server,nowait
-QEMU_FLAGS := -cdrom $(ISO_OUT) -boot d -m $(QEMU_MEM) -serial stdio \
+# Boot order: the ISO first; after a restart from inside the guest (for
+# example at the end of an installation) the hard disk, then the ISO again
+# if the disk has no boot loader.
+QEMU_BOOT ?= -boot order=cd,once=d
+QEMU_COMMON := -m $(QEMU_MEM) -serial stdio \
               -rtc base=localtime $(QEMU_AUDIO) $(QEMU_DISK) $(QEMU_NET) $(QEMU_USB) \
               $(QEMU_MONITOR)
+QEMU_FLAGS := -cdrom $(ISO_OUT) $(QEMU_BOOT) $(QEMU_COMMON)
+# UEFI firmware for the run-uefi targets (Debian/Kali package: ovmf).
+OVMF_CODE ?= /usr/share/OVMF/OVMF_CODE_4M.fd
+OVMF_VARS_SRC ?= /usr/share/OVMF/OVMF_VARS_4M.fd
+OVMF_VARS := storage/OVMF_VARS.fd
+QEMU_UEFI := -machine q35 -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+             -drive if=pflash,format=raw,file=$(OVMF_VARS)
 
 # Host voice bridge: COM2 is exposed as this socket; tools/voice_bridge.py
 # records the host microphone, transcribes it with whisper.cpp and sends the
@@ -93,9 +116,9 @@ VOICE_SOCKET := /tmp/jarvis-voice.sock
 # Keep the ISO small: compress GRUB and ship only what the themed boot menu
 # needs (the unicode font; no locales or stock themes).
 GRUB_MKRESCUE_FLAGS := --compress=xz --locales= --themes= --fonts=unicode
-GRUB_THEME_DIR := $(ISO_DIR)/boot/grub/themes/jarvis
+GRUB_THEME_DIR := $(ISO_DIR)/boot/grub/themes/kryzen
 
-.PHONY: all clean check iso iso-models run qemu run-headless run-voice voice-install voice-enroll voice-setup voice-render usb-list usb-attach usb-image usb-detach FORCE
+.PHONY: all clean check iso iso-models run qemu run-disk run-uefi run-disk-uefi run-headless run-voice art voice-install voice-enroll voice-setup voice-render usb-list usb-attach usb-image usb-detach FORCE
 
 all: kernel.elf
 
@@ -110,6 +133,7 @@ FORCE:
 # them must rebuild desktop_init.o.
 desktop/desktop_init.o: $(wildcard desktop/*.c desktop/*.h apps/*.c apps/*.h \
                           input/*.c input/*.h wm/*.h)
+desktop/ui_shell.o: $(wildcard desktop/*.c desktop/*.h)
 
 # Shared headers: a change to any of them rebuilds everything that uses them.
 $(DRIVER_OBJS) $(DESKTOP_OBJS) $(WM_OBJS): kernel/kernel.h drivers/gpu.h \
@@ -119,11 +143,50 @@ $(DISK_IMG):
 	mkdir -p $(dir $(DISK_IMG))
 	truncate -s $(DISK_MB)M $@
 
+# Boot loaders the native installer puts on the target disk. Both search for
+# EFI/Kryzen/kryzen.marker and read the boot menu next to it.
+$(INSTALLER_EFI): configs/grub-installed.cfg
+	mkdir -p $(dir $@)
+	grub-mkimage -O x86_64-efi -o $@ -p /EFI/Kryzen/grub -c configs/grub-installed.cfg \
+		$(GRUB_BOOT_MODS) efi_gop chain efifwsetup
+
+$(BIOS_CORE): configs/grub-installed.cfg
+	mkdir -p $(dir $@)
+	grub-mkimage -O i386-pc -o $@ -p /EFI/Kryzen/grub -c configs/grub-installed.cfg \
+		$(GRUB_BOOT_MODS) biosdisk vbe vga
+
+$(BOOT_BUNDLE): $(INSTALLER_EFI) $(BIOS_CORE) configs/grub-installed-menu.cfg \
+                scripts/make_boot_bundle.py $(wildcard $(THEME_SRC)/* $(THEME_SRC)/icons/*)
+	$(PYTHON) scripts/make_boot_bundle.py $@ $(INSTALLER_EFI) $(BIOS_BOOT) $(BIOS_CORE) \
+		configs/grub-installed-menu.cfg $(THEME_SRC)
+
+$(OVMF_VARS):
+	mkdir -p $(dir $@)
+	cp $(OVMF_VARS_SRC) $@
+
+# Regenerate the artwork (wallpapers, boot-menu theme, UI fonts). The results
+# are checked in; this needs python3-numpy, python3-scipy and python3-pil.
+art:
+	$(PYTHON) scripts/gen_wallpapers.py
+	$(PYTHON) scripts/gen_grub_theme.py
+	$(PYTHON) tools/gen_fonts.py
+
 # Build the ISO and boot it in a QEMU window; kernel log goes to this terminal.
 run: iso $(DISK_IMG)
 	$(QEMU) $(QEMU_FLAGS) $(QEMU_DISPLAY)
 
 qemu: run
+
+# Start the system installed on the hard disk image (no ISO attached).
+run-disk: $(DISK_IMG)
+	$(QEMU) -boot c $(QEMU_COMMON) $(QEMU_DISPLAY)
+
+# The same two, on UEFI firmware instead of the legacy BIOS.
+run-uefi: iso $(DISK_IMG) $(OVMF_VARS)
+	$(QEMU) $(QEMU_UEFI) -cdrom $(ISO_OUT) $(QEMU_COMMON) $(QEMU_DISPLAY)
+
+run-disk-uefi: $(DISK_IMG) $(OVMF_VARS)
+	$(QEMU) $(QEMU_UEFI) $(QEMU_COMMON) $(QEMU_DISPLAY)
 
 # No window: serial log only (Ctrl-C to quit).
 run-headless: iso $(DISK_IMG)
@@ -206,19 +269,24 @@ user/counter.jpk: user/counter.elf tools/mkjpk.py
 user/programs.o: user/programs.S $(USER_ELFS) user/hello.jpk user/counter.jpk
 	$(CC) -c user/programs.S -o $@
 
+desktop/assets.o: desktop/assets.S $(wildcard desktop/assets/*.jpg)
+	$(CC) -c desktop/assets.S -o $@
+
 kernel/syscall_entry.o: kernel/syscall_entry.S
 	$(AS) $(ASFLAGS) $< -o $@
 
 check:
 	$(MAKE) -C kernel check
 
-iso: kernel.elf
+iso: kernel.elf $(BOOT_BUNDLE)
 	$(PYTHON) scripts/sync_models.py --no-iso-sync
 	rm -rf $(ISO_DIR)
 	mkdir -p $(ISO_DIR)/boot/grub build
 	cp configs/grub.cfg $(ISO_DIR)/boot/grub/grub.cfg
+	cp $(BOOT_BUNDLE) $(ISO_DIR)/boot/kryzen-boot.tar
+	rm -rf $(GRUB_THEME_DIR)
 	mkdir -p $(GRUB_THEME_DIR)
-	cp configs/grub-theme/theme.txt configs/grub-theme/*.png $(GRUB_THEME_DIR)/
+	cp -r $(THEME_SRC)/. $(GRUB_THEME_DIR)/
 	cp kernel.elf $(ISO_DIR)/boot/kernel.elf
 	if command -v grub-mkrescue >/dev/null 2>&1; then \
 		rm -f $(ISO_OUT); \
@@ -228,12 +296,14 @@ iso: kernel.elf
 		exit 1; \
 	fi
 
-iso-models: kernel.elf
+iso-models: kernel.elf $(BOOT_BUNDLE)
 	$(PYTHON) scripts/sync_models.py
 	mkdir -p $(ISO_DIR)/boot/grub build
 	cp configs/grub.cfg $(ISO_DIR)/boot/grub/grub.cfg
+	cp $(BOOT_BUNDLE) $(ISO_DIR)/boot/kryzen-boot.tar
+	rm -rf $(GRUB_THEME_DIR)
 	mkdir -p $(GRUB_THEME_DIR)
-	cp configs/grub-theme/theme.txt configs/grub-theme/*.png $(GRUB_THEME_DIR)/
+	cp -r $(THEME_SRC)/. $(GRUB_THEME_DIR)/
 	cp kernel.elf $(ISO_DIR)/boot/kernel.elf
 	if command -v grub-mkrescue >/dev/null 2>&1; then \
 		rm -f $(ISO_OUT); \

@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Taskbar flyouts (desktop/flyouts.c)
+ * Kryzen OS — Taskbar flyouts (desktop/flyouts.c)
  * Language: C17
  *
  * Quick Settings (click the network / volume icons, or Win+A):

@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Taskbar and Start menu (desktop/taskbar.c)
+ * Kryzen OS — Taskbar and Start menu (desktop/taskbar.c)
  * Language: C17
  *
  * Taskbar: centred Start button, search and app icons (with running / focused
@@ -33,20 +33,29 @@ static int rect_hit(const rect_t *r, int px, int py)
 }
 
 /* ==========================================================================
- * TASKBAR
+ * TASKBAR: the slim top bar and the dock
+ *
+ * Top bar   K (Start) on the left; on the right quick settings, lock,
+ *           network, sound, the clock and show-desktop.
+ * Dock      Kryzen logo (Start), the assistant orb, the search field, pinned
+ *           and running apps, then Settings, quick settings, sound,
+ *           notifications and show-desktop.
  * ========================================================================== */
 #define TB_MAX_APPS 16
+#define DOCK_H      64
 
 enum {
     TBH_NONE = 0, TBH_START, TBH_SEARCH, TBH_CHIP, TBH_CLOCK, TBH_BELL, TBH_STATUS,
-    TBH_SHOWDESK, TBH_APP0 = 100,
+    TBH_SHOWDESK, TBH_SETTINGS, TBH_VOLUME,
+    TBH_TOP_K, TBH_TOP_TRAY, TBH_TOP_LOCK, TBH_TOP_NET, TBH_TOP_VOL, TBH_TOP_DESK,
+    TBH_APP0 = 100,
 };
 
 static struct {
-    rect_t start, search, apps[TB_MAX_APPS], chip, status, clock, bell, showdesk;
+    rect_t dock, start, search, apps[TB_MAX_APPS], chip, status, bell, showdesk, settings, volume;
+    rect_t top_k, top_tray, top_lock, top_net, top_vol, clock, top_desk;
     int app_idx[TB_MAX_APPS];   /* taskbar slot -> app index */
     int app_count;
-    int wide_search;
     int hover;
 } g_tb;
 
@@ -58,7 +67,7 @@ static struct {
 } g_start;
 
 /* ---- Pinned apps (setting "pins": names separated by commas) -------------- */
-static const char *g_default_pins = "Files,Browser,Terminal,JARVIS,Settings,Notepad,Photos";
+static const char *g_default_pins = "Files,Browser,Notepad,Photos,Terminal,JARVIS,Settings";
 
 int taskbar_is_pinned(int idx)
 {
@@ -106,8 +115,32 @@ static int taskbar_y(void)
  * always exactly what you can click. */
 static void taskbar_layout(void)
 {
-    int W = (int)fb_get_width();
-    int y = taskbar_y();
+    int W = (int)fb_get_width(), H = (int)fb_get_height();
+
+    /* ---- top bar ---- */
+    g_tb.top_k    = (rect_t){ 0, 0, 32, TOPBAR_H };
+    int rx = W - 4;
+    g_tb.top_desk = (rect_t){ rx - 26, 0, 26, TOPBAR_H };  rx -= 30;
+    g_tb.clock    = (rect_t){ rx - 74, 0, 74, TOPBAR_H };  rx -= 78;
+    g_tb.top_vol  = (rect_t){ rx - 24, 0, 24, TOPBAR_H };  rx -= 26;
+    g_tb.top_net  = (rect_t){ rx - 24, 0, 24, TOPBAR_H };  rx -= 26;
+    g_tb.top_lock = (rect_t){ rx - 24, 0, 24, TOPBAR_H };  rx -= 26;
+    g_tb.top_tray = (rect_t){ rx - 24, 0, 24, TOPBAR_H };
+
+    /* ---- dock ---- */
+    int dx = 8, dy = H - DOCK_H - 6, dw = W - 16;
+    g_tb.dock = (rect_t){ dx, dy, dw, DOCK_H };
+    g_tb.start = (rect_t){ dx + 10, dy + 8, W >= 1000 ? 152 : 50, 48 };
+
+    /* right cluster */
+    rx = dx + dw - 10;
+    g_tb.showdesk = (rect_t){ rx - 40, dy + 12, 40, 40 };  rx -= 44;
+    g_tb.bell     = (rect_t){ rx - 40, dy + 12, 40, 40 };  rx -= 44;
+    g_tb.volume   = (rect_t){ rx - 40, dy + 12, 40, 40 };  rx -= 44;
+    g_tb.status   = (rect_t){ rx - 40, dy + 12, 40, 40 };  rx -= 44;
+    g_tb.settings = (rect_t){ rx - 40, dy + 12, 40, 40 };  rx -= 44;
+    int right_edge = rx - 8;
+
     /* pinned apps first, then any other open app */
     int n = 0;
     for (int i = 0; i < desktop_app_builtin_count() && n < TB_MAX_APPS; i++)
@@ -115,35 +148,47 @@ static void taskbar_layout(void)
     for (int i = 0; i < desktop_app_builtin_count() && n < TB_MAX_APPS; i++)
         if (!taskbar_is_pinned(i) && desktop_app_get(i)->window) g_tb.app_idx[n++] = i;
 
+    /* orb, search and apps share what is left between the logo and the tray */
+    int left_edge = g_tb.start.x + g_tb.start.w + 12;
+    int room = right_edge - left_edge;
+    int max_apps = (room - 60 - 60) / 46;                   /* orb + a minimal search button */
+    if (max_apps < 0) max_apps = 0;
+    if (n > max_apps) n = max_apps;
     g_tb.app_count = n;
-    g_tb.wide_search = W >= 1200;
-    int search_w = g_tb.wide_search ? 200 : 44;
-    int total = 44 + 4 + search_w + 4 + n * 44;
-    int x = setting_get_int("taskbar_align", 0) == 1 ? 8 : (W - total) / 2;
-
-    g_tb.start = (rect_t){ x, y + 4, 44, 40 };            x += 48;
-    g_tb.search = (rect_t){ x, y + 4, search_w, 40 };     x += search_w + 4;
-    for (int i = 0; i < n; i++, x += 44)
-        g_tb.apps[i] = (rect_t){ x, y + 4, 44, 40 };
-
-    int rx = W - 6;
-    g_tb.showdesk = (rect_t){ rx, y, 6, TASKBAR_H };
-    g_tb.bell   = (rect_t){ rx - 36, y + 4, 36, 40 };     rx -= 38;
-    g_tb.clock  = (rect_t){ rx - 96, y + 4, 96, 40 };     rx -= 98;
-    g_tb.status = (rect_t){ rx - 52, y + 4, 52, 40 };     rx -= 54;
-    g_tb.chip   = (rect_t){ rx - 92, y + 4, 92, 40 };
+    int search_w = room - 60 - n * 46 - 24;
+    if (search_w > 360) search_w = 360;
+    if (search_w < 120) search_w = 44;                      /* just the magnifier */
+    int total = 56 + 12 + search_w + 14 + n * 46;
+    int cx = left_edge + (room - total) / 2;
+    int ideal = W * 30 / 100 - 28;                          /* the orb sits about a third along */
+    if (cx > ideal && ideal >= left_edge) cx = ideal;
+    g_tb.chip = (rect_t){ cx, dy + 4, 56, 56 };             cx += 56 + 12;
+    g_tb.search = (rect_t){ cx, dy + 12, search_w, 40 };    cx += search_w + 14;
+    for (int i = 0; i < n; i++, cx += 46)
+        g_tb.apps[i] = (rect_t){ cx, dy + 9, 46, 46 };
 }
 
 static int taskbar_hit(int x, int y)
 {
     taskbar_layout();
+    if (y < TOPBAR_H) {
+        if (rect_hit(&g_tb.top_k, x, y))    return TBH_TOP_K;
+        if (rect_hit(&g_tb.top_tray, x, y)) return TBH_TOP_TRAY;
+        if (rect_hit(&g_tb.top_lock, x, y)) return TBH_TOP_LOCK;
+        if (rect_hit(&g_tb.top_net, x, y))  return TBH_TOP_NET;
+        if (rect_hit(&g_tb.top_vol, x, y))  return TBH_TOP_VOL;
+        if (rect_hit(&g_tb.clock, x, y))    return TBH_CLOCK;
+        if (rect_hit(&g_tb.top_desk, x, y)) return TBH_TOP_DESK;
+        return TBH_NONE;
+    }
     if (rect_hit(&g_tb.start, x, y))    return TBH_START;
+    if (rect_hit(&g_tb.chip, x, y))     return TBH_CHIP;
     if (rect_hit(&g_tb.search, x, y))   return TBH_SEARCH;
     for (int i = 0; i < g_tb.app_count; i++)
         if (rect_hit(&g_tb.apps[i], x, y)) return TBH_APP0 + i;
-    if (rect_hit(&g_tb.chip, x, y))     return TBH_CHIP;
+    if (rect_hit(&g_tb.settings, x, y)) return TBH_SETTINGS;
     if (rect_hit(&g_tb.status, x, y))   return TBH_STATUS;
-    if (rect_hit(&g_tb.clock, x, y))    return TBH_CLOCK;
+    if (rect_hit(&g_tb.volume, x, y))   return TBH_VOLUME;
     if (rect_hit(&g_tb.bell, x, y))     return TBH_BELL;
     if (rect_hit(&g_tb.showdesk, x, y)) return TBH_SHOWDESK;
     return TBH_NONE;
@@ -158,132 +203,112 @@ void taskbar_init(void)
 
 int taskbar_hover(int x, int y)
 {
-    int h = taskbar_hit(x, y);
+    int h = (y < TOPBAR_H || y >= taskbar_y()) ? taskbar_hit(x, y) : TBH_NONE;
     if (h == g_tb.hover) return 0;
     g_tb.hover = h;
     return 1;
 }
 
-static void tb_hover_bg(const rect_t *r, int code)
+static void tb_hover_bg(const rect_t *r, int code, int active)
 {
-    if (g_tb.hover == code)
-        fb_fill_rounded_rect(r->x, r->y, r->w, r->h, 5, T(HOVER));
+    if (g_tb.hover == code || active)
+        fb_blend_rounded_rect(r->x, r->y, r->w, r->h, 9, 0x00FFFFFF, active ? 44 : 28);
+}
+
+static void tb_top_item(const rect_t *r, int code, glyph_id_t g, uint32_t col)
+{
+    if (g_tb.hover == code) fb_blend_rect(r->x, r->y, r->w, r->h, 0x00FFFFFF, 30);
+    glyph_draw(g, r->x + (r->w - 16) / 2, r->y + (TOPBAR_H - 16) / 2, 16, col, 0);
 }
 
 void taskbar_draw(void)
 {
     int W = (int)fb_get_width();
-    int y = taskbar_y();
+    uint32_t fg = T(TEXT), dim = T(TEXT_DIM);
+    int muted = !g_kstate.audio_ready || setting_get_int("mute", 0);
 
     taskbar_layout();
 
-    if (setting_get_int("transparency", 1) && theme_get_mode() != THEME_HIGH_CONTRAST)
-        fb_blend_rect(0, y, W, TASKBAR_H, T(TASKBAR), 225);         /* see-through, like Windows */
-    else
-        fb_fill_rect(0, y, W, TASKBAR_H, T(TASKBAR));
-    fb_fill_rect(0, y, W, 1, T(BORDER));
-
-    /* ---- Start ---- */
-    if (g_start.open)
-        fb_fill_rounded_rect(g_tb.start.x, g_tb.start.y, 44, 40, 5, T(HOVER));
-    tb_hover_bg(&g_tb.start, TBH_START);
-    icon_draw(ICON_START, g_tb.start.x + 10, g_tb.start.y + 8, 24);
-
-    /* ---- Search ---- */
-    if (g_tb.wide_search) {
-        rect_t *s = &g_tb.search;
-        fb_fill_rounded_rect(s->x, s->y + 4, s->w, 32, 16,
-                             g_tb.hover == TBH_SEARCH ? T(HOVER) : T(INPUT));
-        glyph_draw(GLYPH_SEARCH, s->x + 12, s->y + 12, 16, T(TEXT_DIM), T(INPUT));
-        fb_draw_text(s->x + 36, s->y + 12, "Ask JARVIS", T(TEXT_DIM));
-    } else {
-        tb_hover_bg(&g_tb.search, TBH_SEARCH);
-        glyph_draw(GLYPH_SEARCH, g_tb.search.x + 12, g_tb.search.y + 10, 20,
-                   T(TEXT), g_tb.hover == TBH_SEARCH ? T(HOVER) : T(TASKBAR));
-    }
-
-    /* ---- Apps ---- */
-    for (int i = 0; i < g_tb.app_count; i++) {
-        desktop_app_t *app = desktop_app_get(g_tb.app_idx[i]);
-        rect_t *r = &g_tb.apps[i];
-        int running = app->window != NULL;
-        int focused = running && app->window == g_wm_ctx.focused;
-
-        if (focused || g_tb.hover == TBH_APP0 + i)
-            fb_fill_rounded_rect(r->x + 2, r->y, r->w - 4, r->h, 5, T(HOVER));
-        icon_draw(app->icon, r->x + 10, r->y + 6, 24);
-
-        if (focused)
-            fb_fill_rounded_rect(r->x + 14, r->y + 35, 16, 3, 1, T(ACCENT));
-        else if (running)
-            fb_fill_rounded_rect(r->x + 19, r->y + 35, 6, 3, 1, T(TEXT_DIM));
-    }
-
-    /* ---- JARVIS status chip ---- */
+    /* ---- top bar ---- */
+    ui_glass_tinted(-12, -12, W + 24, TOPBAR_H + 12, 0, 0x00141830, 170);
+    if (g_start.open || g_tb.hover == TBH_TOP_K) fb_blend_rect(0, 0, 32, TOPBAR_H, 0x005CE6FF, 60);
+    icon_kryzen_logo(8, 3, 18);
+    tb_top_item(&g_tb.top_tray, TBH_TOP_TRAY, GLYPH_CHEVRON_UP, fg);
+    tb_top_item(&g_tb.top_lock, TBH_TOP_LOCK, GLYPH_PADLOCK, fg);
+    tb_top_item(&g_tb.top_net, TBH_TOP_NET, GLYPH_NET, net_connected() ? fg : dim);
+    tb_top_item(&g_tb.top_vol, TBH_TOP_VOL, GLYPH_VOLUME, muted ? dim : fg);
     {
-        rect_t *r = &g_tb.chip;
-        uint32_t col = ui_shell_get_security_alert() ? T(DANGER) : T(ACCENT);
-        char status[9];
-        tb_hover_bg(r, TBH_CHIP);
-        glyph_draw(GLYPH_MIC, r->x + 6, r->y + 12, 16, col,
-                   g_tb.hover == TBH_CHIP ? T(HOVER) : T(TASKBAR));
-        strncpy(status, ui_shell_get_status(), 8);
-        status[8] = 0;
-        fb_draw_text(r->x + 26, r->y + 12, status, col);
-    }
-
-    /* ---- Network + volume ---- */
-    if (shell_flyout_is_open() == FLY_QUICK) fb_fill_rounded_rect(g_tb.status.x, g_tb.status.y, g_tb.status.w, g_tb.status.h, 5, T(HOVER));
-    tb_hover_bg(&g_tb.status, TBH_STATUS);
-    {
-        uint32_t sbg = (shell_flyout_is_open() == FLY_QUICK || g_tb.hover == TBH_STATUS) ? T(HOVER) : T(TASKBAR);
-        glyph_draw(setting_get_int("airplane", 0) ? GLYPH_PLANE : GLYPH_NET, g_tb.status.x + 6, g_tb.status.y + 12, 16,
-                   net_connected() ? T(TEXT) : T(TEXT_DIM), sbg);
-        glyph_draw(GLYPH_VOLUME, g_tb.status.x + 30, g_tb.status.y + 12, 16,
-                   g_kstate.audio_ready && !setting_get_int("mute", 0) ? T(TEXT) : T(TEXT_DIM), sbg);
-        if (setting_get_int("mute", 0)) fb_draw_line(g_tb.status.x + 30, g_tb.status.y + 28, g_tb.status.x + 46, g_tb.status.y + 12, T(DANGER));
-    }
-
-    /* ---- Clock ---- */
-    {
-        static const char *const months[12] =
-            { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-        rect_t *r = &g_tb.clock;
-        char clock[12], date[16];
+        char clock[16];
         sys_time_t t;
-
-        if (shell_flyout_is_open() == FLY_CALENDAR) fb_fill_rounded_rect(r->x, r->y, r->w, r->h, 5, T(HOVER));
-        tb_hover_bg(r, TBH_CLOCK);
         sys_get_time(&t);
         sys_format_clock(clock, sizeof(clock));
         if (setting_get_int("clock_seconds", 0)) {
             if (sys_clock_24h()) snprintf(clock, sizeof(clock), "%02d:%02d:%02d", t.hour, t.minute, t.second);
             else snprintf(clock, sizeof(clock), "%d:%02d:%02d %s", t.hour % 12 ? t.hour % 12 : 12, t.minute, t.second, t.hour < 12 ? "AM" : "PM");
         }
-        snprintf(date, sizeof(date), "%d %s %d", t.day, months[t.month - 1], t.year);
-        fb_draw_text(r->x + r->w - 6 - fb_text_width(clock), r->y + 3, clock, T(TEXT));
-        fb_draw_text(r->x + r->w - 6 - fb_text_width(date), r->y + 21, date, T(TEXT));
+        if (g_tb.hover == TBH_CLOCK || shell_flyout_is_open() == FLY_CALENDAR)
+            fb_blend_rect(g_tb.clock.x, 0, g_tb.clock.w, TOPBAR_H, 0x00FFFFFF, 30);
+        fb_draw_text(g_tb.clock.x + (g_tb.clock.w - fb_text_width(clock)) / 2, (TOPBAR_H - 16) / 2, clock, fg);
+    }
+    tb_top_item(&g_tb.top_desk, TBH_TOP_DESK, GLYPH_SQUARE, fg);
+
+    /* ---- dock ---- */
+    rect_t *d = &g_tb.dock;
+    fb_blend_rounded_rect(d->x, d->y + 3, d->w, d->h, 16, 0x00000000, 60);
+    ui_glass(d->x, d->y, d->w, d->h, 14);
+
+    /* logo: opens Start */
+    tb_hover_bg(&g_tb.start, TBH_START, g_start.open);
+    icon_kryzen_logo(g_tb.start.x + 6, g_tb.start.y + 5, 38);
+    if (g_tb.start.w > 100)
+        fb_text(g_tb.start.x + 52, g_tb.start.y + 8, "Kryzen", 0x008FEAFF, FONT_TITLE);
+
+    /* the assistant */
+    {
+        rect_t *r = &g_tb.chip;
+        int level = ui_shell_get_mic_level();
+        ui_orb(r->x + r->w / 2, r->y + r->h / 2, g_tb.hover == TBH_CHIP ? 25 : 23, level);
     }
 
-    /* ---- Notification bell ---- */
+    /* search */
     {
-        rect_t *r = &g_tb.bell;
-        int unread = notifications_get_unread_count();
-        if (notifications_center_is_visible())
-            fb_fill_rounded_rect(r->x, r->y, r->w, r->h, 5, T(HOVER));
-        tb_hover_bg(r, TBH_BELL);
-        glyph_draw(GLYPH_BELL, r->x + 9, r->y + 11, 18, T(TEXT), T(TASKBAR));
-        if (unread > 0) {
-            char num[4];
-            snprintf(num, sizeof(num), "%d", unread > 9 ? 9 : unread);
-            fb_fill_circle(r->x + 27, r->y + 11, 8, T(ACCENT));
-            fb_draw_text(r->x + 23, r->y + 3, num, T(ACCENT_TEXT));
+        rect_t *r = &g_tb.search;
+        if (r->w > 60) {
+            fb_blend_rounded_rect(r->x, r->y, r->w, r->h, r->h / 2, 0x00050818, g_tb.hover == TBH_SEARCH ? 150 : 110);
+            fb_neon_rounded_rect(r->x, r->y, r->w, r->h, r->h / 2, 1, 0, 0x00C8D8FF, 0x00C8D8FF, 70);
+            glyph_draw(GLYPH_SEARCH, r->x + 14, r->y + 11, 18, dim, 0);
+            ui_text_fit(r->x + 42, r->y + 12, r->w - 56, "Search applications, files, and AI...", dim);
+        } else {
+            tb_hover_bg(r, TBH_SEARCH, 0);
+            glyph_draw(GLYPH_SEARCH, r->x + (r->w - 20) / 2, r->y + 10, 20, fg, 0);
         }
     }
 
-    /* ---- Show desktop sliver ---- */
-    fb_fill_rect(g_tb.showdesk.x, y + 8, 1, TASKBAR_H - 16, T(BORDER));
+    /* apps */
+    for (int i = 0; i < g_tb.app_count; i++) {
+        desktop_app_t *app = desktop_app_get(g_tb.app_idx[i]);
+        rect_t *r = &g_tb.apps[i];
+        int running = app->window != NULL;
+        int focused = running && app->window == g_wm_ctx.focused;
+        tb_hover_bg(r, TBH_APP0 + i, focused);
+        icon_draw(app->icon, r->x + 8, r->y + 6, 30);
+        if (focused) fb_fill_rounded_rect(r->x + 15, r->y + 41, 16, 3, 1, UI_NEON_CYAN);
+        else if (running) fb_fill_circle(r->x + 23, r->y + 42, 2, 0x00FFFFFF);
+    }
+
+    /* right cluster */
+    tb_hover_bg(&g_tb.settings, TBH_SETTINGS, 0);
+    glyph_draw(GLYPH_COG, g_tb.settings.x + 8, g_tb.settings.y + 8, 24, fg, 0);
+    tb_hover_bg(&g_tb.status, TBH_STATUS, shell_flyout_is_open() == FLY_QUICK);
+    glyph_draw(GLYPH_DISPLAY, g_tb.status.x + 8, g_tb.status.y + 8, 24, fg, 0);
+    tb_hover_bg(&g_tb.volume, TBH_VOLUME, 0);
+    glyph_draw(GLYPH_VOLUME, g_tb.volume.x + 9, g_tb.volume.y + 9, 22, muted ? dim : fg, 0);
+    if (muted) fb_draw_line_aa(g_tb.volume.x + 10, g_tb.volume.y + 30, g_tb.volume.x + 30, g_tb.volume.y + 10, 2, T(DANGER), 255);
+    tb_hover_bg(&g_tb.bell, TBH_BELL, notifications_center_is_visible());
+    glyph_draw(GLYPH_BELL, g_tb.bell.x + 9, g_tb.bell.y + 9, 22, fg, 0);
+    if (notifications_get_unread_count() > 0) fb_fill_circle(g_tb.bell.x + 29, g_tb.bell.y + 11, 4, UI_NEON_CYAN);
+    tb_hover_bg(&g_tb.showdesk, TBH_SHOWDESK, 0);
+    glyph_draw(GLYPH_SQUARE, g_tb.showdesk.x + 8, g_tb.showdesk.y + 8, 24, fg, 0);
 }
 
 static int g_tb_menu_app = -1;
@@ -301,17 +326,17 @@ static void taskbar_menu_action(int id, void *ctx)
     }
 }
 
-/* Is (x,y) on the network / volume icons? (mouse wheel changes the volume) */
+/* Is (x,y) on a sound icon? (the mouse wheel changes the volume there) */
 int taskbar_tray_hit(int x, int y)
 {
     taskbar_layout();
-    return rect_hit(&g_tb.status, x, y);
+    return rect_hit(&g_tb.volume, x, y) || rect_hit(&g_tb.top_vol, x, y);
 }
 
 /* Right-click on the taskbar: per-app menu, or taskbar menu. */
 int taskbar_handle_right_click(int x, int y)
 {
-    if (y < taskbar_y()) return 0;
+    if (y < taskbar_y() && y >= TOPBAR_H) return 0;
     int hit = taskbar_hit(x, y);
     if (hit >= TBH_APP0) {
         g_tb_menu_app = g_tb.app_idx[hit - TBH_APP0];
@@ -329,36 +354,43 @@ int taskbar_handle_right_click(int x, int y)
     return 1;
 }
 
-/* Returns 1 if the click landed on the taskbar. */
+/* Returns 1 if the click landed on the top bar or the dock. */
 int taskbar_handle_click(int x, int y)
 {
-    if (y < taskbar_y())
+    if (y < taskbar_y() && y >= TOPBAR_H)
         return 0;
 
     int hit = taskbar_hit(x, y);
 
-    if (hit != TBH_START && hit != TBH_SEARCH)
+    if (hit != TBH_START && hit != TBH_SEARCH && hit != TBH_TOP_K)
         start_menu_close();
     if (hit != TBH_BELL)
         notifications_close_center();
-    if (hit != TBH_STATUS && hit != TBH_CLOCK)
+    if (hit != TBH_STATUS && hit != TBH_CLOCK && hit != TBH_TOP_TRAY && hit != TBH_TOP_NET)
         shell_flyout_close();
 
-    if (hit == TBH_START) {
+    if (hit == TBH_START || hit == TBH_TOP_K) {
         taskbar_toggle_start_menu();
     } else if (hit == TBH_SEARCH) {
         if (!g_start.open) taskbar_toggle_start_menu();
     } else if (hit >= TBH_APP0) {
         desktop_app_activate(g_tb.app_idx[hit - TBH_APP0]);
-    } else if (hit == TBH_STATUS) {
+    } else if (hit == TBH_STATUS || hit == TBH_TOP_TRAY || hit == TBH_TOP_NET) {
         shell_flyout_toggle(FLY_QUICK);
+    } else if (hit == TBH_VOLUME || hit == TBH_TOP_VOL) {
+        char msg[96];
+        prefs_set("mute", setting_get_int("mute", 0) ? "off" : "on", msg, sizeof(msg));
+    } else if (hit == TBH_SETTINGS) {
+        desktop_app_launch(desktop_app_find("Settings"));
     } else if (hit == TBH_CHIP) {
         desktop_app_launch(desktop_app_find("JARVIS"));
     } else if (hit == TBH_CLOCK) {
         shell_flyout_toggle(FLY_CALENDAR);
     } else if (hit == TBH_BELL) {
         notifications_toggle_center();
-    } else if (hit == TBH_SHOWDESK) {
+    } else if (hit == TBH_TOP_LOCK) {
+        desktop_lock();
+    } else if (hit == TBH_SHOWDESK || hit == TBH_TOP_DESK) {
         wm_minimize_all();
     }
 
@@ -375,16 +407,17 @@ int taskbar_handle_click(int x, int y)
 #define SM_CELL_H   84
 #define SM_FOOTER_H 60
 
-enum { SMH_NONE = -1, SMH_LOCK = 200, SMH_RESTART, SMH_POWER };
+enum { SMH_NONE = -1, SMH_SIGNOUT = 200, SMH_LOCK, SMH_RESTART, SMH_POWER };
 
 static void start_rect(int *x, int *y, int *w, int *h)
 {
     int H = (int)fb_get_height() - TASKBAR_H - 24;
     *w = SM_W;
     if (*w > (int)fb_get_width() - 24) *w = (int)fb_get_width() - 24;
-    *h = H < 600 ? H : 600;
-    *x = ((int)fb_get_width() - *w) / 2;
-    *y = taskbar_y() - *h - 12;
+    H -= TOPBAR_H;
+    *h = H < 580 ? H : 580;
+    *x = 8;
+    *y = taskbar_y() - *h - 2;
 }
 
 static char lower(char c)
@@ -423,9 +456,9 @@ static void start_cell_rect(int k, int sx, int sy, rect_t *r)
 
 static void start_power_rect(int which, int sx, int sy, int sw, int sh, rect_t *r)
 {
-    /* which: 0 = lock, 1 = restart, 2 = power (right-most) */
+    /* which: 0 = sign out, 1 = lock, 2 = restart, 3 = power (right-most) */
     r->w = 36; r->h = 36;
-    r->x = sx + sw - 20 - 36 - (2 - which) * 42;
+    r->x = sx + sw - 20 - 36 - (3 - which) * 42;
     r->y = sy + sh - SM_FOOTER_H + 12;
 }
 
@@ -440,9 +473,9 @@ static int start_hit(int px, int py)
         start_cell_rect(k, x, y, &r);
         if (rect_hit(&r, px, py)) return 100 + k;
     }
-    for (int b = 0; b < 3; b++) {
+    for (int b = 0; b < 4; b++) {
         start_power_rect(b, x, y, w, h, &r);
-        if (rect_hit(&r, px, py)) return SMH_LOCK + b;
+        if (rect_hit(&r, px, py)) return SMH_SIGNOUT + b;
     }
     return SMH_NONE;
 }
@@ -495,14 +528,14 @@ void start_menu_draw(void)
     rect_t r;
     start_rect(&x, &y, &w, &h);
 
-    fb_blend_rounded_rect(x + 2, y + 6, w, h, 10, 0x00000000, 80);
-    fb_fill_rounded_rect(x, y, w, h, 10, T(BORDER));
-    fb_fill_rounded_rect(x + 1, y + 1, w - 2, h - 2, 9, T(MENU));
+    fb_blend_rounded_rect(x + 2, y + 6, w, h, 14, 0x00000000, 70);
+    ui_glass_tinted(x, y, w, h, 14, 0x001A1E36, 200);
+    ui_neon_frame(x, y, w, h, 14, 1, 5);
 
     /* ---- Search box ---- */
-    fb_fill_rounded_rect(x + 24, y + 24, w - 48, 36, 18, T(INPUT));
-    fb_fill_rect(x + 40, y + 59, w - 80, 1, T(ACCENT));
-    glyph_draw(GLYPH_SEARCH, x + 38, y + 34, 16, T(TEXT_DIM), T(INPUT));
+    fb_blend_rounded_rect(x + 24, y + 24, w - 48, 36, 18, 0x00050818, 130);
+    fb_neon_rounded_rect(x + 24, y + 24, w - 48, 36, 18, 1, 0, UI_NEON_CYAN, UI_NEON_VIOLET, 150);
+    glyph_draw(GLYPH_SEARCH, x + 38, y + 34, 16, T(TEXT_DIM), 0);
     if (g_start.qlen) {
         fb_draw_text(x + 64, y + 34, g_start.query, T(TEXT));
         fb_fill_rect(x + 64 + fb_text_width_n(g_start.query, g_start.qlen) + 1, y + 34, 1, 16, T(TEXT));
@@ -518,7 +551,7 @@ void start_menu_draw(void)
         desktop_app_t *app = desktop_app_get(m[k]);
         start_cell_rect(k, x, y, &r);
         if (g_start.hover == 100 + k || (g_start.qlen && k == 0))
-            fb_fill_rounded_rect(r.x + 2, r.y, r.w - 4, r.h, 6, T(HOVER));
+            fb_blend_rounded_rect(r.x + 2, r.y, r.w - 4, r.h, 8, 0x00FFFFFF, 30);
         icon_draw(app->icon, r.x + (r.w - 36) / 2, r.y + 8, 36);
         ui_text_center(r.x, r.y + 54, r.w, app->name, T(TEXT));
         if (app->window)
@@ -536,7 +569,7 @@ void start_menu_draw(void)
     int rows_end = y + 106 + ((n + SM_COLS - 1) / SM_COLS) * SM_CELL_H;
     if (card_y >= rows_end + 8) {
         int half = (w - 48) / 2;
-        ui_card(x + 24, card_y, w - 48, card_h);
+        fb_blend_rounded_rect(x + 24, card_y, w - 48, card_h, 10, 0x00050818, 120);
         icon_draw(ICON_JARVIS, x + 36, card_y + 10, 20);
         fb_draw_text_bold(x + 64, card_y + 12, "JARVIS", T(TEXT));
         fb_draw_text(x + 64 + 56, card_y + 12, ui_shell_get_status(), T(ACCENT));
@@ -555,18 +588,31 @@ void start_menu_draw(void)
 
     /* ---- Footer: user + power ---- */
     int fy = y + h - SM_FOOTER_H;
-    fb_fill_rect(x + 1, fy, w - 2, 1, T(BORDER));
+    fb_blend_rect(x + 14, fy, w - 28, 1, 0x00FFFFFF, 30);
     fb_fill_circle(x + 40, fy + 30, 16, T(ACCENT));
     glyph_draw(GLYPH_USER, x + 31, fy + 20, 18, T(ACCENT_TEXT), T(ACCENT));
-    fb_draw_text(x + 66, fy + 22, g_kstate.username[0] ? g_kstate.username : "User", T(TEXT));
+    {
+        user_info_t u;
+        int have = user_current() >= 0 && user_info(user_current(), &u) == 0;
+        fb_draw_text(x + 66, fy + 14, have ? u.name : "Live session", T(TEXT));
+        fb_text(x + 66, fy + 32, have ? (u.admin ? "Administrator" : "Standard user") : "No account: nothing is kept",
+                T(TEXT_DIM), FONT_SMALL);
+    }
 
-    static const glyph_id_t power_glyphs[3] = { GLYPH_LOCK, GLYPH_RESTART, GLYPH_POWER };
-    for (int b = 0; b < 3; b++) {
+    /* sign out, lock, restart, shut down */
+    static const glyph_id_t power_glyphs[4] = { GLYPH_PROFILE, GLYPH_PADLOCK, GLYPH_RESTART, GLYPH_POWER };
+    for (int b = 0; b < 4; b++) {
         start_power_rect(b, x, y, w, h, &r);
-        uint32_t bg = (g_start.hover == SMH_LOCK + b) ? T(HOVER) : T(MENU);
-        if (g_start.hover == SMH_LOCK + b)
-            fb_fill_rounded_rect(r.x, r.y, r.w, r.h, 5, bg);
-        glyph_draw(power_glyphs[b], r.x + 9, r.y + 9, 18, T(TEXT), bg);
+        if (g_start.hover == SMH_SIGNOUT + b)
+            fb_blend_rounded_rect(r.x, r.y, r.w, r.h, 8, 0x00FFFFFF, 34);
+        glyph_draw(power_glyphs[b], r.x + 8, r.y + 8, 20, b == 0 && user_current() < 0 ? T(TEXT_DIM) : T(TEXT), 0);
+    }
+    static const char *const tips[4] = { "Sign out / switch user", "Lock", "Restart", "Shut down" };
+    if (g_start.hover >= SMH_SIGNOUT && g_start.hover <= SMH_POWER) {
+        start_power_rect(g_start.hover - SMH_SIGNOUT, x, y, w, h, &r);
+        int tw = fb_text_width(tips[g_start.hover - SMH_SIGNOUT]) + 16;
+        fb_fill_rounded_rect(r.x + r.w - tw, r.y - 28, tw, 22, 6, 0x000A0E20);
+        fb_draw_text(r.x + r.w - tw + 8, r.y - 25, tips[g_start.hover - SMH_SIGNOUT], 0x00F2F5FF);
     }
 }
 
@@ -586,6 +632,9 @@ int start_menu_click(int px, int py)
         int k = hit - 100;
         start_menu_close();
         if (k < n) desktop_app_launch(m[k]);
+    } else if (hit == SMH_SIGNOUT) {
+        start_menu_close();
+        if (user_current() >= 0) desktop_sign_out();
     } else if (hit == SMH_LOCK) {
         start_menu_close();
         desktop_lock();

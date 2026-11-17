@@ -50,6 +50,7 @@ multiboot2_start:
     ; frames over all of low memory).
     call parse_multiboot2_framebuffer
     call parse_multiboot2_memmap
+    call parse_multiboot2_boot_params
 
     call setup_paging
 
@@ -214,6 +215,106 @@ parse_multiboot2_memmap:
 .mm_done:
     mov dword [0x7100], edi      ; final entry count
     pop edx
+    pop edi
+    pop esi
+    pop ebx
+    ret
+
+; ---- Boot parameters handed to the kernel ---------------------------------
+; Read while GRUB's Multiboot2 information block is still intact:
+;   0x7B10  u32 firmware flags (bit 0: started by UEFI firmware)
+;   0x7B14  install payload "kryzen-kernel": start, 0x7B18: end
+;   0x7B1C  install payload "kryzen-boot" (boot bundle): start, 0x7B20: end
+;   0x7C00  kernel command line, NUL terminated (at most 255 characters)
+; GRUB puts the module's file name first in a module string
+; ("/boot/kernel.elf kryzen-kernel"), so the tag name is searched for
+; anywhere in the string, not only at its start.
+parse_multiboot2_boot_params:
+    push ebx
+    push esi
+    push edi
+    xor eax, eax
+    mov [0x7B10], eax
+    mov [0x7B14], eax
+    mov [0x7B18], eax
+    mov [0x7B1C], eax
+    mov [0x7B20], eax
+    mov byte [0x7C00], 0
+    cld
+    lea esi, [ebx + 8]
+.tag_loop:
+    mov eax, [esi + 0]              ; tag type
+    test eax, eax
+    jz .done
+    mov ecx, [esi + 4]              ; tag size
+    cmp ecx, 8
+    jb .done
+    cmp eax, 1
+    je .cmdline
+    cmp eax, 3
+    je .module
+    cmp eax, 11                     ; EFI 32-bit system table
+    je .efi
+    cmp eax, 12                     ; EFI 64-bit system table
+    je .efi
+.next:
+    mov eax, [esi + 4]
+    add eax, 7
+    and eax, ~7
+    add esi, eax
+    jmp .tag_loop
+.efi:
+    or dword [0x7B10], 1
+    jmp .next
+.cmdline:
+    sub ecx, 8                      ; string bytes, including the NUL
+    cmp ecx, 255
+    jbe .cmd_len_ok
+    mov ecx, 255
+.cmd_len_ok:
+    push esi
+    lea esi, [esi + 8]
+    mov edi, 0x7C00
+    rep movsb
+    mov byte [edi], 0
+    pop esi
+    jmp .next
+.module:
+    cmp ecx, 24                     ; header (16) + at least "kryzen-x"
+    jb .next
+    sub ecx, 16                     ; string bytes, including the NUL
+    lea edi, [esi + 16]
+.mod_scan:
+    cmp ecx, 8
+    jb .next
+    cmp dword [edi + 0], 0x7A79726B ; "kryz"
+    jne .mod_scan_next
+    cmp word [edi + 4], 0x6E65      ; "en"
+    jne .mod_scan_next
+    cmp byte [edi + 6], '-'
+    jne .mod_scan_next
+    mov al, [edi + 7]
+    cmp al, 'k'                     ; kryzen-kernel
+    je .mod_kernel
+    cmp al, 'b'                     ; kryzen-boot
+    je .mod_bundle
+.mod_scan_next:
+    inc edi
+    dec ecx
+    jmp .mod_scan
+.mod_kernel:
+    mov eax, [esi + 8]
+    mov [0x7B14], eax
+    mov eax, [esi + 12]
+    mov [0x7B18], eax
+    jmp .next
+.mod_bundle:
+    mov eax, [esi + 8]
+    mov [0x7B1C], eax
+    mov eax, [esi + 12]
+    mov [0x7B20], eax
+    jmp .next
+.done:
     pop edi
     pop esi
     pop ebx

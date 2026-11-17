@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Apps (apps/store.c)
+ * Kryzen OS — Apps (apps/store.c)
  * Language: C17
  *
  * The package manager window.
@@ -70,9 +70,9 @@ static void store_reload(void)
 {
     st.installed_n = pkg_list(st.installed, ST_MAX);
     st.avail_n = 0;
-    scan_folder("/jarvis/data/Downloads");
-    scan_folder("/jarvis/data");
-    scan_folder("/jarvis/desktop");
+    scan_folder("/kryzen/data/Downloads");
+    scan_folder("/kryzen/data");
+    scan_folder("/kryzen/desktop");
     drive_info_t drives[8];
     int n = storage_list(drives, 8);
     for (int i = 0; i < n; i++)
@@ -142,7 +142,7 @@ static void draw_confirm(int x, int y, int w, int h)
     snprintf(line, sizeof(line), "From %s", p->publisher[0] ? p->publisher : "an unknown publisher");
     ui_text_fit(px + 76, py + 42, pw - 96, line, T(TEXT_DIM));
     ui_text_fit(px + 20, py + 80, pw - 40, p->description, T(TEXT));
-    snprintf(line, sizeof(line), "%u file(s) will be installed in /jarvis/apps/%s", p->files, p->name);
+    snprintf(line, sizeof(line), "%u file(s) will be installed in /kryzen/apps/%s", p->files, p->name);
     ui_text_fit(px + 20, py + 108, pw - 40, line, T(TEXT_DIM));
     ui_text_fit(px + 20, py + 128, pw - 40, "Packages are not signed: only install apps you trust.", T(WARN));
     ui_button(px + pw - 220, py + ph - 48, 100, 32, p->installed ? "Reinstall" : "Install", T(ACCENT), T(ACCENT_TEXT));

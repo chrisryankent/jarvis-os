@@ -7,8 +7,8 @@
  * (from Windows, macOS, phones and cameras), with long file names.
  *
  * Every FAT volume on a disk other than the system disk is mounted: the
- * first one as /jarvis/<disk> (usb0, sd1 ...), further partitions as
- * /jarvis/<disk>p2, p3 ... Files and folders can be read, created,
+ * first one as /kryzen/<disk> (usb0, sd1 ...), further partitions as
+ * /kryzen/<disk>p2, p3 ... Files and folders can be read, created,
  * written, appended to, renamed, moved and deleted.
  *
  * Writing keeps the volume consistent the way other systems expect:
@@ -37,7 +37,7 @@ typedef struct {
     int      used;
     int      dev;                   /* block device */
     int      part;                  /* partition number (1-4), 0 = whole disk */
-    char     mount[24];             /* "/jarvis/usb0" */
+    char     mount[24];             /* "/kryzen/usb0" */
     char     label[12];
     int      fat32;
     uint64_t start;                 /* first sector of the volume */
@@ -980,7 +980,7 @@ int storage_list(drive_info_t *out, int max)
     if (n < max) {
         drive_info_t *d = &out[n++];
         memset(d, 0, sizeof(*d));
-        snprintf(d->mount, sizeof(d->mount), "/jarvis");
+        snprintf(d->mount, sizeof(d->mount), "/kryzen");
         if (diskfs_get_stats(&ds) == 0) {
             snprintf(d->name, sizeof(d->name), "Local Disk");
             snprintf(d->fs, sizeof(d->fs), "JARVISFS");
@@ -1025,7 +1025,7 @@ int storage_list(drive_info_t *out, int max)
 }
 
 /* ---- Mounting ------------------------------------------------------------ */
-static int try_volume(int dev, uint64_t start, int part, const char *mount)
+static int try_volume(int dev, uint64_t start, uint64_t limit, int part, const char *mount)
 {
     uint8_t b[512];
     if (block_read(dev, start, 1, b) != 0 || b[510] != 0x55 || b[511] != 0xAA) return -1;
@@ -1036,6 +1036,7 @@ static int try_volume(int dev, uint64_t start, int part, const char *mount)
     uint32_t spc = b[13], reserved = le16(b + 14), nfats = b[16], root_ents = le16(b + 17);
     uint32_t fatsz = le16(b + 22) ? le16(b + 22) : le32(b + 36);
     uint32_t total = le16(b + 19) ? le16(b + 19) : le32(b + 32);
+    if (total > limit) return -1;
     v.root_sectors = (root_ents * 32 + 511) / 512;
     if (total < reserved + nfats * fatsz + v.root_sectors) return -1;
     uint32_t data_secs = total - (reserved + nfats * fatsz + v.root_sectors);
@@ -1087,21 +1088,34 @@ int fatfs_mount_dev(int dev)
 {
     block_info_t info;
     static uint8_t mbr[512];
-    if (block_get_info(dev, &info) != 0 || dev == diskfs_device() || block_read(dev, 0, 1, mbr) != 0) return -1;
+    if (block_get_info(dev, &info) != 0 || block_read(dev, 0, 1, mbr) != 0) return -1;
 
     char mount[24];
-    snprintf(mount, sizeof(mount), "/jarvis/%s", info.name);
+    snprintf(mount, sizeof(mount), "/kryzen/%s", info.name);
     fat_lock();
     int mounted = 0, unsupported = 0;
-    if (try_volume(dev, 0, 0, mount) == 0) mounted = 1;     /* whole drive is one volume */
+    if (try_volume(dev, 0, info.sectors, 0, mount) == 0) mounted = 1; /* whole drive */
     else if (mbr[510] == 0x55 && mbr[511] == 0xAA) {
-        for (int p = 0; p < 4; p++) {
-            const uint8_t *e = mbr + 446 + p * 16;
-            uint8_t type = e[4];
-            if (type == 0x07) unsupported = 1;
-            else if (type == 0x04 || type == 0x06 || type == 0x0E || type == 0x0B || type == 0x0C) {
-                if (mounted) snprintf(mount, sizeof(mount), "/jarvis/%sp%d", info.name, p + 1);
-                if (try_volume(dev, le32(e + 8), p + 1, mount) == 0) mounted++;
+        if (mbr[446 + 4] == 0xEE) {
+            static dm_disk_t disk;
+            if (dm_disk_info(dev, &disk) == 0 && disk.scheme == DM_GPT) {
+                for (int p = 0; p < disk.nparts; p++) {
+                    dm_part_t *part = &disk.parts[p];
+                    if (strcmp(part->fs, "FAT16") && strcmp(part->fs, "FAT32")) continue;
+                    if (mounted) snprintf(mount, sizeof(mount), "/kryzen/%sp%d", info.name, part->num);
+                    if (try_volume(dev, part->start, part->sectors, part->num, mount) == 0) mounted++;
+                }
+            }
+        } else {
+            for (int p = 0; p < 4; p++) {
+                const uint8_t *e = mbr + 446 + p * 16;
+                uint8_t type = e[4];
+                if (type == 0x07) unsupported = 1;
+                else if (type == 0x04 || type == 0x06 || type == 0x0E || type == 0x0B || type == 0x0C) {
+                    uint64_t start = le32(e + 8), sectors = le32(e + 12);
+                    if (mounted) snprintf(mount, sizeof(mount), "/kryzen/%sp%d", info.name, p + 1);
+                    if (try_volume(dev, start, sectors, p + 1, mount) == 0) mounted++;
+                }
             }
         }
     }
@@ -1151,7 +1165,6 @@ void fatfs_mount_all(void)
 {
     for (int dev = 0; dev < block_count(); dev++) {
         block_info_t info;
-        if (block_get_info(dev, &info) == 0 && dev != diskfs_device())
-            fatfs_mount_dev(dev);
+        if (block_get_info(dev, &info) == 0) fatfs_mount_dev(dev);
     }
 }

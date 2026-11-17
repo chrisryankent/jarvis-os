@@ -10,12 +10,12 @@ int main(void)
     print_num((uint64_t)getpid());
     print(".\n");
 
-    int fd = open("/jarvis/data/hello.txt", O_WRITE | O_CREATE | O_TRUNC);
+    int fd = open("/kryzen/data/hello.txt", O_WRITE | O_CREATE | O_TRUNC);
     if (fd >= 0) {
         const char *text = "Written by the hello program, running in user mode.\n";
         write(fd, text, strlen(text));
         close(fd);
-        print("Wrote /jarvis/data/hello.txt\n");
+        print("Wrote /kryzen/data/hello.txt\n");
     }
 
     if (syscall3(SYS_jarvis_status, (uint64_t)status, sizeof(status), 0) > 0) {

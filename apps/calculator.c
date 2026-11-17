@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Calculator (apps/calculator.c)
+ * Kryzen OS — Calculator (apps/calculator.c)
  * Language: C17
  *
  * Four-function calculator. Works with the mouse or the keyboard

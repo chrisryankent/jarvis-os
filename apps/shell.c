@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Command shell (apps/shell.c)
+ * Kryzen OS — Command shell (apps/shell.c)
  * Language: C17
  *
  * The command language behind the Terminal, and behind JARVIS's
@@ -21,7 +21,7 @@ int c_killall(int argc, char **argv);
 
 #define SH_MAX_ARGS   48
 #define SH_PIPE_MAX   (256 * 1024)
-#define SH_HOME       "/jarvis/data"
+#define SH_HOME       "/kryzen/data"
 
 int  prefs_set(const char *name, const char *value, char *msg, size_t n);
 int  prefs_get(const char *name, char *out, size_t n);
@@ -164,11 +164,11 @@ static void sh_init(void)
     snprintf(sh.oldpwd, sizeof(sh.oldpwd), "%s", SH_HOME);
     sh_setenv("HOME", SH_HOME);
     sh_setenv("USERPROFILE", SH_HOME);
-    sh_setenv("PATH", "/jarvis/bin");
+    sh_setenv("PATH", "/kryzen/bin");
     sh_setenv("SHELL", "jsh");
-    sh_setenv("OS", "JARVIS OS");
-    sh_setenv("DESKTOP", "/jarvis/desktop");
-    sh_setenv("DOWNLOADS", "/jarvis/data/Downloads");
+    sh_setenv("OS", "Kryzen OS");
+    sh_setenv("DESKTOP", "/kryzen/desktop");
+    sh_setenv("DOWNLOADS", "/kryzen/data/Downloads");
     /* variables saved with setx (HKCU\Environment) */
     {
         int k = reg_open_key("HKCU\\Environment", 0);
@@ -207,8 +207,8 @@ static void sh_path(const char *arg, char *out, size_t n)
     char base[256];
     if (((a[0] >= 'a' && a[0] <= 'z') || (a[0] >= 'A' && a[0] <= 'Z')) && a[1] == ':') {
         char d = (char)(a[0] | 32);
-        if (d == 'c') snprintf(base, sizeof(base), "/jarvis");
-        else snprintf(base, sizeof(base), "/jarvis/usb%d", d - 'd');
+        if (d == 'c') snprintf(base, sizeof(base), "/kryzen");
+        else snprintf(base, sizeof(base), "/kryzen/usb%d", d - 'd');
         rest = a + 2;
         if (*rest == '/') rest++;
         snprintf(tmp, sizeof(tmp), "%s/%s", base, rest);
@@ -790,8 +790,8 @@ static int c_mkdir(int argc, char **argv)
 
 static int sh_protected(const char *p)
 {
-    static const char *const fixed[] = { "/", "/jarvis", "/jarvis/bin", "/jarvis/data", "/jarvis/desktop", "/jarvis/models",
-                                         "/jarvis/system", "/jarvis/trash", "/jarvis/data/Downloads", "/jarvis/apps" };
+    static const char *const fixed[] = { "/", "/kryzen", "/kryzen/bin", "/kryzen/data", "/kryzen/desktop", "/kryzen/models",
+                                         "/kryzen/system", "/kryzen/trash", "/kryzen/data/Downloads", "/kryzen/apps" };
     for (size_t i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++)
         if (!strcmp(p, fixed[i])) return 1;
     return vfs_is_private(p);
@@ -874,7 +874,7 @@ static int c_stat(int argc, char **argv)
     sh_size_str(size, sz, sizeof(sz));
     sh_printf("  Path:  %s\n  Type:  %s\n  Size:  %ld bytes (%s)\n", p, vfs_is_dir(p) ? "folder" : "file", size, sz);
     if (vfs_is_dir(p)) sh_printf("  Items: %d\n", vfs_count_children(p));
-    sh_printf("  Store: %s\n", fatfs_owns(p) ? "USB drive (FAT)" : "JARVIS disk");
+    sh_printf("  Store: %s\n", fatfs_owns(p) ? "USB drive (FAT)" : "Kryzen disk");
     return 0;
 }
 
@@ -896,7 +896,7 @@ static int c_file(int argc, char **argv)
         else if (h[0] == 0xFF && h[1] == 0xD8) t = "JPEG image";
         else if (h[0] == 'B' && h[1] == 'M') t = "BMP image";
         else if (!memcmp(h, "\x7f" "ELF", 4)) t = "ELF 64-bit program";
-        else if (!memcmp(h, "JPK", 3)) t = "JARVIS package (.jpk)";
+        else if (!memcmp(h, "JPK", 3)) t = "Kryzen package (.kpk)";
         else if (!memcmp(h, "PK", 2)) t = "ZIP archive";
         else if (!memcmp(h, "%PDF", 4)) t = "PDF document";
         else if (!memcmp(h, "RIFF", 4)) t = "RIFF (WAV audio)";
@@ -1308,10 +1308,10 @@ static int sh_background;           /* the line ended in '&' */
 
 static int c_run(int argc, char **argv)
 {
-    if (argc < 2) { sh_err("usage: run <program> [&]   (programs: ls /jarvis/bin)\n"); return 1; }
+    if (argc < 2) { sh_err("usage: run <program> [&]   (programs: ls /kryzen/bin)\n"); return 1; }
     char p[256];
     if (strchr(argv[1], '/') || argv[1][0] == '.') sh_path(argv[1], p, sizeof(p));
-    else snprintf(p, sizeof(p), "/jarvis/bin/%s", argv[1]);
+    else snprintf(p, sizeof(p), "/kryzen/bin/%s", argv[1]);
     if (!user_is_program(p)) {
         if (pkg_run(argv[1])) return 0;                 /* an installed app */
         sh_err("run: %s is not a program\n", argv[1]);
@@ -1343,6 +1343,12 @@ static int c_apt(int argc, char **argv)
         const char *dot = strrchr(argv[argc - 1], '.');
         if (dot && !strcasecmp_s(dot, ".jpk")) return c_pkgcmd(argc, argv);
     }
+    if (!user_is_admin() && argc > 1) {
+        static const char *const changes[] = { "install", "remove", "purge", "upgrade", "full-upgrade", "dist-upgrade",
+                                               "update", "autoremove", "-i", "-r", "-P", "--install", "--remove", "--purge" };
+        for (size_t i = 0; i < sizeof(changes) / sizeof(changes[0]); i++)
+            if (!strcmp(argv[1], changes[i])) { sh_err("%s: changing Linux packages needs an administrator\n", argv[0]); return 1; }
+    }
     uint32_t pid = dpkg_start(argc, argv, sh.cwd);
     if (!pid) return 1;
     if (sh.root) {
@@ -1365,13 +1371,13 @@ static int sh_run_with(const char *p, int argc, char **argv)
     return c_run(n, a);
 }
 
-/* Looks a name up on the Linux PATH inside /jarvis/linux. */
+/* Looks a name up on the Linux PATH inside /kryzen/linux. */
 static int sh_linux_find(const char *name, char *out, size_t n)
 {
     static const char *const dirs[] = { "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin" };
     if (strchr(name, '/')) return 0;
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
-        snprintf(out, n, "/jarvis/linux%s/%s", dirs[i], name);
+        snprintf(out, n, "/kryzen/linux%s/%s", dirs[i], name);
         if (user_is_program(out)) return 1;
     }
     return 0;
@@ -1383,13 +1389,13 @@ static int c_linux(int argc, char **argv)
 {
     if (argc < 2) {
         sh_printf("Linux compatibility layer: runs Linux x86-64 programs (PIE and static-PIE, glibc).\n"
-                  "Files: / for a Linux program is /jarvis/linux; /jarvis is shared.\n"
+                  "Files: / for a Linux program is /kryzen/linux; /kryzen is shared.\n"
                   "usage: linux <program> [args]      e.g. linux hello, linux ./a.out\n");
         return 0;
     }
     char p[256];
     if (strchr(argv[1], '/') || argv[1][0] == '.') sh_path(argv[1], p, sizeof(p));
-    else if (!sh_linux_find(argv[1], p, sizeof(p))) { sh_err("linux: %s: not found on the Linux PATH (/jarvis/linux/usr/bin, /bin ...)\n", argv[1]); return 127; }
+    else if (!sh_linux_find(argv[1], p, sizeof(p))) { sh_err("linux: %s: not found on the Linux PATH (/kryzen/linux/usr/bin, /bin ...)\n", argv[1]); return 127; }
     if (!linux_is_program(p)) { sh_err("linux: %s is not a Linux program\n", argv[1]); return 1; }
     return sh_run_with(p, argc - 1, argv + 1);
 }
@@ -1408,7 +1414,7 @@ static int c_uname(int argc, char **argv)
     char host[48];
     prefs_get("device_name", host, sizeof(host));
     if (argc > 1 && (!strcmp(argv[1], "-a") || !strcmp(argv[1], "--all")))
-        sh_printf("JARVIS %s 1.0 x86_64 JARVIS-OS (built %s)\n", host, __DATE__);
+        sh_printf("Kryzen OS 2026 x86_64 (built %s)\n", host, __DATE__);
     else sh_printf("JARVIS\n");
     return 0;
 }
@@ -1416,6 +1422,7 @@ static int c_uname(int argc, char **argv)
 static int c_hostname(int argc, char **argv)
 {
     char msg[128];
+    if (argc > 1 && !user_is_admin()) { sh_err("hostname: only an administrator can rename this PC\n"); return 1; }
     if (argc > 1) { if (prefs_set("device_name", argv[1], msg, sizeof(msg))) { sh_err("%s\n", msg); return 1; } return 0; }
     prefs_get("device_name", msg, sizeof(msg));
     sh_printf("%s\n", msg);
@@ -1424,12 +1431,125 @@ static int c_hostname(int argc, char **argv)
 
 static int c_whoami(int argc, char **argv)
 {
-    (void)argc; (void)argv;
+    (void)argc;
     char host[48];
+    user_info_t u;
     prefs_get("device_name", host, sizeof(host));
-    if (!strcmp(argv[0], "id")) sh_printf("uid=1000(%s) groups=1000(%s),0(administrators)\n", account_name(), account_name());
-    else sh_printf("%s\\%s\n", host, account_name());
+    int have = user_current() >= 0 && user_info(user_current(), &u) == 0;
+    if (!strcmp(argv[0], "id")) {
+        if (have) sh_printf("uid=%d(%s) gid=%d(%s) groups=%d(%s),100(users)%s\n", u.uid, u.name, u.uid, u.name, u.uid, u.name,
+                            u.admin ? ",0(administrators)" : "");
+        else sh_printf("uid=0(system) gid=0(system) groups=0(administrators)\n");
+    } else if (!strcmp(argv[0], "groups")) {
+        sh_printf("%s users%s\n", have ? u.name : "system", !have || u.admin ? " administrators" : "");
+    } else sh_printf("%s\\%s\n", host, have ? u.name : "system");
     return 0;
+}
+
+/* ---- Users ---------------------------------------------------------------- */
+static int c_users(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    sh_printf("%-6s %-22s %-15s %-10s %s\n", "UID", "NAME", "ROLE", "SIGN-IN", "HOME");
+    for (int i = 0; i < user_count(); i++) {
+        user_info_t u;
+        char how[24];
+        if (user_info(i, &u) != 0) continue;
+        snprintf(how, sizeof(how), "%s%s%s", u.has_password ? "pw " : "", u.has_pin ? "pin " : "", u.has_voice ? "voice" : "");
+        sh_printf("%-6d %-22s %-15s %-10s %s%s\n", u.uid, u.name, u.admin ? "administrator" : "standard",
+                  how[0] ? how : "none", u.home, u.signed_in ? "   (signed in)" : "");
+    }
+    if (!user_count()) sh_printf("No accounts yet: this is a live session.\n");
+    return 0;
+}
+
+static int c_useradd(int argc, char **argv)
+{
+    int admin = 0, a = 1;
+    char err[128];
+    while (a < argc && argv[a][0] == '-') {
+        if (!strcmp(argv[a], "-a") || !strcmp(argv[a], "--admin") || !strcmp(argv[a], "/admin")) admin = 1;
+        a++;
+    }
+    if (a >= argc) { sh_err("usage: useradd [--admin] <name> [password]\n"); return 1; }
+    if (!user_is_admin()) { sh_err("useradd: only an administrator can add users\n"); return 1; }
+    int i = user_add(argv[a], a + 1 < argc ? argv[a + 1] : "", "", "", admin, err, sizeof(err));
+    if (i < 0) { sh_err("useradd: %s\n", err); return 1; }
+    user_info_t u;
+    user_info(i, &u);
+    sh_printf("Added %s (uid %d, %s). Home: %s\n", u.name, u.uid, u.admin ? "administrator" : "standard user", u.home);
+    if (a + 1 >= argc) sh_printf("No password set: %s can choose one in Settings > Accounts after signing in.\n", u.name);
+    return 0;
+}
+
+static int c_userdel(int argc, char **argv)
+{
+    char err[128];
+    if (argc < 2) { sh_err("usage: userdel <name>\n"); return 1; }
+    if (user_remove(argv[1], err, sizeof(err)) != 0) { sh_err("userdel: %s\n", err); return 1; }
+    sh_printf("Removed %s and their files.\n", argv[1]);
+    return 0;
+}
+
+static int c_usermod(int argc, char **argv)
+{
+    char err[128];
+    if (argc < 3 || (strcmp(argv[1], "--admin") && strcmp(argv[1], "--standard"))) {
+        sh_err("usage: usermod --admin|--standard <name>\n");
+        return 1;
+    }
+    if (user_set_admin(argv[2], !strcmp(argv[1], "--admin"), err, sizeof(err)) != 0) { sh_err("usermod: %s\n", err); return 1; }
+    sh_printf("%s is now %s.\n", argv[2], !strcmp(argv[1], "--admin") ? "an administrator" : "a standard user");
+    return 0;
+}
+
+/* passwd <new password>            your own
+ * passwd <user> <new password>     another user's (administrators) */
+static int c_passwd(int argc, char **argv)
+{
+    char err[128];
+    user_info_t u;
+    if (argc < 2 || user_current() < 0 || user_info(user_current(), &u) != 0) {
+        sh_err("usage: passwd <new password>   |   passwd <user> <new password>\n");
+        return 1;
+    }
+    const char *who = argc >= 3 ? argv[1] : u.name;
+    const char *pw = argc >= 3 ? argv[2] : argv[1];
+    if (user_reset_password(who, pw, err, sizeof(err)) != 0) { sh_err("passwd: %s\n", err); return 1; }
+    sh_printf("Password changed for %s.\n", who);
+    return 0;
+}
+
+static int c_logout(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    desktop_sign_out();
+    return 0;
+}
+
+/* su <user>: go to the sign-in screen with that user chosen. */
+static int c_su(int argc, char **argv)
+{
+    int i = argc > 1 ? user_find(argv[1]) : -1;
+    if (argc > 1 && i < 0) { sh_err("su: there is no user called %s\n", argv[1]); return 1; }
+    desktop_lock();
+    if (i >= 0) user_select(i);
+    return 0;
+}
+
+/* sudo <command>: administrators run it; a standard user is told who can. */
+static int c_sudo(int argc, char **argv)
+{
+    if (argc < 2) { sh_err("usage: sudo <command>\n"); return 1; }
+    if (!user_is_admin()) {
+        sh_err("sudo: %s is not an administrator. Sign in as one (su <name>) to do this.\n", account_name());
+        return 1;
+    }
+    char line[512];
+    size_t o = 0;
+    for (int i = 1; i < argc && o < sizeof(line) - 2; i++)
+        o += (size_t)snprintf(line + o, sizeof(line) - o, "%s%s", i > 1 ? " " : "", argv[i]);
+    return sh_exec_line(line);
 }
 
 static int c_date(int argc, char **argv)
@@ -1517,7 +1637,7 @@ static int c_sysinfo(int argc, char **argv)
     sys_format_uptime(up, sizeof(up));
     pmm_get_stats(&total, &freep);
     prefs_get("resolution", res, sizeof(res));
-    sh_printf("Host name:        %s\nOS:               JARVIS OS 1.0 (x86-64), built %s\nUser:             %s\nProcessor:        %s\n"
+    sh_printf("Host name:        %s\nOS:               Kryzen OS 1.0 (x86-64), built %s\nUser:             %s\nProcessor:        %s\n"
               "Memory:           %u MB, %u MB free\nDisplay:          %s\nUp time:          %s\nAI brain:         %s\n",
               host, __DATE__, account_name(), cpu, (unsigned)(total >> 8), (unsigned)(freep >> 8), res, up,
               g_kstate.ai_ready ? "ready" : "offline");
@@ -1890,7 +2010,7 @@ static int c_chkdsk(int argc, char **argv)
     }
     if (!status) {
         uint32_t pid = diskfs_check_start(surface, repair);
-        if (!pid) { sh_err("chkdsk: a check is already running, or there is no JARVIS disk\n"); return 1; }
+        if (!pid) { sh_err("chkdsk: a check is already running, or there is no Kryzen disk\n"); return 1; }
         sh_printf("Disk check started as PID %u. Type 'chkdsk status' for the result.\n", pid);
         return 0;
     }
@@ -2189,12 +2309,27 @@ static const sh_cmd_t g_cmds[] = {
     { "resume",    c_suspres,   "resume <pid>", "Resume a process", "Processes" },
     { "nice",      c_nice,      "nice <pid> low|normal|high", "Change priority", "Processes" },
     { "run",       c_run,       "run <program> [args] [&]", "Run a program (Ctrl+C ends it)", "Processes" },
-    { "linux",     c_linux,     "linux <program> [args]", "Run a Linux program (from /jarvis/linux)", "Processes" },
+    { "linux",     c_linux,     "linux <program> [args]", "Run a Linux program (from /kryzen/linux)", "Processes" },
     { "spawn",     c_spawn,     "spawn cpu|sleeper|deadlock|memory|isolate", "Start a test process", "Processes" },
     { "uname",     c_uname,     "uname [-a]", "System name", "System" },
     { "hostname",  c_hostname,  "hostname [new name]", "Show or set the PC name", "System" },
     { "whoami",    c_whoami,    "whoami", "Current user", "System" },
     { "id",        c_whoami,    "id", "User and groups", "System" },
+    { "groups",    c_whoami,    "groups", "Groups of the current user", "Users" },
+    { "users",     c_users,     "users", "Accounts on this PC", "Users" },
+    { "who",       c_users,     "who", "Accounts on this PC and who is signed in", "Users" },
+    { "useradd",   c_useradd,   "useradd [--admin] <name> [password]", "Add a user (administrators)", "Users" },
+    { "adduser",   c_useradd,   "adduser [--admin] <name> [password]", "Add a user (administrators)", "Users" },
+    { "userdel",   c_userdel,   "userdel <name>", "Remove a user and their files (administrators)", "Users" },
+    { "deluser",   c_userdel,   "deluser <name>", "Remove a user and their files (administrators)", "Users" },
+    { "usermod",   c_usermod,   "usermod --admin|--standard <name>", "Change a user's role (administrators)", "Users" },
+    { "passwd",    c_passwd,    "passwd <new password> | passwd <user> <new password>", "Change a password", "Users" },
+    { "su",        c_su,        "su [user]", "Switch user: shows the sign-in screen", "Users" },
+    { "sudo",      c_sudo,      "sudo <command>", "Run a command as an administrator", "Users" },
+    { "runas",     c_sudo,      "runas <command>", "Run a command as an administrator", "Users" },
+    { "logout",    c_logout,    "logout", "Sign out", "Users" },
+    { "logoff",    c_logout,    "logoff", "Sign out", "Users" },
+    { "signout",   c_logout,    "signout", "Sign out", "Users" },
     { "date",      c_date,      "date", "Date and time", "System" },
     { "time",      c_date,      "time", "Date and time", "System" },
     { "uptime",    c_uptime,    "uptime", "Time since start", "System" },
@@ -2204,7 +2339,7 @@ static const sh_cmd_t g_cmds[] = {
     { "lsusb",     c_lspci,     "lsusb", "USB devices", "System" },
     { "dmesg",     c_dmesg,     "dmesg [filter]", "Kernel messages", "System" },
     { "sysinfo",   c_sysinfo,   "sysinfo", "Summary of this PC", "System" },
-    { "status",    c_status,    "status", "JARVIS status", "System" },
+    { "status",    c_status,    "status", "Kryzen status", "System" },
     { "env",       c_env,       "env", "Shell variables", "Shell" },
     { "setx",      c_setx,      "setx NAME value", "Save a variable for every new Terminal (HKCU\\Environment)", "Shell" },
     { "reg",       c_reg,       "reg query|add|delete|export|import <key> ...", "Read and change the registry (reg /?)", "Settings" },
@@ -2258,9 +2393,9 @@ static const sh_cmd_t g_cmds[] = {
     { "mount",     c_mount,     "mount", "Mounted drives", "Disks" },
     { "disk",      c_diskcmd,   "disk list|info|init|create|delete|format|label|extend|shrink ...", "Disk management (see: disk help)", "Disks" },
     { "diskpart",  c_diskcmd,   "diskpart ...", "Disk management (same as disk)", "Disks" },
-    { "format",    c_diskcmd,   "format <disk> [partition] fat32|jarvisfs [label]", "Format a drive", "Disks" },
-    { "chkdsk",    c_chkdsk,    "chkdsk [/r] [/s] | status", "Check the JARVIS disk", "Disks" },
-    { "fsck",      c_chkdsk,    "fsck [-y] | status", "Check the JARVIS disk", "Disks" },
+    { "format",    c_diskcmd,   "format <disk> [partition] fat32|kryzenfs [label]", "Format a drive", "Disks" },
+    { "chkdsk",    c_chkdsk,    "chkdsk [/r] [/s] | status", "Check the Kryzen disk", "Disks" },
+    { "fsck",      c_chkdsk,    "fsck [-y] | status", "Check the Kryzen disk", "Disks" },
     { "sync",      c_sync,      "sync", "Save everything to disk now", "Disks" },
     { "sector",    c_sector,    "sector <disk> <n>", "Show a raw disk sector", "Disks" },
     { "eject",     c_eject,     "eject [usbN]", "Safely remove a USB drive", "Disks" },
@@ -2268,7 +2403,7 @@ static const sh_cmd_t g_cmds[] = {
     { "packages",  c_packages,  "packages", "Installed apps", "Apps" },
     { "install",   c_install,   "install <file.jpk>", "Install an app", "Apps" },
     { "uninstall", c_uninstall, "uninstall <name>", "Remove an app", "Apps" },
-    { "pkg",       c_pkgcmd,    "pkg list|install|remove", "Manage JARVIS apps (.jpk)", "Apps" },
+    { "pkg",       c_pkgcmd,    "pkg list|install|remove", "Manage Kryzen apps (.kpk)", "Apps" },
     { "apps",      c_apps,      "apps", "Apps on this PC", "Apps" },
     { "close",     c_close,     "close <app>", "Close an app window", "Apps" },
     { "screenshot", c_screenshot, "screenshot", "Save a picture of the screen", "Desktop" },
@@ -2358,7 +2493,7 @@ static int c_help(int argc, char **argv)
         sh_printf("%s\n", line);
     }
     sh_out("\nMore: help <command>.  Pipes a | b, redirection > >> <, a && b, a ; b, variables $HOME.\n"
-           "Paths: ~ (Documents), C:\\ (/jarvis), D:\\ (first USB drive). Tab completes, Up/Down recall.\n");
+           "Paths: ~ (Documents), C:\\ (/kryzen), D:\\ (first USB drive). Tab completes, Up/Down recall.\n");
     return 0;
 }
 
@@ -2505,10 +2640,37 @@ static int sh_glob(char **in, int *quoted, int n, char **out, int max, char *sto
 
 static char g_pipe[2][SH_PIPE_MAX + 1];
 
+/* Host environments (first-run setup, Settings > System). */
+static int sh_word_in(const char *w, const char *const *list, size_t n)
+{
+    for (size_t i = 0; i < n; i++) if (!strcmp(w, list[i])) return 1;
+    return 0;
+}
+
+static int sh_host_blocked(const char *cmd)
+{
+    static const char *const linux_cmds[] = { "apt", "apt-get", "apt-cache", "dpkg", "dpkg-query", "dpkg-deb", "linux" };
+    static const char *const nt_cmds[] = {
+        "dir", "type", "copy", "xcopy", "move", "ren", "del", "erase", "md", "rd", "cls", "findstr", "tasklist",
+        "taskkill", "ipconfig", "systeminfo", "ver", "where", "reg", "regedit", "diskpart", "chkdsk", "setx",
+        "runas", "logoff",
+    };
+    if (sh_word_in(cmd, linux_cmds, sizeof(linux_cmds) / sizeof(linux_cmds[0])) && !setting_get_int("host_linux", 1)) {
+        sh_err("%s: the Debian Linux layer is switched off (Settings > System > Host environments)\n", cmd);
+        return 1;
+    }
+    if (sh_word_in(cmd, nt_cmds, sizeof(nt_cmds) / sizeof(nt_cmds[0])) && !setting_get_int("host_nt", 1)) {
+        sh_err("%s: Windows NT commands are switched off (Settings > System > Host environments)\n", cmd);
+        return 1;
+    }
+    return 0;
+}
+
 /* Runs one simple command (words already split). */
 static int sh_run_simple(char **argv, int *quoted, int argc)
 {
     if (!argc) return 0;
+    if (sh_host_blocked(argv[0])) return 1;
     /* NAME=value on its own: set a variable */
     if (argc == 1 && !quoted[0] && strchr(argv[0], '=') && argv[0][0] != '=') {
         char *eq = strchr(argv[0], '=');
@@ -2546,9 +2708,9 @@ static int sh_run_simple(char **argv, int *quoted, int argc)
     }
     const sh_cmd_t *c = sh_find(argv[0]);
     if (c) return c->fn(argc, argv);
-    /* a program in /jarvis/bin, or an installed app */
+    /* a program in /kryzen/bin, or an installed app */
     char p[256];
-    snprintf(p, sizeof(p), "/jarvis/bin/%s", argv[0]);
+    snprintf(p, sizeof(p), "/kryzen/bin/%s", argv[0]);
     if (user_is_program(p)) return sh_run_with(p, argc, argv);
     if (pkg_run(argv[0])) return 0;
     /* a Linux program on the Linux PATH (installed with apt or dpkg) */
@@ -2737,7 +2899,7 @@ int shell_run_capture(const char *line, char *out, size_t n)
     return rc;
 }
 
-/* Prompt like "chris@JARVIS-PC:~/Downloads$ ". */
+/* Prompt like "chris@Kryzen-PC:~/Downloads$ ". */
 void shell_prompt(char *out, size_t n)
 {
     sh_init();

@@ -12,7 +12,7 @@
  *   randomness    a ChaCha20 generator seeded from RDRAND (when the CPU
  *                 has it) and CPU timing jitter
  *
- * Verification only: JARVIS OS never signs, so no private-key RSA/ECDSA
+ * Verification only: Kryzen OS never signs, so no private-key RSA/ECDSA
  * code exists. Built so it also compiles on a normal Linux host for tests
  * (tools/test, CRYPTO_HOST).
  * =============================================================================

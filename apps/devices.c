@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Device Manager (apps/devices.c)
+ * Kryzen OS — Device Manager (apps/devices.c)
  *
  * Every device in the machine, from the kernel's device table
  * (kernel/devmgr.c), grouped by type or by connection (platform, PCI bus,
@@ -295,7 +295,7 @@ static void dv_draw_details(int x, int y, int w, int h)
             p = e ? e + 1 : NULL;
         }
         ry += 6;
-        fb_draw_text(px, ry, "Drivers are built into the JARVIS OS kernel and started at boot.", T(TEXT_DIM));
+        fb_draw_text(px, ry, "Drivers are built into the Kryzen OS kernel and started at boot.", T(TEXT_DIM));
         break;
     }
     case DVT_RESOURCES: {

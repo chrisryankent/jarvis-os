@@ -1,5 +1,5 @@
 /*
- * JARVIS OS — cryptography, X.509 and TLS 1.3 (kernel/crypto.c, x509.c, tls.c)
+ * Kryzen OS — cryptography, X.509 and TLS 1.3 (kernel/crypto.c, x509.c, tls.c)
  *
  * The three files only use these declarations plus a few platform hooks
  * (memory, entropy, time, TCP), so they also build on a Linux host for

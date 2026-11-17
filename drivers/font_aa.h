@@ -1,5 +1,5 @@
 /*
- * JARVIS OS — anti-aliased font data (drivers/font_aa.h)
+ * Kryzen OS — anti-aliased font data (drivers/font_aa.h)
  *
  * Glyphs are pre-rendered by tools/gen_fonts.py into 8-bit coverage maps.
  * Characters 32..126 are stored first, then the extra symbols listed in
@@ -17,6 +17,10 @@ typedef enum {
     FONT_LARGE,         /* 32 px: big numbers (old scale 3)             */
     FONT_DISPLAY,       /* 58 px light: lock-screen clock (old scale 4) */
     FONT_SMALL,         /* 11 px: captions                               */
+    FONT_MEDIUM,        /* 16 px regular: list entries, input fields     */
+    FONT_MEDIUM_BOLD,   /* 16 px semibold: option titles                 */
+    FONT_SUBHEAD,       /* 19 px regular: subtitles, dates               */
+    FONT_HEADLINE,      /* 38 px light: screen headlines, user name      */
     FONT_COUNT
 } font_id_t;
 

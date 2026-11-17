@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Desktop system (desktop/desktop_init.c)
+ * Kryzen OS — Desktop system (desktop/desktop_init.c)
  * Language: C17
  *
  * Ties the desktop together: the app registry, the frame compositor, and
@@ -218,8 +218,13 @@ void desktop_app_launch(int index)
 
     /* Cascade new windows from the top-left of the work area. */
     int step = g_ds.launch_count++ % 6;
-    int x = 110 + step * 34;
-    int y = 28 + step * 30;
+    int x = desktop_panel_right() + 26 + step * 34;
+    int y = TOPBAR_H + 14 + step * 30;
+    /* keep the new window on the screen */
+    if (x + app->w > (int)fb_get_width() - 8) x = (int)fb_get_width() - 8 - app->w;
+    if (x < 0) x = 0;
+    if (y + app->h > (int)fb_get_height() - TASKBAR_H) y = (int)fb_get_height() - TASKBAR_H - app->h;
+    if (y < TOPBAR_H) y = TOPBAR_H;
 
     app->pub.window = app->open(x, y, app->w, app->h);
     if (app->pub.window)
@@ -309,7 +314,7 @@ static void desktop_display_changed(void)
     int W = (int)fb_get_width(), H = (int)fb_get_height();
     g_wm_ctx.screen_w = (uint32_t)W;
     g_wm_ctx.screen_h = (uint32_t)H;
-    wm_set_workarea(0, 0, W, H - TASKBAR_H);
+    wm_set_workarea(0, TOPBAR_H, W, H - TASKBAR_H - TOPBAR_H);
     for (wm_window_t *w = g_wm_ctx.windows_head; w; w = w->next) {
         if (w->state != WIN_STATE_NORMAL) {           /* maximized or snapped: re-apply */
             wm_window_state_t st = w->state;
@@ -323,7 +328,7 @@ static void desktop_display_changed(void)
         if (w->x + w->w > W) w->x = W - w->w;
         if (w->y + w->h > H - TASKBAR_H) w->y = H - TASKBAR_H - w->h;
         if (w->x < 0) w->x = 0;
-        if (w->y < 0) w->y = 0;
+        if (w->y < TOPBAR_H) w->y = TOPBAR_H;
     }
     desktop_wallpaper_invalidate();
     desktop_files_changed();
@@ -352,6 +357,21 @@ static void run_startup_apps(void)
 static uint64_t g_last_input_tick = 0;
 void desktop_note_input(void) { g_last_input_tick = g_kstate.uptime_ticks; }
 
+/* Sign out: close this user's windows, forget the conversation, end the
+ * session and return to the sign-in screen. */
+void desktop_sign_out(void)
+{
+    start_menu_close();
+    notifications_close_center();
+    desktop_context_close();
+    shell_flyout_close();
+    desktop_system_close_all();
+    ui_shell_clear_lines();
+    ai_host_pref("forget");
+    user_session_end();
+    ui_shell_show_lock_screen();
+}
+
 void desktop_lock(void)
 {
     start_menu_close();
@@ -365,8 +385,8 @@ void desktop_lock(void)
 void desktop_take_screenshot(char *saved, size_t n)
 {
     saved[0] = 0;
-    const char *dir = "/jarvis/data/Pictures/Screenshots";
-    if (!vfs_is_dir("/jarvis/data/Pictures")) vfs_mkdir("/jarvis/data/Pictures");
+    const char *dir = "/kryzen/data/Pictures/Screenshots";
+    if (!vfs_is_dir("/kryzen/data/Pictures")) vfs_mkdir("/kryzen/data/Pictures");
     if (!vfs_is_dir(dir)) vfs_mkdir(dir);
     sys_time_t t;
     sys_get_time(&t);
@@ -418,7 +438,7 @@ void desktop_system_init(void)
     }
 
     wm_init(W, H);
-    wm_set_workarea(0, 0, (int)W, (int)H - TASKBAR_H);
+    wm_set_workarea(0, TOPBAR_H, (int)W, (int)H - TASKBAR_H - TOPBAR_H);
     theme_init();
     input_queue_init();
     notifications_init();
@@ -428,7 +448,7 @@ void desktop_system_init(void)
     g_ds.initialized = 1;
     g_ds.dirty = 1;
 
-    notification_show("Welcome to JARVIS OS",
+    notification_show("Welcome to Kryzen OS",
                       "Click Start, or open JARVIS and type 'help'.",
                       NOTIF_INFO, 6000);
     terminal_puts("[DESKTOP] Desktop system ready\n");
@@ -578,6 +598,7 @@ void desktop_system_handle_mouse_move(int x, int y)
         changed |= desktop_context_hover(x, y);
         changed |= start_menu_hover(x, y);
         changed |= taskbar_hover(x, y);
+        changed |= desktop_panel_hover(x, y);
         changed |= shell_flyout_hover(x, y);
         changed |= wm_handle_mouse_move(x, y);
     }
@@ -589,11 +610,14 @@ void desktop_open_icon(int icon)
 {
     const char *target = desktop_get_icon_target(icon);
 
-    if (!strncmp(target, "::", 2) || !strcmp(target, "/jarvis/trash") ||
+    if (!strncmp(target, "::", 2) || !strcmp(target, "/kryzen/trash") ||
         (target[0] == '/' && vfs_is_dir(target))) {
         /* This PC, the Recycle Bin (even while it is still empty) or a folder */
         desktop_app_launch(desktop_app_find("Files"));
         file_explorer_navigate_to(target);
+    } else if (!strcmp(target, "@network")) {
+        desktop_app_launch(desktop_app_find("Settings"));
+        settings_show_page("network");
     } else if (target[0] == '/') {
         shell_open_path(target);
     } else if (target[0]) {

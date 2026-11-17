@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Theme Manager (desktop/theme.c)
+ * Kryzen OS — Theme Manager (desktop/theme.c)
  * Language: C17
  *
  * One palette per mode. Everything on screen reads its colours through
@@ -14,24 +14,24 @@
 
 static const uint32_t g_palettes[3][TC_COUNT] = {
     [THEME_DARK] = {
-        [TC_ACCENT]         = 0x0060CDFF,
-        [TC_ACCENT_TEXT]    = 0x00000000,
-        [TC_WINDOW]         = 0x00202020,
-        [TC_SURFACE]        = 0x002B2B2B,
-        [TC_HOVER]          = 0x003A3A3A,
-        [TC_TEXT]           = 0x00FFFFFF,
-        [TC_TEXT_DIM]       = 0x00A6A6A6,
-        [TC_BORDER]         = 0x00404040,
-        [TC_TITLE_ACTIVE]   = 0x00202020,
-        [TC_TITLE_INACTIVE] = 0x002B2B2B,
-        [TC_TITLE_TEXT]     = 0x00FFFFFF,
-        [TC_TASKBAR]        = 0x001C1C1C,
-        [TC_MENU]           = 0x00242424,
-        [TC_WALL_TOP]       = 0x00071426,
-        [TC_WALL_BOTTOM]    = 0x000F4C81,
-        [TC_INPUT]          = 0x00161616,
-        [TC_OK]             = 0x006CCB5F,
-        [TC_WARN]           = 0x00F2C14E,
+        [TC_ACCENT]         = 0x005CE6FF,
+        [TC_ACCENT_TEXT]    = 0x00032A38,
+        [TC_WINDOW]         = 0x000F1220,
+        [TC_SURFACE]        = 0x00191D30,
+        [TC_HOVER]          = 0x00272C46,
+        [TC_TEXT]           = 0x00E8ECF8,
+        [TC_TEXT_DIM]       = 0x009AA3BF,
+        [TC_BORDER]         = 0x00343A58,
+        [TC_TITLE_ACTIVE]   = 0x00141830,
+        [TC_TITLE_INACTIVE] = 0x000F1220,
+        [TC_TITLE_TEXT]     = 0x00E8ECF8,
+        [TC_TASKBAR]        = 0x000C0F1C,
+        [TC_MENU]           = 0x00171B2C,
+        [TC_WALL_TOP]       = 0x0006081A,
+        [TC_WALL_BOTTOM]    = 0x00161C3B,
+        [TC_INPUT]          = 0x0012162A,
+        [TC_OK]             = 0x003DDC84,
+        [TC_WARN]           = 0x00FFC857,
         [TC_DANGER]         = 0x00FF6B6B,
     },
     [THEME_LIGHT] = {

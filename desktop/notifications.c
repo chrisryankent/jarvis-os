@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Notifications (desktop/notifications.c)
+ * Kryzen OS — Notifications (desktop/notifications.c)
  * Language: C17
  *
  * Toasts slide in at the bottom-right above the taskbar and expire on their

@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — System settings registry (desktop/prefs.c)
+ * Kryzen OS — System settings registry (desktop/prefs.c)
  * Language: C17
  *
  * Every user-adjustable setting, by name, with one place that validates,
@@ -44,7 +44,7 @@ static const pref_t g_prefs[] = {
     /* Personalization */
     { "theme",            PK_ENUM, 0, 0, 0, PO_THEME, 3, "Colour mode" },
     { "accent",           PK_ENUM, 0, 0, 0, PO_ACCENT, 7, "Accent colour" },
-    { "wallpaper",        PK_TEXT, 0, 0, 0, NULL, 0, "bloom, aurora, mountains, dunes, night, waves, solid, or a picture file path" },
+    { "wallpaper",        PK_TEXT, 0, 0, 0, NULL, 0, "kryzen, bloom, aurora, mountains, dunes, night, waves, solid, or a picture file path" },
     { "wallpaper_fit",    PK_ENUM, 0, 0, 0, PO_FIT, 5, "How a picture wallpaper fills the screen" },
     { "wallpaper_color",  PK_TEXT, 0, 0, 0, NULL, 0, "Colour for the solid wallpaper, #RRGGBB" },
     { "bloom_color",      PK_ENUM, 0, 0, 0, PO_BLOOM, 6, "Colours of the Bloom wallpaper" },
@@ -235,7 +235,8 @@ int prefs_set(const char *name, const char *value, char *msg, size_t n)
         for (int i = 0; i < WP_PICTURE; i++)
             if (!strcmp(s, wallpaper_style_name(i)) || !strcmp(s, wallpaper_style_title(i))) style = i;
         if (style < 0 && (!strcmp(s, "night sky") || !strcmp(s, "stars"))) style = WP_NIGHT;
-        if (style < 0 && (!strcmp(s, "default") || !strcmp(s, "theme"))) style = WP_BLOOM;
+        if (style < 0 && (!strcmp(s, "default") || !strcmp(s, "cosmos") || !strcmp(s, "space"))) style = WP_KRYZEN;
+        if (style < 0 && !strcmp(s, "theme")) style = WP_BLOOM;
         if (style < 0 && (!strcmp(s, "ocean") || !strcmp(s, "sea"))) style = WP_WAVES;
         if (style < 0 && (!strcmp(s, "desert") || !strcmp(s, "sand"))) style = WP_DUNES;
         if (style < 0 && (!strcmp(s, "sunset") || !strcmp(s, "mountain"))) style = WP_MOUNTAINS;
@@ -337,7 +338,7 @@ int prefs_get(const char *name, char *out, size_t n)
     if (!strcmp(nm, "bloom_color")) { int i = setting_get_int("wallpaper", 0); snprintf(out, n, "%s", PO_BLOOM[i >= 0 && i < 6 ? i : 0]); return 0; }
     if (!strcmp(nm, "mouse_speed")) { int i = setting_get_int("mouse_speed", 2) - 1; snprintf(out, n, "%s", PO_MOUSE[i >= 0 && i < 4 ? i : 1]); return 0; }
     if (!strcmp(nm, "wallpaper_color")) { char b[16]; setting_get(nm, b, sizeof(b)); snprintf(out, n, "%s", b[0] ? b : "#204060"); return 0; }
-    if (!strcmp(nm, "device_name")) { char b[48]; setting_get(nm, b, sizeof(b)); snprintf(out, n, "%s", b[0] ? b : "JARVIS-PC"); return 0; }
+    if (!strcmp(nm, "device_name")) { char b[48]; setting_get(nm, b, sizeof(b)); snprintf(out, n, "%s", b[0] ? b : "Kryzen-PC"); return 0; }
     switch (p->kind) {
     case PK_BOOL: snprintf(out, n, "%s", setting_get_int(nm, p->dflt) ? "on" : "off"); break;
     case PK_INT:  snprintf(out, n, "%d", setting_get_int(nm, p->dflt)); break;

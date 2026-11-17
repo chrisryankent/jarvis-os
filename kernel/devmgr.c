@@ -303,6 +303,7 @@ void devmgr_release_all(uint32_t pid)
  * the sound card and USB devices. Returns 0, or -1 with the reason. */
 int devmgr_set_enabled(int id, int on, char *why, size_t why_len)
 {
+    if (!user_is_admin()) { snprintf(why, why_len, "changing devices needs an administrator"); return -1; }
     if (id < 0 || id >= g_dev_count) { snprintf(why, why_len, "no such device"); return -1; }
     dev_entry_t *d = &g_devs[id];
     switch (d->info.control) {
@@ -336,6 +337,7 @@ int audio_restart(void);                    /* drivers/audio.c */
 
 int devmgr_restart(int id, char *why, size_t why_len)
 {
+    if (!user_is_admin()) { snprintf(why, why_len, "changing devices needs an administrator"); return -1; }
     if (id < 0 || id >= g_dev_count) { snprintf(why, why_len, "no such device"); return -1; }
     dev_entry_t *d = &g_devs[id];
     char name[48];
@@ -367,6 +369,7 @@ int devmgr_restart(int id, char *why, size_t why_len)
 
 int devmgr_uninstall(int id, char *why, size_t why_len)
 {
+    if (!user_is_admin()) { snprintf(why, why_len, "changing devices needs an administrator"); return -1; }
     if (id < 0 || id >= g_dev_count) { snprintf(why, why_len, "no such device"); return -1; }
     dev_entry_t *d = &g_devs[id];
     char name[48];
@@ -428,10 +431,10 @@ void devmgr_driver_info(int id, char *out, size_t n)
     if (!in->driver[0]) { snprintf(out, n, "No driver is installed for this device."); return; }
     for (size_t i = 0; i < sizeof(info) / sizeof(info[0]); i++)
         if (!strcmp(info[i].drv, in->driver)) {
-            snprintf(out, n, "%s\nProvider: JARVIS OS\nVersion: 1.0 (built %s)\nFile: %s (built into the kernel)", info[i].desc, __DATE__, info[i].file);
+            snprintf(out, n, "%s\nProvider: Kryzen OS\nVersion: 1.0 (built %s)\nFile: %s (built into the kernel)", info[i].desc, __DATE__, info[i].file);
             return;
         }
-    snprintf(out, n, "Driver %s\nProvider: JARVIS OS\nVersion: 1.0 (built %s)\nBuilt into the kernel", in->driver, __DATE__);
+    snprintf(out, n, "Driver %s\nProvider: Kryzen OS\nVersion: 1.0 (built %s)\nBuilt into the kernel", in->driver, __DATE__);
 }
 
 static int dm_icontains(const char *hay, const char *needle)

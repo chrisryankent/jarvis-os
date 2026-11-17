@@ -187,13 +187,16 @@ public:
         return load_model(model_dir);
     }
 
-    void on_desktop_ready()
+    /* A user has signed in: greet them by name. Called once per session, so
+     * JARVIS never speaks to an empty sign-in or setup screen. */
+    void on_session_start()
     {
         char greeting[192];
+        const char *who = account_exists() ? account_name() : "";
 
-        if (g_kstate.username[0] != '\0') {
+        if (who[0] != '\0') {
             snprintf(greeting, sizeof(greeting),
-                     "JARVIS ready, %s. Say a command.", g_kstate.username);
+                     "JARVIS ready, %s. Say a command.", who);
         } else {
             snprintf(greeting, sizeof(greeting),
                      "JARVIS ready. Say a command.");
@@ -203,7 +206,7 @@ public:
         ui_shell_set_status("SPEAKING");
         ui_shell_display(greeting);
         tts_speak(greeting, strlen(greeting));
-        terminal_printf("[AI] Brain startup voice queued: %s\n", greeting);
+        terminal_printf("[AI] Session greeting queued: %s\n", greeting);
     }
 
     /* ---- Load model weights from disk ------------------------------------ */
@@ -561,14 +564,19 @@ void ai_core_infer(const char *prompt, size_t len)
     ipc_send(&msg);
 }
 
-void ai_brain_on_desktop_ready(void)
+/* Boot: load the model and get ready. Nothing is said yet. */
+void ai_brain_start(void)
 {
     g_runtime.init(
         g_kstate.model_vaddr,
         g_kstate.model_pool_size,
         "/jarvis/models/brain"
     );
-    g_runtime.on_desktop_ready();
+}
+
+void ai_brain_greet_user(void)
+{
+    g_runtime.on_session_start();
 }
 
 } /* extern "C" */

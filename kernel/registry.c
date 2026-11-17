@@ -7,23 +7,23 @@
  * registry: keys containing sub-keys and typed values.
  *
  *   HKEY_CLASSES_ROOT    file types: which app opens .txt, .png, .html ...
- *   HKEY_CURRENT_USER    Software\JARVIS OS\Settings (every system
+ *   HKEY_CURRENT_USER    Software\Kryzen OS\Settings (every system
  *                        setting: theme, wallpaper, brightness ...),
  *                        Environment (Terminal variables, setx)
- *   HKEY_LOCAL_MACHINE   SOFTWARE\JARVIS OS\CurrentVersion, and, built
+ *   HKEY_LOCAL_MACHINE   SOFTWARE\Kryzen OS\CurrentVersion, and, built
  *                        live from the hardware (not saved):
  *                        HARDWARE\DESCRIPTION, HARDWARE\DEVICEMAP,
  *                        SYSTEM\CurrentControlSet\Services (drivers),
- *                        SOFTWARE\JARVIS OS\Installed Apps
+ *                        SOFTWARE\Kryzen OS\Installed Apps
  *   HKEY_CURRENT_CONFIG  the display mode in use (live)
  *
  * Value types use the Windows numbering: REG_SZ 1, REG_EXPAND_SZ 2,
  * REG_BINARY 3, REG_DWORD 4, REG_MULTI_SZ 7, REG_QWORD 11.
  *
- * Saved keys are written to /jarvis/system/registry.reg (the protected
+ * Saved keys are written to /kryzen/system/registry.reg (the protected
  * system folder) in the same text format as "reg export" files, a couple
  * of seconds after a change. The settings store (setting_get/set) is a
- * view of HKCU\Software\JARVIS OS\Settings.
+ * view of HKCU\Software\Kryzen OS\Settings.
  * =============================================================================
  */
 
@@ -31,8 +31,8 @@
 #include <string.h>
 #include <stdio.h>
 
-#define REG_FILE        "/jarvis/system/registry.reg"
-#define REG_OLD_SETTINGS "/jarvis/system/settings.conf"
+#define REG_FILE        "/kryzen/system/registry.reg"
+#define REG_OLD_SETTINGS "/kryzen/system/settings.conf"
 #define REG_MAX_KEYS    1024
 #define REG_MAX_VALUES  4096
 #define REG_NAME_MAX    64
@@ -574,22 +574,34 @@ int reg_import(const char *text, int *keys_out, int *vals_out, char *err, size_t
 }
 
 /* ---- persistence ----------------------------------------------------------------- */
-void reg_flush(void)
+int reg_flush_checked(void)
 {
-    if (!g_ready || !g_dirty) return;
+    if (!g_ready) return -1;
+    if (!g_dirty) return 0;
     g_dirty = 0;
     size_t cap = 512 * 1024;
     char *b = (char *)kmalloc_large(cap);
-    if (!b) { g_dirty = 1; return; }
+    if (!b) { g_dirty = 1; return -1; }
     size_t o = (size_t)snprintf(b, cap, "Windows Registry Editor Version 5.00\r\n");
     for (int h = 0; h < REG_HIVES; h++) {
         if (h == REG_HKCC) continue;                         /* current config is live only */
         o = export_key(h, b, cap, o, 0);
     }
-    if (o >= cap) o = cap - 1;
-    vfs_mkdir("/jarvis/system");
-    vfs_write_file(REG_FILE, b, o);
+    int overflow = o >= cap;
+    if (overflow) o = cap - 1;
+    vfs_mkdir("/kryzen/system");
+    int write_rc = vfs_write_file(REG_FILE, b, o);
     kfree_large(b, cap);
+    if (overflow || write_rc != 0) {
+        g_dirty = 1;
+        return -1;
+    }
+    return 0;
+}
+
+void reg_flush(void)
+{
+    (void)reg_flush_checked();
 }
 
 /* ---- live (volatile) keys ------------------------------------------------------- */
@@ -605,7 +617,7 @@ void reg_refresh_live(void)
     g_building = 1;
     reg_delete_key("HKLM\\HARDWARE");
     reg_delete_key("HKLM\\SYSTEM\\CurrentControlSet\\Services");
-    reg_delete_key("HKLM\\SOFTWARE\\JARVIS OS\\Installed Apps");
+    reg_delete_key("HKLM\\SOFTWARE\\Kryzen OS\\Installed Apps");
     reg_delete_key("HKCC\\System");
 
     char b[96];
@@ -648,7 +660,7 @@ void reg_refresh_live(void)
     int np = pkg_list(pk, 32);
     for (int i = 0; i < np; i++) {
         char path[160];
-        snprintf(path, sizeof(path), "HKLM\\SOFTWARE\\JARVIS OS\\Installed Apps\\%s", pk[i].name);
+        snprintf(path, sizeof(path), "HKLM\\SOFTWARE\\Kryzen OS\\Installed Apps\\%s", pk[i].name);
         int ak = reg_open_key(path, 1);
         vset_sz(ak, "DisplayName", pk[i].title);
         vset_sz(ak, "DisplayVersion", pk[i].version);
@@ -660,7 +672,7 @@ void reg_refresh_live(void)
     vset_dw(k, "YResolution", fb_get_height());
     vset_dw(k, "BitsPerPel", 32);
     /* mark the generated subtrees volatile */
-    static const char *const roots[] = { "HKLM\\HARDWARE", "HKLM\\SYSTEM\\CurrentControlSet\\Services", "HKLM\\SOFTWARE\\JARVIS OS\\Installed Apps", "HKCC\\System" };
+    static const char *const roots[] = { "HKLM\\HARDWARE", "HKLM\\SYSTEM\\CurrentControlSet\\Services", "HKLM\\SOFTWARE\\Kryzen OS\\Installed Apps", "HKCC\\System" };
     for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) { int r = reg_open_key(roots[i], 1); if (r >= 0) g_keys[r].vol = 1; }
     g_building = 0;
     g_reg_generation++;
@@ -669,14 +681,14 @@ void reg_refresh_live(void)
 /* ---- defaults and start-up -------------------------------------------------------- */
 static void defaults(void)
 {
-    reg_set_sz("HKLM\\SOFTWARE\\JARVIS OS\\CurrentVersion", "ProductName", "JARVIS OS");
-    reg_set_sz("HKLM\\SOFTWARE\\JARVIS OS\\CurrentVersion", "CurrentVersion", "1.0");
-    reg_set_sz("HKLM\\SOFTWARE\\JARVIS OS\\CurrentVersion", "CurrentBuild", __DATE__);
-    reg_set_sz("HKLM\\SOFTWARE\\JARVIS OS\\CurrentVersion", "SystemRoot", "/jarvis");
-    reg_set_sz("HKLM\\SOFTWARE\\JARVIS OS\\CurrentVersion", "RegisteredOwner", account_name());
+    reg_set_sz("HKLM\\SOFTWARE\\Kryzen OS\\CurrentVersion", "ProductName", "Kryzen OS");
+    reg_set_sz("HKLM\\SOFTWARE\\Kryzen OS\\CurrentVersion", "CurrentVersion", "1.0");
+    reg_set_sz("HKLM\\SOFTWARE\\Kryzen OS\\CurrentVersion", "CurrentBuild", __DATE__);
+    reg_set_sz("HKLM\\SOFTWARE\\Kryzen OS\\CurrentVersion", "SystemRoot", "/kryzen");
+    reg_set_sz("HKLM\\SOFTWARE\\Kryzen OS\\CurrentVersion", "RegisteredOwner", account_name());
     char t[24];
     snprintf(t, sizeof(t), "%ld", (long)sys_unix_time());
-    reg_set_sz("HKLM\\SOFTWARE\\JARVIS OS\\CurrentVersion", "InstallDate", t);
+    reg_set_sz("HKLM\\SOFTWARE\\Kryzen OS\\CurrentVersion", "InstallDate", t);
     static const char *const assoc[][2] = {
         { ".txt", "Notepad" }, { ".log", "Notepad" }, { ".md", "Notepad" }, { ".conf", "Notepad" }, { ".ini", "Notepad" },
         { ".c", "Notepad" }, { ".h", "Notepad" }, { ".py", "Notepad" }, { ".json", "Notepad" }, { ".csv", "Notepad" },
@@ -689,7 +701,7 @@ static void defaults(void)
         reg_set_sz(p, "", assoc[i][1]);
     }
     reg_open_key("HKCU\\Environment", 1);
-    reg_open_key("HKCU\\Software\\JARVIS OS\\Settings", 1);
+    reg_open_key("HKCU\\Software\\Kryzen OS\\Settings", 1);
 }
 
 void reg_init(void)
@@ -733,8 +745,8 @@ void reg_init(void)
                 if (num && *v != '-') {
                     uint32_t d = 0;
                     for (const char *c = v; *c; c++) d = d * 10 + (uint32_t)(*c - '0');
-                    reg_set_dword("HKCU\\Software\\JARVIS OS\\Settings", p, d);
-                } else reg_set_sz("HKCU\\Software\\JARVIS OS\\Settings", p, v);
+                    reg_set_dword("HKCU\\Software\\Kryzen OS\\Settings", p, d);
+                } else reg_set_sz("HKCU\\Software\\Kryzen OS\\Settings", p, v);
                 moved++;
             }
             if (!e) break;
@@ -748,7 +760,7 @@ void reg_init(void)
 }
 
 /* ---- settings view ----------------------------------------------------------------- */
-#define SETTINGS_KEY "HKCU\\Software\\JARVIS OS\\Settings"
+#define SETTINGS_KEY "HKCU\\Software\\Kryzen OS\\Settings"
 static int g_settings_key = -1;
 
 static int settings_key(void)
@@ -757,16 +769,39 @@ static int settings_key(void)
     return g_settings_key;
 }
 
+/* Settings that belong to the PC, not to whoever is signed in. They live in
+ * HKLM; a value still found only in a user's hive (older disks) is read from
+ * there until it is next written. */
+#define MACHINE_KEY "HKLM\\SOFTWARE\\Kryzen OS\\Machine"
+static int setting_is_machine(const char *key)
+{
+    static const char *const names[] = { "device_name", "resolution", "host_nt", "host_linux",
+                                         "dev_net_off", "dev_audio_off" };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        if (!strcmp(key, names[i])) return 1;
+    return 0;
+}
+
+/* The HKCU hive was replaced (another user signed in). */
+void reg_settings_reset(void)
+{
+    g_settings_key = -1;
+}
+
 int reg_setting_get(const char *key, char *out, size_t n)
 {
     if (!g_ready) { if (n) out[0] = 0; return 0; }
+    if (setting_is_machine(key)) {
+        int mk = reg_open_key(MACHINE_KEY, 0);
+        if (mk >= 0 && reg_get_text_k(mk, key, out, n) == 0) return 1;
+    }
     return reg_get_text_k(settings_key(), key, out, n) == 0;
 }
-
 void reg_setting_set(const char *key, const char *value, int numeric)
 {
     if (!g_ready) return;
-    int k = settings_key();
+    int k = setting_is_machine(key) ? reg_open_key(MACHINE_KEY, 1) : settings_key();
+    if (k < 0) return;
     if (numeric) {
         long v = 0;
         int neg = *value == '-';

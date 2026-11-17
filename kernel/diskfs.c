@@ -29,8 +29,8 @@
  *     crash can never leave it inconsistent with the files.
  * There is no journal: a crash can lose changes made since the last sync.
  *
- * Not stored on disk: /jarvis/models (packaged with the system image) and
- * /jarvis/bin (reinstalled from the system image at every boot).
+ * Not stored on disk: /kryzen/models (packaged with the system image) and
+ * /kryzen/bin (reinstalled from the system image at every boot).
  * =============================================================================
  */
 
@@ -46,7 +46,7 @@
 #define FS_MAX_CHUNKS   31
 #define FS_MAX_FILES    (FS_PRIMARY + FS_MAX_CHUNKS * FS_CHUNK)    /* 16384 */
 #define FS_MAX_EXTENTS  14
-#define FS_MAX_BLOCKS   (1u << 20)          /* 4 GB */
+#define FS_MAX_BLOCKS   (1u << 24)          /* 64 GB */
 #define FS_VERSION      1
 #define FS_VERSION_EXT  2                   /* has extension chunks */
 
@@ -79,8 +79,11 @@ static fs_super_t g_super;
 static fs_entry_t g_table[FS_MAX_FILES];
 static uint8_t    g_bitmap[FS_MAX_BLOCKS / 8];
 static uint8_t    g_io[65536];              /* transfer buffer (16 blocks) */
+static uint8_t    g_verify[65536];
 static int        g_dev = -1;
 static int        g_mounted = 0;
+static uint64_t   g_start_sector = 0;        /* partition start on g_dev */
+static uint64_t   g_limit_blocks = 0;        /* bounded volume size */
 static uint64_t   g_used_blocks = 0;
 static int        g_full_reported = 0;
 static int        g_fs_lock = -1;           /* sync vs. the disk check */
@@ -90,14 +93,32 @@ static void fs_lock(void)   { if (g_fs_lock >= 0) kmutex_lock(g_fs_lock); }
 static void fs_unlock(void) { if (g_fs_lock >= 0) kmutex_unlock(g_fs_lock); }
 
 /* ---- Block helpers ------------------------------------------------------- */
+static int rd_sectors(uint64_t sector, uint32_t count, void *buf)
+{
+    if (g_dev < 0 || sector > g_limit_blocks * FS_SPB ||
+        count > g_limit_blocks * FS_SPB - sector)
+        return -1;
+    return block_read(g_dev, g_start_sector + sector, count, buf);
+}
+
+static int wr_sectors(uint64_t sector, uint32_t count, const void *buf)
+{
+    if (g_dev < 0 || sector > g_limit_blocks * FS_SPB ||
+        count > g_limit_blocks * FS_SPB - sector)
+        return -1;
+    return block_write(g_dev, g_start_sector + sector, count, buf);
+}
+
 static int rd(uint64_t block, uint32_t count, void *buf)
 {
-    return block_read(g_dev, block * FS_SPB, count * FS_SPB, buf);
+    if (count > UINT32_MAX / FS_SPB) return -1;
+    return rd_sectors(block * FS_SPB, count * FS_SPB, buf);
 }
 
 static int wr(uint64_t block, uint32_t count, const void *buf)
 {
-    return block_write(g_dev, block * FS_SPB, count * FS_SPB, buf);
+    if (count > UINT32_MAX / FS_SPB) return -1;
+    return wr_sectors(block * FS_SPB, count * FS_SPB, buf);
 }
 
 static int  bit_get(uint32_t b) { return g_bitmap[b / 8] & (1u << (b % 8)); }
@@ -195,10 +216,30 @@ static int write_bitmap(void)
     return wr(g_super.bitmap_start, g_super.bitmap_blocks, g_bitmap);
 }
 
+static int verify_disk_metadata(void)
+{
+    if (rd(0, 1, g_io) != 0 || memcmp(g_io, &g_super, sizeof(g_super))) return -1;
+    for (int i = 0; i < g_nent; i += 8) {
+        if (rd(entry_block(i), 1, g_io) != 0 ||
+            memcmp(g_io, &g_table[i], FS_BLOCK) != 0)
+            return -1;
+    }
+    for (uint32_t off = 0; off < g_super.bitmap_blocks;) {
+        uint32_t count = g_super.bitmap_blocks - off;
+        if (count > sizeof(g_io) / FS_BLOCK) count = sizeof(g_io) / FS_BLOCK;
+        if (rd(g_super.bitmap_start + off, count, g_io) != 0 ||
+            memcmp(g_io, g_bitmap + (size_t)off * FS_BLOCK,
+                   (size_t)count * FS_BLOCK) != 0)
+            return -1;
+        off += count;
+    }
+    return 0;
+}
+
 static int persistable(const char *path)
 {
-    return strncmp(path, "/jarvis/models", 14) != 0 &&
-           strncmp(path, "/jarvis/bin", 11) != 0 &&
+    return strncmp(path, "/kryzen/models", 14) != 0 &&
+           strncmp(path, "/kryzen/bin", 11) != 0 &&
            strlen(path) < sizeof(g_table[0].path);
 }
 
@@ -269,26 +310,33 @@ static int load_file(int idx)
     return left ? -1 : 0;
 }
 
-void diskfs_mount(void)
+static void diskfs_clear_selection(void)
+{
+    g_dev = -1;
+    g_start_sector = 0;
+    g_limit_blocks = 0;
+}
+
+static int diskfs_mount_range(int dev, uint64_t start_sector,
+                              uint64_t sector_count, int format_blank)
 {
     block_info_t info;
+    if (g_mounted || block_get_info(dev, &info) != 0 || start_sector >= info.sectors)
+        return -1;
+    if (!sector_count || sector_count > info.sectors - start_sector)
+        sector_count = info.sectors - start_sector;
 
-    if (block_count() == 0 || block_get_info(0, &info) != 0) {
-        terminal_puts("[FS] No disk: files are kept in memory only and will not survive a restart\n");
-        return;
-    }
-    g_dev = 0;
-
-    uint64_t total_blocks = info.sectors / FS_SPB;
+    uint64_t total_blocks = sector_count / FS_SPB;
     if (total_blocks > FS_MAX_BLOCKS) total_blocks = FS_MAX_BLOCKS;
-    if (total_blocks < 1024) {
-        terminal_puts("[FS] Disk is too small (need at least 4 MB)\n");
-        return;
-    }
+    if (total_blocks < 1024) return -1;
+
+    g_dev = dev;
+    g_start_sector = start_sector;
+    g_limit_blocks = total_blocks;
 
     if (rd(0, 16, g_io) != 0) {
-        terminal_puts("[FS] Could not read the disk\n");
-        return;
+        diskfs_clear_selection();
+        return -1;
     }
     memcpy(&g_super, g_io, sizeof(g_super));
 
@@ -296,20 +344,23 @@ void diskfs_mount(void)
         int blank = 1;
         for (size_t i = 0; i < sizeof(g_io); i++)
             if (g_io[i]) { blank = 0; break; }
-        if (!blank) {
+        if (!blank || !format_blank) {
             terminal_puts("[FS] Disk contains data that is not a JARVIS file system; leaving it untouched\n");
-            return;
+            diskfs_clear_selection();
+            return -1;
         }
         if (format(total_blocks) != 0) {
             terminal_puts("[FS] Format failed\n");
-            return;
+            diskfs_clear_selection();
+            return -1;
         }
     } else if ((g_super.version != FS_VERSION && g_super.version != FS_VERSION_EXT) || g_super.block_size != FS_BLOCK ||
                g_super.total_blocks > total_blocks ||
                g_super.table_blocks != FS_PRIMARY * sizeof(fs_entry_t) / FS_BLOCK ||
                (g_super.version == FS_VERSION && g_super.chunk_count) || g_super.chunk_count > FS_MAX_CHUNKS) {
         terminal_puts("[FS] Unsupported file system version; leaving the disk untouched\n");
-        return;
+        diskfs_clear_selection();
+        return -1;
     } else {
         int bad = rd(g_super.table_start, g_super.table_blocks, g_table) != 0;
         for (uint32_t c = 0; c < g_super.chunk_count && !bad; c++)
@@ -317,7 +368,8 @@ void diskfs_mount(void)
                   rd(g_super.chunk_start[c], FS_CHUNK_BLOCKS, &g_table[FS_PRIMARY + c * FS_CHUNK]) != 0;
         if (bad) {
             terminal_puts("[FS] Could not read the file table\n");
-            return;
+            diskfs_clear_selection();
+            return -1;
         }
     }
     g_nent = FS_PRIMARY + (int)g_super.chunk_count * FS_CHUNK;
@@ -338,6 +390,63 @@ void diskfs_mount(void)
         (unsigned long long)(g_super.total_blocks * FS_BLOCK >> 20));
     if (bad)
         terminal_printf("[FS] %d item(s) could not be read\n", bad);
+    return 0;
+}
+
+void diskfs_mount(void)
+{
+    static dm_disk_t disk;
+    for (int dev = 0; dev < block_count(); dev++) {
+        if (dm_disk_info(dev, &disk) != 0) continue;
+        for (int p = 0; p < disk.nparts; p++) {
+            if (!strcmp(disk.parts[p].fs, "JARVISFS") &&
+                diskfs_mount_range(dev, disk.parts[p].start, disk.parts[p].sectors, 0) == 0)
+                return;
+        }
+    }
+
+    /* Preserve the existing blank-image development workflow. A partitioned
+     * disk with no KryzenFS volume is left alone by diskfs_mount_range(). */
+    if (!block_count() || diskfs_mount_range(0, 0, 0, 1) != 0)
+        terminal_puts("[FS] No usable Kryzen data volume: files are kept in memory only and will not survive a restart\n");
+}
+
+int diskfs_mount_partition(int dev, uint64_t start_sector, uint64_t sector_count)
+{
+    return diskfs_mount_range(dev, start_sector, sector_count, 0);
+}
+
+int diskfs_format_partition(int dev, uint64_t start_sector, uint64_t sector_count)
+{
+    block_info_t info;
+    if (g_mounted || block_get_info(dev, &info) != 0 || start_sector >= info.sectors)
+        return -1;
+    if (!sector_count || sector_count > info.sectors - start_sector)
+        sector_count = info.sectors - start_sector;
+    uint64_t total_blocks = sector_count / FS_SPB;
+    if (total_blocks > FS_MAX_BLOCKS) total_blocks = FS_MAX_BLOCKS;
+    if (total_blocks < 1024) return -1;
+
+    g_dev = dev;
+    g_start_sector = start_sector;
+    g_limit_blocks = total_blocks;
+    if (format(total_blocks) != 0) {
+        diskfs_clear_selection();
+        return -1;
+    }
+    g_nent = FS_PRIMARY;
+    g_full_reported = 0;
+    rebuild_bitmap();
+    if (write_bitmap() != 0 || block_flush(dev) != 0 || verify_disk_metadata() != 0) {
+        terminal_puts("[FS] Formatted Kryzen partition failed its read-back check\n");
+        diskfs_clear_selection();
+        return -1;
+    }
+    g_mounted = 1;
+    if (g_fs_lock < 0) g_fs_lock = kmutex_create("jarvisfs");
+    terminal_printf("[FS] Formatted %s partition: %llu MB\n", info.name,
+                    (unsigned long long)(total_blocks * FS_BLOCK >> 20));
+    return 0;
 }
 
 /* ---- Sync ---------------------------------------------------------------- */
@@ -429,6 +538,70 @@ int diskfs_sync(void)
     return changed;
 }
 
+/* Installer first-account completion uses a stronger persistence barrier
+ * than the desktop's periodic save. First sync all pending VFS changes, flush
+ * the device, then verify KryzenFS metadata and every saved persistent file
+ * against its in-memory VFS contents. */
+int diskfs_sync_verified(void)
+{
+    if (!g_mounted) return -1;
+    diskfs_sync();
+
+    int failed = 0, account_seen = 0, registry_seen = 0;
+    fs_lock();
+    if (block_flush(g_dev) != 0 || verify_disk_metadata() != 0) failed = 1;
+
+    int slots = vfs_slot_max();
+    for (int slot = 0; slot < slots; slot++) {
+        vfs_slot_info_t s;
+        if (vfs_slot_info(slot, &s) != 0 || !persistable(s.path)) continue;
+        int account_file = !strcmp(s.path, "/kryzen/system/users.conf");
+        int registry_file = !strcmp(s.path, "/kryzen/system/registry.reg");
+        if (account_file) account_seen = 1;
+        if (registry_file) registry_seen = 1;
+        if (s.dirty) { failed = 1; continue; }
+        if (s.disk_idx < 0) {
+            if (account_file || registry_file) failed = 1;
+            continue;
+        }
+        if (s.disk_idx >= g_nent) { failed = 1; continue; }
+        fs_entry_t *e = &g_table[s.disk_idx];
+        if (!e->used || strcmp(e->path, s.path) || e->size != s.size ||
+            e->is_dir != (uint32_t)s.is_dir || e->extent_count > FS_MAX_EXTENTS) {
+            failed = 1;
+            continue;
+        }
+        if (s.is_dir || !s.size) continue;
+
+        uint64_t left = s.size, offset = 0;
+        for (uint32_t x = 0; x < e->extent_count && left; x++) {
+            for (uint32_t k = 0; k < e->extents[x].count && left; k += 16) {
+                uint32_t blocks = e->extents[x].count - k;
+                if (blocks > 16) blocks = 16;
+                if (rd(e->extents[x].start + k, blocks, g_io) != 0) {
+                    failed = 1;
+                    left = 0;
+                    break;
+                }
+                size_t bytes = (size_t)blocks * FS_BLOCK;
+                if ((uint64_t)bytes > left) bytes = (size_t)left;
+                int got = vfs_slot_read(slot, offset, g_verify, bytes, s.gen);
+                if (got < 0 || (size_t)got != bytes || memcmp(g_io, g_verify, bytes) != 0) {
+                    failed = 1;
+                    left = 0;
+                    break;
+                }
+                offset += bytes;
+                left -= bytes;
+            }
+        }
+        if (left) failed = 1;
+    }
+    if (!account_seen || !registry_seen) failed = 1;
+    fs_unlock();
+    return failed ? -1 : 0;
+}
+
 int diskfs_get_stats(diskfs_stats_t *out)
 {
     memset(out, 0, sizeof(*out));
@@ -447,7 +620,7 @@ int diskfs_get_stats(diskfs_stats_t *out)
 }
 
 /* ---- Resize (Disks: Extend / Shrink volume) --------------------------------
- * The JARVIS volume starts at sector 0 and may end before the disk does.
+ * The JARVIS volume may be a whole disk or a bounded partition range.
  * Growing is limited by the disk and by the space map's capacity (one bit
  * per block in the bitmap blocks reserved at format time); shrinking needs
  * the blocks past the new end to be free. Returns 0, or -1 with the reason. */
@@ -456,7 +629,8 @@ uint64_t diskfs_max_blocks(void)
     if (!g_mounted) return 0;
     block_info_t info;
     if (block_get_info(g_dev, &info) != 0) return 0;
-    uint64_t m = info.sectors / FS_SPB;
+    uint64_t m = g_limit_blocks;
+    if (!m) m = (info.sectors - g_start_sector) / FS_SPB;
     uint64_t cap = (uint64_t)g_super.bitmap_blocks * FS_BLOCK * 8;
     if (m > cap) m = cap;
     if (m > FS_MAX_BLOCKS) m = FS_MAX_BLOCKS;
@@ -467,8 +641,23 @@ uint64_t diskfs_min_blocks(void)
 {
     if (!g_mounted) return 0;
     uint64_t hi = g_super.data_start;
-    for (uint64_t b = g_super.data_start; b < g_super.total_blocks; b++)
-        if (bit_get((uint32_t)b)) hi = b + 1;
+    uint64_t end = g_super.total_blocks;
+    while (end > g_super.data_start) {
+        uint64_t byte = (end - 1) >> 3;
+        int top_bit = (int)((end - 1) & 7);
+        uint8_t used = g_bitmap[byte];
+        int found = 0;
+        for (int bit = top_bit; bit >= 0; bit--) {
+            if (used & (1u << bit)) {
+                uint64_t candidate = byte * 8 + (uint64_t)bit + 1;
+                if (candidate > hi) hi = candidate;
+                found = 1;
+                break;
+            }
+        }
+        if (found) break;
+        end = byte * 8;
+    }
     /* keep a margin so the next saves have room (files are rewritten into
      * fresh blocks before the old ones are released) */
     uint64_t margin = g_used_blocks / 4 + 256;
@@ -540,11 +729,11 @@ static void diskfs_check_process(void)
     /* 1. superblock and file table as stored on the disk */
     g_chk.phase = "Reading the file table";
     fs_lock();
-    if (block_read(g_dev, 0, FS_SPB, g_chk_buf) != 0) { g_chk.read_errors++; chk_issue("The superblock cannot be read", 0, 0); }
+    if (rd_sectors(0, FS_SPB, g_chk_buf) != 0) { g_chk.read_errors++; chk_issue("The superblock cannot be read", 0, 0); }
     else if (memcmp(g_chk_buf, &g_super, sizeof(g_super)) != 0) chk_issue("The superblock on disk differs from the one in use", 0, 0);
     /* the table as stored, one block (8 entries) at a time */
     for (int i = 0; i < g_nent; i += 8) {
-        if (block_read(g_dev, (uint64_t)entry_block(i) * FS_SPB, FS_SPB, g_chk_buf) != 0) {
+        if (rd_sectors((uint64_t)entry_block(i) * FS_SPB, FS_SPB, g_chk_buf) != 0) {
             g_chk.read_errors++;
             chk_issue("The file table cannot be read (entry %s%ld)", "#", i);
             continue;
@@ -609,7 +798,7 @@ static void diskfs_check_process(void)
     uint64_t bm_bytes = (uint64_t)g_super.bitmap_blocks * FS_BLOCK;
     for (uint64_t off = 0; off < bm_bytes; off += sizeof(g_chk_buf)) {
         uint32_t n = (uint32_t)((bm_bytes - off) < sizeof(g_chk_buf) ? (bm_bytes - off) : sizeof(g_chk_buf));
-        if (block_read(g_dev, (uint64_t)g_super.bitmap_start * FS_SPB + off / 512, n / 512, g_chk_buf) != 0) { g_chk.read_errors++; break; }
+        if (rd_sectors((uint64_t)g_super.bitmap_start * FS_SPB + off / 512, n / 512, g_chk_buf) != 0) { g_chk.read_errors++; break; }
         fs_lock();
         for (uint32_t k = 0; k < n && off + k < sizeof(g_bitmap); k++) {
             uint8_t d = (uint8_t)(g_chk_buf[k] ^ g_bitmap[off + k]);
@@ -642,7 +831,7 @@ static void diskfs_check_process(void)
                 for (uint32_t k = 0; k < e.extents[x].count && off < e.size; k += 16) {
                     uint32_t n = e.extents[x].count - k;
                     if (n > 16) n = 16;
-                    if (block_read(g_dev, (uint64_t)(e.extents[x].start + k) * FS_SPB, n * FS_SPB, g_chk_buf) != 0) {
+                    if (rd_sectors((uint64_t)(e.extents[x].start + k) * FS_SPB, n * FS_SPB, g_chk_buf) != 0) {
                         g_chk.read_errors++; bad = 1; break;
                     }
                     g_chk.blocks_read += n;
@@ -668,7 +857,7 @@ static void diskfs_check_process(void)
         g_chk.phase = "Reading every block";
         for (uint64_t b = 0; b < total; b += 16) {
             uint32_t n = (uint32_t)(total - b < 16 ? total - b : 16);
-            if (block_read(g_dev, b * FS_SPB, n * FS_SPB, g_chk_buf) != 0) {
+            if (rd_sectors(b * FS_SPB, n * FS_SPB, g_chk_buf) != 0) {
                 g_chk.read_errors++;
                 if (g_chk.read_errors <= 3) chk_issue("Unreadable blocks near %s%ld", "block ", (long)b);
             }

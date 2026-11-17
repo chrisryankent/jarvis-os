@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — System monitor / Task Manager (apps/sysmon.c)
+ * Kryzen OS — System monitor / Task Manager (apps/sysmon.c)
  * Language: C17
  *
  * Processes tab: the kernel's live process table with CPU use per process;

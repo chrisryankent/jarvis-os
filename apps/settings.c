@@ -1,15 +1,15 @@
 /*
  * =============================================================================
- * JARVIS OS — Settings (apps/settings.c)
+ * Kryzen OS — Settings (apps/settings.c)
  * Language: C17
  *
  * Categories: Home, System, Bluetooth & devices, Network & internet,
  * Personalization, Apps, Accounts, Time & language, Accessibility,
  * Privacy & security, Update.
  *
- * Every switch changes something real; hardware or features JARVIS OS does
+ * Every switch changes something real; hardware or features Kryzen OS does
  * not support yet are listed as such instead of offering a switch that does
- * nothing. Choices are saved in /jarvis/system/settings.conf and applied at
+ * nothing. Choices are saved in /kryzen/system/settings.conf and applied at
  * boot (desktop_apply_settings).
  *
  * A page is a list of rows (s_header, s_info, switch, s_choice, s_slider, text
@@ -30,7 +30,7 @@ int  kernel_voice_bridge_connected(void);
 
 #define SET_SIDEBAR_W 230
 #define SET_TITLE_H   64
-#define SET_MAX_ROWS  64
+#define SET_MAX_ROWS  96
 
 enum {
     P_HOME, P_SYSTEM, P_DISPLAY, P_DEVICES, P_NETWORK, P_PERSONAL, P_APPS, P_ACCOUNTS, P_TIME,
@@ -57,9 +57,13 @@ enum {
     A_NONE, A_THEME, A_ACCENT, A_WALL, A_CLOCK24, A_DND, A_NARRATOR, A_VOICE_IN, A_AI_ASK, A_AI_WEB,
     A_VOLUME, A_VOICE_VOL, A_MOUSE_SPEED, A_MOUSE_SWAP, A_AUTOPLAY, A_AIRPLANE, A_RENEW, A_LOCK_AFTER,
     A_LOCK_NOW, A_RESTART, A_SHUTDOWN, A_EMPTY_TRASH, A_CLEAR_CLIP, A_CLEAR_HISTORY, A_DEVICE_NAME,
-    A_NAME, A_PASSWORD, A_PASSWORD_DEL, A_PIN, A_PIN_DEL, A_VOICE, A_VOICE_DEL, A_HC, A_UNINSTALL0,
+    A_NAME, A_PASSWORD, A_PASSWORD_DEL, A_PIN, A_PIN_DEL, A_VOICE, A_VOICE_DEL, A_HC,
+    A_HOST_NT, A_HOST_LINUX, A_SIGN_OUT, A_USER_ADD, A_UNINSTALL0,
     A_STARTUP0 = 200,
     A_PREF0 = 300,              /* settings changed through prefs_set(): see s_pref_names */
+    A_USER_ROLE0 = 400,         /* + user index: administrator <-> standard */
+    A_USER_DEL0 = 420,          /* + user index: remove the account */
+    A_USER_PASS0 = 440,         /* + user index: set a new password */
 };
 
 static struct {
@@ -167,7 +171,7 @@ static void s_page_home(void)
     s_info(account_name(), account_has_sign_in() ? a : "No sign-in set (anyone can use this PC)");
     s_header("This PC");
     setting_get("device_name", b, sizeof(b));
-    s_info("Device name", b[0] ? b : "JARVIS-PC");
+    s_info("Device name", b[0] ? b : "Kryzen-PC");
     if (nd) {
         s_fmt_size(dr[0].free, a, sizeof(a)); s_fmt_size(dr[0].total, b, sizeof(b));
         snprintf(c, sizeof(c), "%s free of %s", a, b);
@@ -190,6 +194,10 @@ static void s_page_system(void)
     int nd = storage_list(dr, 8);
     pmm_get_stats(&total, &freef);
 
+    s_header("Host environments");
+    s_toggle("Windows NT commands & registry", "dir, copy, tasklist, reg, regedit ... in the Terminal",
+             setting_get_int("host_nt", 1), A_HOST_NT);
+    s_toggle("Debian Linux layer", "Linux programs, apt and dpkg", setting_get_int("host_linux", 1), A_HOST_LINUX);
     s_header("Display");
     snprintf(a, sizeof(a), "%u x %u, 32-bit colour", fb_get_width(), fb_get_height());
     s_info("Resolution", a);
@@ -213,7 +221,7 @@ static void s_page_system(void)
         char lbl[64]; snprintf(lbl, sizeof(lbl), "%s (%s)", dr[i].name, dr[i].device[0] ? dr[i].device : "memory");
         s_drive(lbl, dr[i].total - dr[i].free, dr[i].total, a);
     }
-    long trash = vfs_size("/jarvis/trash");
+    long trash = vfs_size("/kryzen/trash");
     s_fmt_size(trash > 0 ? (uint64_t)trash : 0, b, sizeof(b));
     snprintf(a, sizeof(a), "Uses %s", b);
     s_button("Recycle Bin", a, "Empty", A_EMPTY_TRASH, 0);
@@ -224,14 +232,15 @@ static void s_page_system(void)
     s_button("Clipboard", a, "Clear", A_CLEAR_CLIP, 0);
     s_header("About");
     setting_get("device_name", a, sizeof(a));
-    s_field("Device name", a[0] ? a : "JARVIS-PC", 0, A_DEVICE_NAME);
+    s_field("Device name", a[0] ? a : "Kryzen-PC", 0, A_DEVICE_NAME);
     sys_cpu_name(a, sizeof(a));
     s_info("Processor", a);
     snprintf(a, sizeof(a), "%u MB usable, %u MB in use", (unsigned)(total >> 8), (unsigned)((total - freef) >> 8));
     s_info("Memory", a);
     sys_format_uptime(a, sizeof(a));
     s_info("Running for", a);
-    s_info("System", "JARVIS OS 1.0, 64-bit (x86-64), built " __DATE__);
+    s_info("System", "Kryzen OS 2026, 64-bit (x86-64), built " __DATE__);
+    s_info("Author", "Chris Ryan Kent");
 }
 
 static void s_page_devices(void)
@@ -265,7 +274,7 @@ static void s_page_devices(void)
         snprintf(a, sizeof(a), "%s  -  %s", d[i].type, st_name[d[i].state % 3]);
         s_info(d[i].name, a);
     }
-    s_note("Printers, cameras and phones need drivers JARVIS OS does not have yet.");
+    s_note("Printers, cameras and phones need drivers Kryzen OS does not have yet.");
 }
 
 static void s_page_network(void)
@@ -428,8 +437,28 @@ static void s_page_accounts(void)
     if (account_has_voice()) s_button("Remove passphrase", "Turn off voice sign-in", "Remove", A_VOICE_DEL, 1);
     s_note("Speak your passphrase on the sign-in screen; small mishearings are tolerated.");
     s_note("Choose a phrase of three or more words that others will not guess.");
-    s_header("Other users");
-    s_note("JARVIS OS has one account for now.");
+    s_header("Users of this PC");
+    int me = user_current(), admin = user_is_admin();
+    for (int i = 0; i < user_count(); i++) {
+        user_info_t u;
+        char d[96];
+        if (user_info(i, &u) != 0) continue;
+        snprintf(d, sizeof(d), "%s  \x80  uid %d%s", u.admin ? "Administrator" : "Standard user", u.uid, i == me ? "  \x80  you" : "");
+        s_info(u.name, d);
+        if (!admin || i == me) continue;
+        s_button(u.admin ? "Make standard user" : "Make administrator",
+                 u.admin ? "Can no longer manage users, disks, devices or apps" : "Can manage users, disks, devices and apps",
+                 "Change", A_USER_ROLE0 + i, 0);
+        s_field("New password", "", 1, A_USER_PASS0 + i);
+        s_button("Remove this user", "Deletes the account and every file in its home folder", "Remove", A_USER_DEL0 + i, 1);
+    }
+    if (admin) {
+        s_field("Add a user (type a name)", "", 0, A_USER_ADD);
+        s_note("A new user starts as a standard user with no password, and gets a private home folder and their own settings.");
+    } else {
+        s_note("Only an administrator can add, change or remove users.");
+    }
+    s_button("Sign out", "Closes your apps and returns to the sign-in screen", "Sign out", A_SIGN_OUT, 0);
 }
 
 static void s_page_time(void)
@@ -479,10 +508,11 @@ static void s_page_privacy(void)
 
 static void s_page_update(void)
 {
-    s_header("JARVIS OS");
-    s_info("Version", "1.0, built " __DATE__);
+    s_header("Kryzen OS");
+    s_info("Version", "2026, built " __DATE__);
+    s_info("Author", "Chris Ryan Kent");
     s_info("How updates work", "Install a newer system image (make iso), then restart");
-    s_note("Automatic updates need an update server, which JARVIS OS does not have yet.");
+    s_note("Automatic updates need an update server, which Kryzen OS does not have yet.");
     s_note("Your files, apps and settings are on the disk and are kept across updates.");
 }
 
@@ -521,7 +551,8 @@ static void s_say(const char *msg, uint32_t color)
 static int s_needs_verify(int id)
 {
     return (id == A_PASSWORD || id == A_PASSWORD_DEL || id == A_PIN || id == A_PIN_DEL || id == A_VOICE ||
-            id == A_VOICE_DEL) && (account_has_password() || account_has_pin()) && !sg.verified;
+            id == A_VOICE_DEL || id == A_USER_ADD || (id >= A_USER_ROLE0 && id < A_USER_PASS0 + USER_ACCOUNT_MAX)) &&
+           (account_has_password() || account_has_pin()) && !sg.verified;
 }
 
 static void s_say(const char *msg, uint32_t color);
@@ -542,6 +573,21 @@ static void s_apply_field(int id, const char *text)
     case A_PASSWORD:    rc = text[0] ? account_set_password(text) : -1; if (text[0] && !rc) s_say("Password saved.", T(OK)); break;
     case A_PIN:         rc = text[0] ? account_set_pin(text, err, sizeof(err)) : -1; if (!rc) s_say("PIN saved.", T(OK)); break;
     case A_VOICE:       rc = text[0] ? account_set_voice(text, err, sizeof(err)) : -1; if (!rc) s_say("Spoken passphrase saved.", T(OK)); break;
+    case A_USER_ADD:
+        if (text[0]) {
+            rc = user_add(text, "", "", "", 0, err, sizeof(err)) < 0;
+            if (!rc) s_say("User added. They can sign in from the sign-in screen.", T(OK));
+        }
+        break;
+    default:
+        if (id >= A_USER_PASS0 && id < A_USER_PASS0 + USER_ACCOUNT_MAX && text[0]) {
+            user_info_t u;
+            if (user_info(id - A_USER_PASS0, &u) == 0) {
+                rc = user_reset_password(u.name, text, err, sizeof(err));
+                if (!rc) s_say("Password set. Their PIN and passphrase were cleared.", T(OK));
+            }
+        }
+        break;
     }
     if (rc && err[0]) s_say(err, T(DANGER));
 }
@@ -605,7 +651,20 @@ static void s_do_action(int id, int value)
     case A_PASSWORD_DEL: account_set_password(""); s_say("Password removed.", T(OK)); break;
     case A_PIN_DEL:      { char e[8]; account_set_pin("", e, sizeof(e)); s_say("PIN removed.", T(OK)); break; }
     case A_VOICE_DEL:    { char e[8]; account_set_voice("", e, sizeof(e)); s_say("Voice sign-in removed.", T(OK)); break; }
+    case A_HOST_NT:      setting_set_int("host_nt", !setting_get_int("host_nt", 1)); break;
+    case A_HOST_LINUX:   setting_set_int("host_linux", !setting_get_int("host_linux", 1)); break;
+    case A_SIGN_OUT:     desktop_sign_out(); return;
     default:
+        if (id >= A_USER_ROLE0 && id < A_USER_DEL0 + USER_ACCOUNT_MAX) {
+            user_info_t u;
+            char e[128] = "";
+            int del = id >= A_USER_DEL0;
+            if (user_info(id - (del ? A_USER_DEL0 : A_USER_ROLE0), &u) == 0) {
+                int rc = del ? user_remove(u.name, e, sizeof(e)) : user_set_admin(u.name, !u.admin, e, sizeof(e));
+                s_say(rc ? e : del ? "The user was removed." : "The user's role was changed.", rc ? T(DANGER) : T(OK));
+            }
+            break;
+        }
         if (id >= A_UNINSTALL0 && id < A_UNINSTALL0 + 16 && id - A_UNINSTALL0 < sg.npkgs) {
             snprintf(p, sizeof(p), "%s", sg.pkgs[id - A_UNINSTALL0].name);
             s_say(pkg_uninstall(p) == 0 ? "The app was uninstalled." : "The app could not be uninstalled.", T(OK));

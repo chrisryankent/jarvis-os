@@ -18,8 +18,8 @@
  *   entries, until the end:   u16 path length, path (relative), u32 size, data
  *
  * Installing checks the checksum and every path *before* writing anything,
- * then writes the files to /jarvis/apps/<name>/ and the manifest to
- * /jarvis/apps/<name>/package.info. Installing a package that is already
+ * then writes the files to /kryzen/apps/<name>/ and the manifest to
+ * /kryzen/apps/<name>/package.info. Installing a package that is already
  * installed replaces it (upgrade). Programs inside run in user mode, like
  * any other program.
  *
@@ -31,7 +31,7 @@
 #include <string.h>
 #include <stdio.h>
 
-#define PKG_ROOT      "/jarvis/apps"
+#define PKG_ROOT      "/kryzen/apps"
 #define PKG_MAX_SIZE  (64u << 20)
 
 volatile uint32_t g_pkg_generation = 1;     /* bumped on install / uninstall */
@@ -186,6 +186,7 @@ int pkg_install(const char *path, pkg_info_t *info, char *err, size_t errn)
     size_t size;
     pkg_info_t tmp;
     if (!info) info = &tmp;
+    if (!user_is_admin()) { snprintf(err, errn, "Installing apps needs an administrator."); return -1; }
     uint8_t *b = load(path, &size, err, errn);
     if (!b) return -1;
     int mlen = verify(b, size, info, err, errn);
@@ -232,7 +233,7 @@ int pkg_install(const char *path, pkg_info_t *info, char *err, size_t errn)
 int pkg_uninstall(const char *name)
 {
     char dir[64];
-    if (!valid_name(name)) return -1;
+    if (!user_is_admin() || !valid_name(name)) return -1;
     snprintf(dir, sizeof(dir), PKG_ROOT "/%s", name);
     if (!vfs_exists(dir) || vfs_delete(dir) != 0) return -1;
     g_pkg_generation++;
@@ -293,10 +294,10 @@ extern const uint8_t user_pkg_counter_start[], user_pkg_counter_end[];
 void pkg_place_samples(void)
 {
     const struct { const char *file; const uint8_t *s, *e; } samples[] = {
-        { "/jarvis/data/Downloads/hello-1.0.jpk",   user_pkg_hello_start,   user_pkg_hello_end },
-        { "/jarvis/data/Downloads/counter-1.0.jpk", user_pkg_counter_start, user_pkg_counter_end },
+        { "/kryzen/data/Downloads/hello-1.0.jpk",   user_pkg_hello_start,   user_pkg_hello_end },
+        { "/kryzen/data/Downloads/counter-1.0.jpk", user_pkg_counter_start, user_pkg_counter_end },
     };
-    vfs_mkdir("/jarvis/data/Downloads");
+    vfs_mkdir("/kryzen/data/Downloads");
     for (size_t i = 0; i < sizeof(samples) / sizeof(samples[0]); i++)
         if (!vfs_exists(samples[i].file))
             vfs_write_file(samples[i].file, samples[i].s, (size_t)(samples[i].e - samples[i].s));

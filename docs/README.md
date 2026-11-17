@@ -39,7 +39,7 @@ Every user interaction goes through voice and LLM reasoning.
 ## File Structure
 
 ```
-jarvis-os/
+kryzen-os/
 ├── boot/
 │   ├── boot.asm          # Stage 1: x86_64 MBR bootloader (ASM)
 │   └── stage2.asm        # Stage 2: long mode entry (ASM)

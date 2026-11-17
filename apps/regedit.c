@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Registry Editor (apps/regedit.c)
+ * Kryzen OS — Registry Editor (apps/regedit.c)
  *
  * Browse and edit the registry (kernel/registry.c), like regedit.exe:
  *   - key tree on the left (click to select, click the arrow to expand)
@@ -10,7 +10,7 @@
  *     Expandable String), Modify (double-click), Rename, Delete
  *   - Find (key names, value names and data; F3 finds the next one)
  *   - Export the selected key to a .reg file, Import a .reg file
- * Values under HKCU\Software\JARVIS OS\Settings are the system settings:
+ * Values under HKCU\Software\Kryzen OS\Settings are the system settings:
  * changing one there applies it at once (checked like any other change).
  * Keys built from the hardware (HKLM\HARDWARE ...) are read-only.
  * =============================================================================
@@ -87,7 +87,7 @@ static void re_select(int k)
     re.computer_open = 1;
 }
 
-static const char *re_settings_path = "HKEY_CURRENT_USER\\Software\\JARVIS OS\\Settings";
+static const char *re_settings_path = "HKEY_CURRENT_USER\\Software\\Kryzen OS\\Settings";
 
 static int re_is_settings_key(int k)
 {
@@ -245,7 +245,7 @@ static void re_draw_dialog(int x, int y, int w, int h)
         if (re.sel_val >= 0) snprintf(b, sizeof(b), "Delete the value \"%s\"?", re.old_name[0] ? re.old_name : "(Default)");
         else snprintf(b, sizeof(b), "Delete the key \"%s\" and everything in it?", reg_key_name(re.sel_key));
         ui_text_fit(dx + 20, fy, fw, b, T(TEXT));
-        fb_draw_text(dx + 20, fy + 24, "Changing the registry can change how JARVIS OS behaves.", T(TEXT_DIM));
+        fb_draw_text(dx + 20, fy + 24, "Changing the registry can change how Kryzen OS behaves.", T(TEXT_DIM));
         break;
     case RD_FIND:
         re_field(dx + 20, fy, fw, "Find what (key names, value names and data):", re.f_data, 1);
@@ -291,7 +291,7 @@ void regedit_draw(wm_window_t *win, uint32_t *fb)
     fb_fill_rect(x, sy, w, 26, T(SURFACE));
     fb_fill_rect(x, sy, w, 1, T(BORDER));
     if (re.msg[0]) ui_text_fit(x + 12, sy + 5, w - 24, re.msg, re.msg_color);
-    else if (re.sel_key >= 0 && reg_key_volatile(re.sel_key)) fb_draw_text(x + 12, sy + 5, "Built from the hardware when JARVIS OS starts: read-only, not saved.", T(TEXT_DIM));
+    else if (re.sel_key >= 0 && reg_key_volatile(re.sel_key)) fb_draw_text(x + 12, sy + 5, "Built from the hardware when Kryzen OS starts: read-only, not saved.", T(TEXT_DIM));
     else if (re.sel_key >= 0 && re_is_settings_key(re.sel_key)) fb_draw_text(x + 12, sy + 5, "System settings: a change here applies immediately.", T(TEXT_DIM));
     re_draw_dialog(x, y, w, h);
 }
@@ -699,13 +699,21 @@ static void re_print_key(int k, int recurse, const char *only)
 
 int c_reg(int argc, char **argv)
 {
+    /* Standard users change their own hive (HKCU) only. */
+    if (argc > 1 && !user_is_admin() &&
+        (!strcmp(argv[1], "add") || !strcmp(argv[1], "delete") || !strcmp(argv[1], "import"))) {
+        const char *k = argc > 2 ? argv[2] : "";
+        int own = (k[0] == 'H' || k[0] == 'h') && (k[1] == 'K' || k[1] == 'k') && (k[2] == 'C' || k[2] == 'c') &&
+                  (k[3] == 'U' || k[3] == 'u') && strcmp(argv[1], "import");
+        if (!own) { sh_err("reg: only an administrator can change keys outside HKCU\n"); return 1; }
+    }
     if (argc < 2 || !strcmp(argv[1], "/?") || !strcmp(argv[1], "help")) {
         sh_out("reg query  <key> [/v name] [/s]\n"
                "reg add    <key> [/v name | /ve] [/t REG_SZ|REG_DWORD|REG_QWORD|REG_BINARY|REG_MULTI_SZ|REG_EXPAND_SZ] [/d data] [/f]\n"
                "reg delete <key> [/v name | /ve | /va] [/f]\n"
                "reg export <key> <file.reg>\n"
                "reg import <file.reg>\n"
-               "Keys: HKCR, HKCU, HKLM, HKCC (or HKEY_...), e.g. reg query \"HKCU\\Software\\JARVIS OS\\Settings\"\n");
+               "Keys: HKCR, HKCU, HKLM, HKCC (or HKEY_...), e.g. reg query \"HKCU\\Software\\Kryzen OS\\Settings\"\n");
         return argc < 2;
     }
     const char *act = argv[1];

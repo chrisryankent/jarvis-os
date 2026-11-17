@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Disks (apps/disks.c)
+ * Kryzen OS — Disks (apps/disks.c)
  *
  * Disk management, in the style of Windows Disk Management:
  *
@@ -19,7 +19,7 @@
  *   surface scan
  *   Eject                   safe removal of a USB drive
  *
- * The system disk (where JARVIS OS keeps its files) can be checked,
+ * The system disk (where Kryzen OS keeps its files) can be checked,
  * extended and shrunk, but never formatted or deleted.
  * The same operations are in the Terminal ("disk", "format") and are
  * available to JARVIS (disk_action, check_disk, eject_drive ...).

@@ -36,6 +36,10 @@ FACES = [
     ("LARGE",    "NotoSans-Regular.ttf",     32, 48, None),
     ("DISPLAY",  "NotoSans-Light.ttf",       58, 64, None),
     ("SMALL",    "NotoSans-Regular.ttf",     11, 14, None),
+    ("MEDIUM",   "NotoSans-Regular.ttf",     16, 20, None),
+    ("MEDIUM_BOLD", "NotoSans-SemiBold.ttf", 16, 20, None),
+    ("SUBHEAD",  "NotoSans-Regular.ttf",     19, 24, None),
+    ("HEADLINE", "NotoSans-Light.ttf",       38, 48, None),
 ]
 
 GAMMA = 0.82   # < 1 thickens thin stems a little; linear blending looks too light

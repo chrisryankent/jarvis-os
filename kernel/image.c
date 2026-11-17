@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Image codecs (kernel/image.c)
+ * Kryzen OS — Image codecs (kernel/image.c)
  * Language: C17
  *
  * Decodes PNG (all colour types, 1-16 bit, interlaced or not), baseline JPEG

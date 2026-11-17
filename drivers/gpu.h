@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — GPU Framebuffer Driver Header (drivers/gpu.h)
+ * Kryzen OS — GPU Framebuffer Driver Header (drivers/gpu.h)
  * Language: C17
  *
  * All drawing goes to an off-screen back buffer. Nothing reaches the screen
@@ -48,6 +48,28 @@ void fb_draw_rounded_rect(int x, int y, int w, int h, int r, uint32_t color);
 void fb_fill_circle(int cx, int cy, int r, uint32_t color);
 void fb_fill_ring(int cx, int cy, int r_out, int r_in, uint32_t color);
 
+/* ---- Effects (integer maths): glass, neon outlines, glows ---------------- */
+void fb_gradient_h(int x, int y, int w, int h, uint32_t left, uint32_t right);
+void fb_fill_rounded_rect_grad(int x, int y, int w, int h, int r,
+                               uint32_t left, uint32_t right, uint8_t alpha);
+/* Rounded copy out of a frame-sized picture, tinted (frosted-glass body). */
+void fb_blit_rounded(const uint32_t *src, int x, int y, int w, int h, int r,
+                     uint32_t tint, uint8_t tint_alpha);
+/* Gradient outline, `thickness` px, with `glow` px of soft light around it. */
+void fb_neon_rounded_rect(int x, int y, int w, int h, int r, int thickness, int glow,
+                          uint32_t left, uint32_t right, uint8_t alpha);
+void fb_glow_circle(int cx, int cy, int r, int spread, uint32_t color, uint8_t alpha);
+/* Degrees, clockwise from 3 o'clock; sweep 360 = full ring. */
+void fb_draw_arc(int cx, int cy, int r, int thickness, int start_deg, int sweep_deg,
+                 uint32_t color, uint8_t alpha);
+int  fb_sin1024(int deg);
+int  fb_cos1024(int deg);
+/* Round-capped stroke; coordinates and width in 1/16 px, vertical gradient. */
+void fb_stroke16(int x0, int y0, int x1, int y1, int width16,
+                 uint32_t top, uint32_t bottom, int gy0, int gy1, uint8_t alpha);
+void fb_draw_line_aa(int x0, int y0, int x1, int y1, int width, uint32_t color, uint8_t alpha);
+void fb_blur_frame(const uint32_t *src, uint32_t *dst, int w, int h, int radius);
+
 /* ---- Text ----------------------------------------------------------------
  * Anti-aliased fonts (see drivers/font_aa.h for the faces). y is the top of a
  * 16 px text line. fb_draw_text is proportional; *_mono and the char calls
@@ -60,6 +82,10 @@ int  fb_text_width_n_font(const char *str, int n, int font);
 int  fb_text_index_at(const char *str, int dx, int font);
 void fb_put_char(int px, int py, char c, uint32_t fg, uint32_t bg);      /* mono */
 void fb_put_string(int px, int py, const char *str, uint32_t fg, uint32_t bg);
+/* Screen reading: record the text drawn between begin and end. */
+typedef struct { int x, y, w, h; char text[120]; } fb_text_item_t;
+void fb_capture_begin(fb_text_item_t *items, int max);
+int  fb_capture_end(void);                                                 /* items recorded */
 void fb_draw_char(int px, int py, char c, uint32_t fg);                  /* mono, no bg */
 void fb_draw_text(int px, int py, const char *str, uint32_t fg);
 void fb_draw_text_bold(int px, int py, const char *str, uint32_t fg);

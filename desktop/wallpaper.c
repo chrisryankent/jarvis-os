@@ -1,37 +1,57 @@
 /*
  * =============================================================================
- * JARVIS OS — Wallpapers (desktop/wallpaper.c)
+ * Kryzen OS — Wallpapers (desktop/wallpaper.c)
  * Language: C17
  *
- * Built-in wallpapers are drawn by code at the current resolution, so they
- * stay sharp at any screen size: Bloom (follows the theme), Aurora,
- * Mountains, Dunes, Night sky, Waves and a solid colour. A picture file
- * (PNG, JPEG or BMP) can be used instead, with fill / fit / stretch /
- * centre / tile placement.
+ * The default wallpaper, Kryzen, is the cosmos picture built into the kernel
+ * (desktop/assets/cosmos.jpg, rendered by scripts/gen_wallpapers.py). The
+ * others are drawn by code at the current resolution: Bloom (follows the
+ * theme), Aurora, Mountains, Dunes, Night sky, Waves and a solid colour. A
+ * picture file (PNG, JPEG or BMP) can be used instead, with fill / fit /
+ * stretch / centre / tile placement.
  *
  * The result is cached; it is rebuilt only when the choice, the theme or
- * the resolution changes. The lock screen shows the same wallpaper, dimmed.
+ * the resolution changes. A blurred copy is kept next to it: frosted-glass
+ * panels (ui_glass) are cut out of that copy.
+ *
+ * Sign-in, first-run setup and the installer use their own backdrop, the
+ * nebula picture (desktop/assets/nebula.jpg), also with a blurred copy.
  * =============================================================================
  */
 
 typedef enum {
-    WP_BLOOM = 0, WP_AURORA, WP_MOUNTAINS, WP_DUNES, WP_NIGHT, WP_WAVES, WP_SOLID, WP_PICTURE, WP_COUNT
+    WP_KRYZEN = 0, WP_BLOOM, WP_AURORA, WP_MOUNTAINS, WP_DUNES, WP_NIGHT, WP_WAVES, WP_SOLID, WP_PICTURE, WP_COUNT
 } wp_style_t;
 
 static const char *const g_wp_names[WP_COUNT] = {
-    "bloom", "aurora", "mountains", "dunes", "night", "waves", "solid", "picture"
+    "kryzen", "bloom", "aurora", "mountains", "dunes", "night", "waves", "solid", "picture"
 };
 static const char *const g_wp_titles[WP_COUNT] = {
-    "Bloom", "Aurora", "Mountains", "Dunes", "Night sky", "Waves", "Solid colour", "Picture"
+    "Kryzen", "Bloom", "Aurora", "Mountains", "Dunes", "Night sky", "Waves", "Solid colour", "Picture"
 };
 static const char *const g_fit_names[5] = { "fill", "fit", "stretch", "center", "tile" };
 
 static struct {
     uint32_t *cache;
+    uint32_t *frost;            /* blurred copy for glass panels */
     size_t cache_bytes;
     int cache_w, cache_h;
     int valid;
 } g_wp;
+
+/* Backdrop of the full-screen screens (sign-in, setup, installer). */
+static struct {
+    uint32_t *px, *frost;
+    size_t bytes;
+    int w, h;
+} g_bd;
+
+/* Which picture glass panels are cut from: 0 desktop wallpaper, 1 backdrop. */
+static int g_glass_backdrop;
+
+/* Pictures built into the kernel (desktop/assets.S). */
+extern const uint8_t asset_cosmos_jpg[], asset_cosmos_jpg_end[];
+extern const uint8_t asset_nebula_jpg[], asset_nebula_jpg_end[];
 
 /* ---- small maths (no libm in the kernel) ---------------------------------- */
 #define WP_PI 3.14159265f
@@ -167,17 +187,66 @@ static void wp_bloom(void)
 {
     int W = (int)fb_get_width(), H = (int)fb_get_height();
     fb_reset_clip();
-    fb_gradient_v(0, 0, W, H, T(WALL_TOP), T(WALL_BOTTOM));
+
+    /* 1. Base dark obsidian cosmic background */
+    fb_gradient_v(0, 0, W, H, 0x00080B11, 0x000B101A);
     if (theme_get_mode() == THEME_HIGH_CONTRAST) return;
-    uint32_t glow = (theme_get_mode() == THEME_LIGHT) ? 0x00FFFFFF : T(ACCENT);
-    int cx = W / 2, cy = H + H / 6;
-    static const int radii_pct[4] = { 95, 72, 52, 34 };
-    for (int i = 0; i < 4; i++) {
-        int r = (H * radii_pct[i]) / 100;
-        fb_blend_rounded_rect(cx - r, cy - r, 2 * r, 2 * r, r, glow, 16);
+
+    /* 2. Cosmic glowing nebulas/mesh waves:
+     * - Top-left cosmic purple/blue (#161c3b / #1e1338)
+     * - Top-right cyan/deep blue (#052b36 / #182352)
+     * - Bottom-center deep violet/teal (#260f3d / #0b2136)
+     */
+    int r1 = (W * 35) / 100;
+    fb_blend_rounded_rect(-r1 / 4, -r1 / 4, r1 * 2, r1 * 2, r1, 0x001E1338, 55);
+    fb_blend_rounded_rect(-r1 / 6, -r1 / 6, r1 * 3 / 2, r1 * 3 / 2, r1 * 3 / 4, 0x00161C3B, 70);
+    fb_blend_rounded_rect(0, 0, r1, r1, r1 / 2, 0x008083FF, 20);
+
+    int r2 = (W * 32) / 100;
+    int cx2 = W + r2 / 6, cy2 = (H * 35) / 100;
+    fb_blend_rounded_rect(cx2 - r2, cy2 - r2, r2 * 2, r2 * 2, r2, 0x00052B36, 65);
+    fb_blend_rounded_rect(cx2 - r2 * 3 / 4, cy2 - r2 * 3 / 4, r2 * 3 / 2, r2 * 3 / 2, r2 * 3 / 4, 0x00182352, 50);
+    fb_blend_rounded_rect(cx2 - r2 / 2, cy2 - r2 / 2, r2, r2, r2 / 2, 0x004CD7F6, 18);
+
+    int r3 = (W * 28) / 100;
+    int cx3 = (W * 40) / 100, cy3 = H + r3 / 6;
+    fb_blend_rounded_rect(cx3 - r3, cy3 - r3, r3 * 2, r3 * 2, r3, 0x00260F3D, 55);
+    fb_blend_rounded_rect(cx3 - r3 * 3 / 4, cy3 - r3 * 3 / 4, r3 * 3 / 2, r3 * 3 / 2, r3 * 3 / 4, 0x000B2136, 45);
+    fb_blend_rounded_rect(cx3 - r3 / 2, cy3 - r3 / 2, r3, r3, r3 / 2, 0x00B76DFF, 18);
+
+    /* 3. Cyber Geometric Mesh lines / Aura */
+    int prev_y1 = -1;
+    for (int x = 0; x < W; x += 2) {
+        float u = (float)x / (float)W;
+        int y1 = (int)(H * 0.28f + H * 0.12f * wp_sin(u * 2.0f * WP_PI * 1.2f) - H * 0.05f * wp_sin(u * 2.0f * WP_PI * 2.4f));
+        if (prev_y1 >= 0 && y1 >= 0 && y1 < H) {
+            fb_blend_rect(x, y1, 2, 2, 0x004CD7F6, 50);
+        }
+        prev_y1 = y1;
     }
-    int r2 = H / 2;
-    fb_blend_rounded_rect(W - r2 / 2, -r2, 2 * r2, 2 * r2, r2, glow, 10);
+
+    for (int x = 0; x < W; x += 6) {
+        float u = (float)x / (float)W;
+        int y2 = (int)(H * 0.52f + H * 0.15f * wp_sin(u * 2.0f * WP_PI * 0.9f + 1.2f) + H * 0.06f * wp_sin(u * 2.0f * WP_PI * 2.1f));
+        if (y2 >= 0 && y2 < H && (x / 6) % 3 != 0) {
+            fb_blend_rect(x, y2, 3, 2, 0x008083FF, 42);
+        }
+    }
+
+    for (int x = 0; x < W; x += 3) {
+        float u = (float)x / (float)W;
+        int y3 = (int)(H * 0.72f - H * 0.10f * wp_sin(u * 2.0f * WP_PI * 1.5f + 2.5f));
+        if (y3 >= 0 && y3 < H) {
+            fb_blend_rect(x, y3, 2, 2, 0x00B76DFF, 35);
+        }
+    }
+
+    /* 4. Micro grid raster texture overlay (dots spaced every 28px) */
+    for (int gy = 14; gy < H; gy += 28) {
+        for (int gx = 14; gx < W; gx += 28) {
+            fb_blend_rect(gx, gy, 1, 1, 0x00C0C1FF, 32);
+        }
+    }
 }
 
 static void wp_aurora(uint32_t *px, int W, int H)
@@ -341,39 +410,36 @@ static uint32_t wp_solid_color(void)
     return n == 6 ? v : 0x00204060;
 }
 
-static int wp_picture(uint32_t *px, int W, int H, char *err, size_t errn)
+/* Places a decoded picture on a W x H canvas.
+ * fit: 0 fill (cover), 1 fit (contain), 2 stretch, 3 centre, 4 tile. */
+static int wp_place(uint32_t *px, int W, int H, const image_t *img, int fit, uint32_t bg)
 {
-    char path[256];
-    setting_get("wallpaper_picture", path, sizeof(path));
-    image_t img;
-    if (!path[0] || image_load(path, &img, err, errn)) return -1;
-    int fit = setting_get_int("wallpaper_fit", 0);
-    uint32_t bg = wp_solid_color();
     for (size_t i = 0; i < (size_t)W * H; i++) px[i] = bg;
 
     if (fit == 4) {                                     /* tile */
         for (int y = 0; y < H; y++)
             for (int x = 0; x < W; x++)
-                px[(size_t)y * W + x] = img.px[(size_t)(y % img.h) * img.w + (x % img.w)];
+                px[(size_t)y * W + x] = img->px[(size_t)(y % img->h) * img->w + (x % img->w)];
     } else if (fit == 3) {                              /* centre, no scaling */
-        int ox = (W - img.w) / 2, oy = (H - img.h) / 2;
+        int ox = (W - img->w) / 2, oy = (H - img->h) / 2;
         for (int y = 0; y < H; y++)
             for (int x = 0; x < W; x++) {
                 int sx = x - ox, sy = y - oy;
-                if (sx >= 0 && sy >= 0 && sx < img.w && sy < img.h) px[(size_t)y * W + x] = img.px[(size_t)sy * img.w + sx];
+                if (sx >= 0 && sy >= 0 && sx < img->w && sy < img->h) px[(size_t)y * W + x] = img->px[(size_t)sy * img->w + sx];
             }
     } else {
         int dw = W, dh = H;
         if (fit == 0 || fit == 1) {                     /* fill (cover) / fit (contain) */
-            int64_t a = (int64_t)W * img.h, b = (int64_t)H * img.w;
+            int64_t a = (int64_t)W * img->h, b = (int64_t)H * img->w;
             int wider = a > b;                          /* screen is wider than the picture */
-            if ((fit == 0) == wider) { dw = W; dh = (int)((int64_t)img.h * W / img.w); }
-            else { dh = H; dw = (int)((int64_t)img.w * H / img.h); }
+            if ((fit == 0) == wider) { dw = W; dh = (int)((int64_t)img->h * W / img->w); }
+            else { dh = H; dw = (int)((int64_t)img->w * H / img->h); }
         }
+        if (dw == W && dh == H) { image_scale(img, px, W, H); return 0; }
         size_t bytes = (size_t)dw * dh * 4;
         uint32_t *tmp = (uint32_t *)(bytes >= LARGE_ALLOC_THRESHOLD ? kmalloc_large(bytes) : kmalloc(bytes));
-        if (!tmp) { image_free(&img); snprintf(err, errn, "Out of memory"); return -1; }
-        image_scale(&img, tmp, dw, dh);
+        if (!tmp) return -1;
+        image_scale(img, tmp, dw, dh);
         int ox = (W - dw) / 2, oy = (H - dh) / 2;
         for (int y = 0; y < dh; y++) {
             int ty = y + oy;
@@ -385,8 +451,33 @@ static int wp_picture(uint32_t *px, int W, int H, char *err, size_t errn)
         }
         if (bytes >= LARGE_ALLOC_THRESHOLD) kfree_large(tmp, bytes); else kfree(tmp);
     }
-    image_free(&img);
     return 0;
+}
+
+static int wp_picture(uint32_t *px, int W, int H, char *err, size_t errn)
+{
+    char path[256];
+    setting_get("wallpaper_picture", path, sizeof(path));
+    image_t img;
+    if (!path[0] || image_load(path, &img, err, errn)) return -1;
+    int rc = wp_place(px, W, H, &img, setting_get_int("wallpaper_fit", 0), wp_solid_color());
+    image_free(&img);
+    if (rc) snprintf(err, errn, "Out of memory");
+    return rc;
+}
+
+/* A picture built into the kernel, scaled to cover the canvas. */
+static int wp_builtin(uint32_t *px, int W, int H, const uint8_t *data, const uint8_t *end)
+{
+    image_t img;
+    char err[64];
+    if (image_decode(data, (size_t)(end - data), &img, err, sizeof(err)) != 0) {
+        terminal_printf("[WALLPAPER] built-in picture: %s\n", err);
+        return -1;
+    }
+    int rc = wp_place(px, W, H, &img, 0, 0x0005060F);
+    image_free(&img);
+    return rc;
 }
 
 /* Bloom drawn into a buffer (for previews): gradient plus soft circles. */
@@ -428,6 +519,10 @@ const uint32_t *wallpaper_thumb(int style)
     if (valid[style]) return px;
     valid[style] = 1;
     switch (style) {
+    case WP_KRYZEN:
+        if (wp_builtin(px, WP_THUMB_W, WP_THUMB_H, asset_cosmos_jpg, asset_cosmos_jpg_end))
+            for (int i = 0; i < WP_THUMB_W * WP_THUMB_H; i++) px[i] = 0x000A0F2A;
+        break;
     case WP_BLOOM:     wp_bloom_buf(px, WP_THUMB_W, WP_THUMB_H); break;
     case WP_AURORA:    wp_aurora(px, WP_THUMB_W, WP_THUMB_H); break;
     case WP_MOUNTAINS: wp_mountains(px, WP_THUMB_W, WP_THUMB_H); break;
@@ -457,7 +552,7 @@ int wallpaper_style(void)
     setting_get("wallpaper_style", b, sizeof(b));
     for (int i = 0; i < WP_COUNT; i++)
         if (!strcmp(b, g_wp_names[i])) return i;
-    return WP_BLOOM;
+    return WP_KRYZEN;
 }
 
 const char *wallpaper_style_name(int i) { return i >= 0 && i < WP_COUNT ? g_wp_names[i] : ""; }
@@ -475,6 +570,11 @@ static void wallpaper_render(void)
     g_wp_error[0] = 0;
     if (theme_get_mode() == THEME_HIGH_CONTRAST && style != WP_PICTURE) style = WP_BLOOM;
     switch (style) {
+    case WP_KRYZEN:
+        /* drawn into the cache (stride == width), then shown from there */
+        if (!g_wp.cache || wp_builtin(g_wp.cache, W, H, asset_cosmos_jpg, asset_cosmos_jpg_end)) wp_bloom();
+        else fb_load_frame(g_wp.cache);
+        break;
     case WP_AURORA:    wp_aurora(px, W, H); break;
     case WP_MOUNTAINS: wp_mountains(px, W, H); break;
     case WP_DUNES:     wp_dunes(px, W, H); break;
@@ -497,14 +597,17 @@ void desktop_wallpaper_invalidate(void)
 static void wallpaper_draw(void)
 {
     int W = (int)fb_get_width(), H = (int)fb_get_height();
+    g_glass_backdrop = 0;
     if (g_wp.cache && (g_wp.cache_w != W || g_wp.cache_h != H)) {
         kfree_large(g_wp.cache, g_wp.cache_bytes);
-        g_wp.cache = NULL;
+        if (g_wp.frost) kfree_large(g_wp.frost, g_wp.cache_bytes);
+        g_wp.cache = g_wp.frost = NULL;
         g_wp.valid = 0;
     }
     if (!g_wp.cache) {
         g_wp.cache_bytes = (size_t)W * H * 4;
         g_wp.cache = (uint32_t *)kmalloc_large(g_wp.cache_bytes);
+        g_wp.frost = g_wp.cache ? (uint32_t *)kmalloc_large(g_wp.cache_bytes) : NULL;
         g_wp.cache_w = W; g_wp.cache_h = H;
     }
     fb_reset_clip();
@@ -512,15 +615,70 @@ static void wallpaper_draw(void)
     if (!g_wp.valid) {
         wallpaper_render();
         fb_save_frame(g_wp.cache);
+        if (g_wp.frost) fb_blur_frame(g_wp.cache, g_wp.frost, W, H, 28);
         g_wp.valid = 1;
         return;
     }
     fb_load_frame(g_wp.cache);
 }
 
-/* Lock and sign-in screens: the wallpaper, darkened so text stays readable. */
+/* Sign-in, setup and installer screens: the nebula backdrop. dim darkens it
+ * (0..255) so text stays readable. */
 void wallpaper_paint_backdrop(int dim)
 {
-    wallpaper_draw();
-    if (dim > 0) fb_blend_rect(0, 0, (int)fb_get_width(), (int)fb_get_height(), 0x00000000, (uint8_t)dim);
+    int W = (int)fb_get_width(), H = (int)fb_get_height();
+    fb_reset_clip();
+    g_glass_backdrop = 1;
+    if (g_bd.px && (g_bd.w != W || g_bd.h != H)) {
+        kfree_large(g_bd.px, g_bd.bytes);
+        if (g_bd.frost) kfree_large(g_bd.frost, g_bd.bytes);
+        g_bd.px = g_bd.frost = NULL;
+    }
+    if (!g_bd.px) {
+        g_bd.bytes = (size_t)W * H * 4;
+        g_bd.w = W; g_bd.h = H;
+        g_bd.px = (uint32_t *)kmalloc_large(g_bd.bytes);
+        if (g_bd.px && wp_builtin(g_bd.px, W, H, asset_nebula_jpg, asset_nebula_jpg_end) != 0) {
+            for (size_t i = 0; i < (size_t)W * H; i++) g_bd.px[i] = 0x00080B1C;
+        }
+        if (g_bd.px) {
+            g_bd.frost = (uint32_t *)kmalloc_large(g_bd.bytes);
+            if (g_bd.frost) fb_blur_frame(g_bd.px, g_bd.frost, W, H, 28);
+        }
+    }
+    if (g_bd.px && theme_get_mode() != THEME_HIGH_CONTRAST) fb_load_frame(g_bd.px);
+    else fb_clear(0x00000000);
+    if (dim > 0) fb_blend_rect(0, 0, W, H, 0x00000000, (uint8_t)dim);
+}
+
+/* ---- Glass ------------------------------------------------------------------
+ * A frosted panel: the blurred picture behind it, tinted, with a hairline
+ * edge and a faint highlight along the top. High contrast: a plain box.
+ */
+void ui_glass_tinted(int x, int y, int w, int h, int r, uint32_t tint, int tint_alpha)
+{
+    if (theme_get_mode() == THEME_HIGH_CONTRAST) {
+        fb_fill_rounded_rect(x, y, w, h, r, 0x00000000);
+        fb_draw_rounded_rect(x, y, w, h, r, 0x00FFFFFF);
+        return;
+    }
+    const uint32_t *frost = g_glass_backdrop ? g_bd.frost : g_wp.frost;
+    if (theme_get_mode() == THEME_LIGHT && !g_glass_backdrop) { tint = 0x00F2F4FA; if (tint_alpha < 190) tint_alpha = 190; }
+    if (frost) fb_blit_rounded(frost, x, y, w, h, r, tint, (uint8_t)tint_alpha);
+    else fb_blend_rounded_rect(x, y, w, h, r, tint, 235);
+    fb_blend_rect(x + r, y + 1, w - 2 * r, 1, 0x00FFFFFF, 26);
+    uint32_t edge = theme_get_mode() == THEME_LIGHT && !g_glass_backdrop ? 0x00707890 : 0x00C8D8FF;
+    fb_neon_rounded_rect(x, y, w, h, r, 1, 0, edge, edge, 58);
+}
+
+void ui_glass(int x, int y, int w, int h, int r)
+{
+    ui_glass_tinted(x, y, w, h, r, 0x00262A46, 150);
+}
+
+/* The signature cyan-to-violet outline with its glow. */
+void ui_neon_frame(int x, int y, int w, int h, int r, int thickness, int glow)
+{
+    if (theme_get_mode() == THEME_HIGH_CONTRAST) { fb_draw_rounded_rect(x, y, w, h, r, 0x00FFFF00); return; }
+    fb_neon_rounded_rect(x, y, w, h, r, thickness, glow, UI_NEON_CYAN, UI_NEON_VIOLET, 255);
 }

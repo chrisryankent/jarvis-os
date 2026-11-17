@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Notepad (apps/notepad.c)
+ * Kryzen OS — Notepad (apps/notepad.c)
  * Language: C17
  *
  * A plain-text editor.
@@ -512,7 +512,7 @@ static void dlg_load(const char *dir)
 static void open_dialog(int which)
 {
     np.dialog = which;
-    const char *start = "/jarvis/data";
+    const char *start = "/kryzen/data";
     char cur[NP_PATH_LEN];
     if (np.path[0]) {                                   /* start in the file's folder */
         snprintf(cur, sizeof(cur), "%s", np.path);
@@ -711,7 +711,7 @@ static void do_menu(int id, void *ctx)
     case M_TIMEDATE: insert_time_date(); break;
     case M_WRAP:     np.wrap = !np.wrap; np.scroll_x = 0; np.layout_dirty = 1; break;
     case M_STATUS:   np.status_bar = !np.status_bar; break;
-    case M_ABOUT:    notification_show("Notepad", "JARVIS OS Notepad: plain-text editor.", NOTIF_INFO, 4000); break;
+    case M_ABOUT:    notification_show("Notepad", "Kryzen OS Notepad: plain-text editor.", NOTIF_INFO, 4000); break;
     }
     desktop_invalidate();
 }
@@ -1353,4 +1353,111 @@ void notepad_open_file(const char *path)
     if (!np_is_open()) return;
     guard(AFTER_OPEN_PATH, path);
     desktop_invalidate();
+}
+
+/* ==========================================================================
+ * JARVIS control (kernel/ai_tools.c, tool "notepad"). Every action goes
+ * through the same editing and saving code as the keyboard, so the window
+ * shows exactly what happened, Undo works, and the reply describes the real
+ * result (the file that was written, the title now shown).
+ *
+ *   type     insert text at the caret          write   replace the whole text
+ *   append   add text at the end               read    the document's text
+ *   save     save (path needed when Untitled)  save_as save under a new name
+ *   new      empty document (unsaved changes are kept unless discard)
+ *   undo / redo / select_all / clear / close / status
+ * ========================================================================== */
+static void np_ai_status(char *out, size_t n)
+{
+    int line, col;
+    line_col(np.caret, &line, &col);
+    snprintf(out, n, "Notepad: %s%s, %u characters, caret at line %d.%s", np.path[0] ? np.path : "Untitled",
+             np.modified ? " (unsaved changes)" : " (saved)", (unsigned)np.len, line,
+             np.dialog == DLG_UNSAVED ? " It is asking whether to save the changes." :
+             np.dialog == DLG_SAVEAS ? " The Save As dialog is open." : "");
+}
+
+int notepad_ai(const char *action, const char *text, const char *path, int discard, char *out, size_t n)
+{
+    out[0] = 0;
+    if (!np_is_open()) desktop_app_launch(desktop_app_find("Notepad"));
+    if (!np_is_open()) { snprintf(out, n, "error: Notepad could not be opened"); return -1; }
+    wm_set_focused(np.window);
+    int tl = text ? (int)strlen(text) : 0;
+    int rc = 0;
+
+    if (!strcmp(action, "type") || !strcmp(action, "insert")) {
+        if (!tl) { snprintf(out, n, "error: give the text to type"); return -1; }
+        replace_selection(text, tl);
+    } else if (!strcmp(action, "append")) {
+        if (!tl) { snprintf(out, n, "error: give the text to add"); return -1; }
+        int at = (int)np.len;
+        if (at && np.text[at - 1] != '\n' && text[0] != '\n') edit(at, 0, "\n", 1), at++;
+        edit(at, 0, text, tl);
+    } else if (!strcmp(action, "write") || !strcmp(action, "replace_all")) {
+        edit(0, (int)np.len, text ? text : "", tl);
+    } else if (!strcmp(action, "clear")) {
+        edit(0, (int)np.len, "", 0);
+    } else if (!strcmp(action, "select_all")) {
+        np.anchor = 0; np.caret = (int)np.len;
+    } else if (!strcmp(action, "undo")) {
+        undo();
+    } else if (!strcmp(action, "redo")) {
+        redo();
+    } else if (!strcmp(action, "read")) {
+        size_t k = (size_t)snprintf(out, n, "%s:\n", np.path[0] ? np.path : "Untitled (not saved yet)");
+        size_t take = np.len < n - k - 1 ? np.len : n - k - 1;
+        if (k < n) { memcpy(out + k, np.text, take); out[k + take] = 0; }
+        if (!np.len) snprintf(out + k, n - k, "(the document is empty)");
+        desktop_invalidate();
+        return 0;
+    } else if (!strcmp(action, "save") || !strcmp(action, "save_as")) {
+        int as = !strcmp(action, "save_as") || !np.path[0] || np.read_only;
+        if (as && (!path || !path[0])) {
+            snprintf(out, n, "error: the document has no name yet; say what to call it (save_as with a path)");
+            return -1;
+        }
+        char p[NP_PATH_LEN];
+        snprintf(p, sizeof(p), "%s", as ? path : np.path);
+        if (as && !strchr(strrchr(p, '/') ? strrchr(p, '/') : p, '.') && strlen(p) + 4 < sizeof(p)) memcpy(p + strlen(p), ".txt", 5);
+        if (np.dialog == DLG_SAVEAS || np.dialog == DLG_UNSAVED) np.dialog = DLG_NONE;
+        rc = save_to(p);
+        if (rc) { snprintf(out, n, "error: Notepad could not save %s (read-only drive, protected folder or disk full)", p); return -1; }
+        snprintf(out, n, "Saved %s (%u characters). Notepad now shows \"%s\".", np.path, (unsigned)np.len, doc_name());
+        desktop_invalidate();
+        return 0;
+    } else if (!strcmp(action, "new")) {
+        if (np.modified && np.len && !discard) {
+            snprintf(out, n, "error: the current document has unsaved changes; save it first, or ask the user whether to discard them");
+            return -1;
+        }
+        np.dialog = DLG_NONE;
+        reset_doc(); update_title();
+    } else if (!strcmp(action, "open")) {
+        if (!path || !path[0] || !vfs_exists(path) || vfs_is_dir(path)) { snprintf(out, n, "error: no file %s", path ? path : ""); return -1; }
+        if (np.modified && np.len && !discard) {
+            snprintf(out, n, "error: the current document has unsaved changes; save it first, or ask the user whether to discard them");
+            return -1;
+        }
+        np.dialog = DLG_NONE;
+        if (load_file(path)) { snprintf(out, n, "error: %s could not be opened (not a text file?)", path); return -1; }
+    } else if (!strcmp(action, "close")) {
+        if (np.modified && np.len && !discard) {
+            snprintf(out, n, "error: the document has unsaved changes; save it first, or ask the user whether to discard them");
+            return -1;
+        }
+        np.modified = 0;
+        wm_close_window(np.window);
+        snprintf(out, n, "Closed Notepad.");
+        desktop_invalidate();
+        return 0;
+    } else if (strcmp(action, "status")) {
+        snprintf(out, n, "error: unknown Notepad action %s (type, append, write, read, save, save_as, new, open, undo, redo, select_all, clear, close, status)", action);
+        return -1;
+    }
+    np.layout_dirty = 1;
+    update_title();
+    desktop_invalidate();
+    np_ai_status(out, n);
+    return rc;
 }

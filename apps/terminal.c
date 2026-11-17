@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Terminal (apps/terminal.c)
+ * Kryzen OS — Terminal (apps/terminal.c)
  * Language: C17
  *
  * The window around the shell (apps/shell.c): scrollback with a coloured
@@ -19,13 +19,13 @@
 #define TERM_LINES      600
 #define TERM_COLS_MAX   200
 #define HISTORY_MAX     200
-#define TERM_BG         0x000C0F14
-#define TERM_FG         0x00D0D4DA
-#define TERM_ERR        0x00FF7A7A
-#define TERM_USER       0x0058E06A
-#define TERM_PATH       0x005AA8FF
-#define TERM_SEL        0x00264F78
-#define HISTORY_FILE    "/jarvis/data/.jsh_history"
+#define TERM_BG         0x000A0E14
+#define TERM_FG         0x00DFE2EB
+#define TERM_ERR        0x00FF5F56
+#define TERM_USER       0x004CD7F6
+#define TERM_PATH       0x008083FF
+#define TERM_SEL        0x00182352
+#define HISTORY_FILE    "/kryzen/data/.jsh_history"
 
 int  shell_execute(const char *line);
 void shell_prompt(char *out, size_t n);
@@ -66,8 +66,11 @@ static char *term_line(int i)
 }
 static int term_slot(int i) { return (g_terminal.first + i) % TERM_LINES; }
 
+static uint32_t g_term_total;      /* lines ever started: marks output for JARVIS */
+
 static void term_newline(void)
 {
+    g_term_total++;
     if (g_terminal.count < TERM_LINES) g_terminal.count++;
     else g_terminal.first = (g_terminal.first + 1) % TERM_LINES;
     int s = term_slot(g_terminal.count - 1);
@@ -122,6 +125,8 @@ void terminal_app_write_err(const char *text)
 /* ---- History ------------------------------------------------------------- */
 static void history_push(const char *cmd, int save)
 {
+    /* never keep a line that carries a password */
+    if (!strncmp(cmd, "passwd", 6) || !strncmp(cmd, "useradd", 7) || !strncmp(cmd, "adduser", 7)) return;
     if (!*cmd) return;
     if (g_terminal.history_count > 0 &&
         !strcmp(g_terminal.history[(g_terminal.history_count - 1) % HISTORY_MAX], cmd))
@@ -596,9 +601,44 @@ wm_window_t *terminal_app_open(int x, int y, int w, int h)
     win->icon = ICON_TERMINAL;
     g_terminal.window = win;
 
-    terminal_app_write("JARVIS OS Terminal. Type 'help' for commands, 'help <command>' for details.\n");
+    terminal_app_write(
+        "  ██╗  ██╗██████╗ ██╗   ██╗███████╗███████╗███╗   ██╗\\n"
+        "  ██║ ██╔╝██╔══██╗╚██╗ ██╔╝╚══███╔╝██╔════╝████╗  ██║   Host: Kryzen OS 2026\\n"
+        "  █████╔╝ ██████╔╝ ╚████╔╝   ███╔╝ █████╗  ██╔██╗ ██║   Kernel: 6.12.8-kryzen #1 PREEMPT\\n"
+        "  ██╔═██╗ ██╔══██╗  ╚██╔╝   ███╔╝  ██╔══╝  ██║╚██╗██║   Neural Engine: Dual NPU (84 TOPS)\\n"
+        "  ██║  ██╗██║  ██║   ██║   ███████╗███████╗██║ ╚████║   Shell: zsh 5.9 + eBPF Sandbox\\n"
+        "  ╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   ╚══════╝╚══════╝╚═╝  ╚═══╝   Model: Local DeepSeek-Kryzen (FP16)\\n"
+        "  ─────────── by Chris Ryan Kent ──────────────────────\\n"
+        "  ● kryzen-ai-daemon.service - Kryzen Neural IPC Daemon (running @ 142 t/s)\\n\\n"
+    );
     char t[96];
-    snprintf(t, sizeof(t), "Terminal - %s", shell_cwd());
+    snprintf(t, sizeof(t), "zsh: %s (WSL3: x86_64)", shell_cwd());
     wm_set_title(win, t);
     return win;
 }
+
+/* ---- JARVIS (kernel/ai_tools.c, tool "terminal") --------------------------
+ * A mark before a command, then the text written after it: what the user
+ * sees in the window, so the reply never claims output that is not there. */
+uint32_t terminal_ai_mark(void) { return g_term_total; }
+
+void terminal_ai_since(uint32_t mark, char *out, size_t n)
+{
+    size_t k = 0;
+    out[0] = 0;
+    uint32_t newer = g_term_total - mark;               /* lines started since the mark */
+    int first = g_terminal.count - 1 - (int)newer;
+    if (first < 0) first = 0;
+    for (int i = first; i < g_terminal.count && k + 2 < n; i++) {
+        const char *l = term_line(i);
+        size_t ll = strlen(l);
+        if (ll > n - k - 2) ll = n - k - 2;
+        memcpy(out + k, l, ll);
+        k += ll;
+        out[k++] = '\n';
+    }
+    while (k && (out[k - 1] == '\n' || out[k - 1] == ' ')) k--;
+    out[k] = 0;
+}
+
+int terminal_ai_is_open(void) { return g_terminal.window != NULL; }

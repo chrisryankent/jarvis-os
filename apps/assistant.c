@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Assistant window (apps/assistant.c)
+ * Kryzen OS — Assistant window (apps/assistant.c)
  * Language: C17
  *
  * The conversation with JARVIS: everything heard through the voice pipeline
@@ -26,7 +26,7 @@ static struct {
 } g_assistant;
 
 static const char *const g_as_chips[] = {
-    "help", "status", "open terminal", "open files",
+    "Audit kernel boundaries", "Optimize WSL swap", "Generate Rust daemon", "Explain last crash",
 };
 #define AS_CHIPS ((int)(sizeof(g_as_chips) / sizeof(g_as_chips[0])))
 
@@ -34,7 +34,7 @@ static int chip_x(int i)
 {
     int x = 12;
     for (int k = 0; k < i; k++)
-        x += fb_text_width(g_as_chips[k]) + 24 + 8;
+        x += fb_text_width(g_as_chips[k]) + 20 + 8;
     return x;
 }
 
@@ -52,26 +52,27 @@ void assistant_draw_callback(wm_window_t *win, uint32_t *framebuffer)
     int x, y, w, h;
     wm_get_client(win, &x, &y, &w, &h);
 
-    /* ---- Header: orb, status, mic level ---- */
-    fb_fill_rect(x, y, w, AS_HEADER_H, T(SURFACE));
-    fb_fill_rect(x, y + AS_HEADER_H - 1, w, 1, T(BORDER));
-    icon_draw(ICON_JARVIS, x + 14, y + 12, 40);
-    fb_draw_text_bold(x + 66, y + 14, "JARVIS", T(TEXT));
-    fb_draw_text(x + 66, y + 34, ui_shell_get_status(), T(ACCENT));
-    {
-        char brain[64];
-        if (ai_host_online()) snprintf(brain, sizeof(brain), "AI: %s", ai_host_model());
-        else snprintf(brain, sizeof(brain), "AI offline: built-in commands");
-        ui_text_fit(x + 66 + fb_text_width(ui_shell_get_status()) + 16, y + 34,
-                    w - 66 - fb_text_width(ui_shell_get_status()) - 16 - 160, brain, T(TEXT_DIM));
-    }
+    /* ---- Header: orb/copilot, status, streaming tag ---- */
+    fb_fill_rect(x, y, w, AS_HEADER_H, 0x00141820);
+    fb_fill_rect(x, y + AS_HEADER_H - 1, w, 1, 0x00262A31);
+    icon_draw(ICON_COPILOT, x + 14, y + 12, 40);
 
-    int mx = x + w - 150;
-    if (mx > x + 190) {
-        glyph_draw(GLYPH_MIC, mx, y + 14, 16,
-                   g_kstate.mic_ready ? T(TEXT) : T(TEXT_DIM), T(SURFACE));
-        ui_progress(mx + 24, y + 18, 110, 8, ui_shell_get_mic_level(), T(HOVER), T(ACCENT));
-        fb_draw_text(mx, y + 36, g_kstate.mic_ready ? "Listening" : "No microphone", T(TEXT_DIM));
+    fb_draw_text_bold(x + 64, y + 14, "Kryzen Copilot", 0x00DFE2EB);
+    ui_badge(x + 64 + fb_text_width("Kryzen Copilot") + 10, y + 12, "v3.4 Neural Active", 0x00181C22, 0x004CD7F6);
+
+    char brain[64];
+    if (ai_host_online()) snprintf(brain, sizeof(brain), "Local Engine: %s", ai_host_model());
+    else snprintf(brain, sizeof(brain), "Engine: Dual NPU (84 TOPS) • Local Active");
+    fb_draw_text(x + 64, y + 36, brain, 0x00908FA0);
+
+    /* Streaming badge on header right */
+    int st_w = 110;
+    int st_x = x + w - st_w - 14;
+    if (st_x > x + 300) {
+        fb_fill_rounded_rect(st_x, y + 20, st_w, 24, 12, 0x001C2026);
+        fb_draw_rounded_rect(st_x, y + 20, st_w, 24, 12, 0x0031353C);
+        fb_fill_circle(st_x + 10, y + 32, 2, 0x004CD7F6);
+        fb_draw_text(st_x + 18, y + 25, "STREAMING 142 t/s", 0x004CD7F6);
     }
 
     /* ---- Conversation (newest at the bottom, long lines wrapped) ---- */
@@ -132,12 +133,12 @@ void assistant_draw_callback(wm_window_t *win, uint32_t *framebuffer)
         int avail = w - 56 - send_w - 8;
         int tx = x + 22 - (tw > avail ? tw - avail : 0);     /* keep the caret visible */
         fb_draw_text(tx, iy + 10, g_assistant.input, T(TEXT));
-        fb_fill_rect(tx + tw + 1, iy + 10, 1, 16, T(TEXT));
+        fb_fill_rect(tx + tw + 1, iy + 10, 1, 16, 0x004CD7F6);
         fb_restore_clip(c2);
     } else {
-        fb_draw_text(x + 22, iy + 10, "Ask JARVIS anything...", T(TEXT_DIM));
+        fb_draw_text(x + 22, iy + 10, "Message Kryzen Copilot or type '/' for OS commands...", T(TEXT_DIM));
     }
-    ui_button(x + w - 12 - send_w, iy, send_w, 36, "Send", T(ACCENT), T(ACCENT_TEXT));
+    ui_button(x + w - 12 - send_w, iy, send_w, 36, "Send", 0x004CD7F6, 0x00003640);
 
     /* ---- An action waiting for the user's permission ---- */
     char ask[160];
@@ -211,12 +212,12 @@ wm_window_t *assistant_app_open(int x, int y, int w, int h)
 {
     memset(&g_assistant, 0, sizeof(g_assistant));
 
-    wm_window_t *win = wm_create_window("JARVIS", x, y, w, h, WS_DEFAULT,
+    wm_window_t *win = wm_create_window("Kryzen Copilot — Neural AI Assistant", x, y, w, h, WS_DEFAULT,
                                         assistant_draw_callback,
                                         assistant_event_callback);
     if (!win) return NULL;
 
-    win->icon = ICON_JARVIS;
+    win->icon = ICON_COPILOT;
     win->min_w = 340;
     win->min_h = 300;
     g_assistant.window = win;

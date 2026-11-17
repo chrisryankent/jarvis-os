@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Window Manager Implementation (wm/wm.c)
+ * Kryzen OS — Window Manager Implementation (wm/wm.c)
  * Language: C17
  *
  * Window list / z-order, focus, move + resize dragging, snapping, and input

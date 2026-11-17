@@ -15,6 +15,7 @@
 
 #include "../kernel/kernel.h"
 #include "gpu.h"
+#include <string.h>
 
 static void fb_setup_backbuffer(void);
 
@@ -574,10 +575,57 @@ static void draw_glyph(const font_face_t *f, const font_glyph_t *g, int x, int y
     }
 }
 
+/* ---- Text capture (screen reading) ----------------------------------------
+ * While a capture is active every visible text run drawn is recorded with
+ * its position, so JARVIS can read any window and click a labelled control
+ * without each app describing itself (kernel/ai_tools.c: read_window,
+ * click). Only text inside the current clip rectangle counts: what was
+ * scrolled away or covered by the clip is not on screen. */
+static fb_text_item_t *g_cap;
+static int g_cap_max, g_cap_n;
+
+void fb_capture_begin(fb_text_item_t *items, int max) { g_cap = items; g_cap_max = max; g_cap_n = 0; }
+int  fb_capture_end(void) { g_cap = NULL; return g_cap_n; }
+
+static void cap_record(int x, int y, int w, int h, const char *s, int n)
+{
+    if (!g_cap || n <= 0 || g_cap_n >= g_cap_max) return;
+    if (x >= g_clip.x1 || y >= g_clip.y1 || x + w <= g_clip.x0 || y + h <= g_clip.y0) return;
+    int blank = 1;
+    for (int i = 0; i < n; i++) if (s[i] != ' ') { blank = 0; break; }
+    if (blank) return;
+    /* characters drawn one by one (fb_draw_char) join the previous run */
+    if (g_cap_n) {
+        fb_text_item_t *p = &g_cap[g_cap_n - 1];
+        int pl = (int)strlen(p->text);
+        if (p->y == y && x >= p->x + p->w - 1 && x <= p->x + p->w + 9 && pl + n + 1 < (int)sizeof(p->text)) {
+            if (x > p->x + p->w + 3) p->text[pl++] = ' ';
+            memcpy(p->text + pl, s, (size_t)n);
+            p->text[pl + n] = 0;
+            p->w = x + w - p->x;
+            return;
+        }
+    }
+    fb_text_item_t *it = &g_cap[g_cap_n++];
+    it->x = x; it->y = y; it->w = w; it->h = h;
+    if (n > (int)sizeof(it->text) - 1) n = (int)sizeof(it->text) - 1;
+    memcpy(it->text, s, (size_t)n);
+    it->text[n] = 0;
+}
+
 int fb_text_n(int px, int py, const char *str, int n, uint32_t fg, int font)
 {
     if (!str || font < 0 || font >= FONT_COUNT) return px;
     const font_face_t *f = &g_font_faces[font];
+    if (g_cap) {
+        int len = 0, start = 0, y = py;
+        for (; (n < 0 || len < n) && str[len]; len++)
+            if (str[len] == '\n') {
+                cap_record(px, y, fb_text_width_n_font(str + start, len - start, font), f->cell, str + start, len - start);
+                start = len + 1; y += f->cell;
+            }
+        cap_record(px, y, fb_text_width_n_font(str + start, len - start, font), f->cell, str + start, len - start);
+    }
     int pen = px * 64;
     for (int i = 0; (n < 0 || i < n) && str[i]; i++) {
         unsigned char c = (unsigned char)str[i];
@@ -629,6 +677,7 @@ int fb_text_index_at(const char *str, int dx, int font)
 void fb_draw_char(int px, int py, char c, uint32_t fg)
 {
     const font_face_t *f = &g_font_faces[FONT_MONO];
+    if (g_cap) cap_record(px, py, 8, f->cell, &c, 1);
     draw_glyph(f, glyph_of(f, (unsigned char)c), px, py, fg);
 }
 
@@ -881,3 +930,315 @@ int fb_set_mode(int w, int h)
 uint32_t fb_get_width(void)  { return g_fb.width;  }
 uint32_t fb_get_height(void) { return g_fb.height; }
 uint32_t *fb_get_base(void)  { return g_draw; }
+
+/* ==========================================================================
+ * Effects: frosted glass, neon outlines, glows, anti-aliased strokes
+ *
+ * All integer maths (distances in 1/16 pixel), so they stay cheap on a CPU
+ * without hardware floating point acceleration and inside an emulator.
+ * ========================================================================== */
+static uint32_t fx_isqrt(uint32_t v)
+{
+    uint32_t r = 0, bit = 1u << 30;
+    while (bit > v) bit >>= 2;
+    while (bit) {
+        if (v >= r + bit) { v -= r + bit; r = (r >> 1) + bit; }
+        else r >>= 1;
+        bit >>= 2;
+    }
+    return r;
+}
+
+static inline uint32_t fx_lerp(uint32_t a, uint32_t b, int t, int max)
+{
+    if (max <= 0 || t <= 0) return a;
+    if (t >= max) return b;
+    return blend_px(b, a, (uint32_t)(t * 255 / max));
+}
+
+/* Signed distance (1/16 px, negative inside) from a pixel centre to a
+ * rounded rectangle at the origin. */
+static inline int fx_rr_dist(int px, int py, int w, int h, int r)
+{
+    int cx = w * 8, cy = h * 8;                    /* centre, 1/16 px */
+    int ax = px * 16 + 8 - cx, ay = py * 16 + 8 - cy;
+    if (ax < 0) ax = -ax;
+    if (ay < 0) ay = -ay;
+    int qx = ax - (cx - r * 16), qy = ay - (cy - r * 16);
+    if (qx > 0 && qy > 0) return (int)fx_isqrt((uint32_t)(qx * qx + qy * qy)) - r * 16;
+    return (qx > qy ? qx : qy) - r * 16;
+}
+
+void fb_gradient_h(int x, int y, int w, int h, uint32_t left, uint32_t right)
+{
+    for (int i = 0; i < w; i++)
+        fb_fill_rect(x + i, y, 1, h, fx_lerp(left, right, i, w - 1));
+}
+
+/* Rounded rectangle filled with a left-to-right gradient. */
+void fb_fill_rounded_rect_grad(int x, int y, int w, int h, int r,
+                               uint32_t left, uint32_t right, uint8_t alpha)
+{
+    if (w <= 0 || h <= 0 || !alpha) return;
+    if (r * 2 > w) r = w / 2;
+    if (r * 2 > h) r = h / 2;
+    for (int j = 0; j < h; j++) {
+        int cj = j < r ? j : (j >= h - r ? h - 1 - j : -1);
+        for (int i = 0; i < w; i++) {
+            int ci = i < r ? i : (i >= w - r ? w - 1 - i : -1);
+            int cov = (cj >= 0 && ci >= 0) ? corner_cov(ci, cj, r) : 16;
+            if (!cov) continue;
+            fb_blend_pixel(x + i, y + j, fx_lerp(left, right, i, w - 1), (uint8_t)((uint32_t)alpha * cov / 16));
+        }
+    }
+}
+
+/* Copies a rounded rectangle out of a frame-sized picture (for example the
+ * blurred wallpaper), tinted: the body of a frosted-glass panel. */
+void fb_blit_rounded(const uint32_t *src, int x, int y, int w, int h, int r,
+                     uint32_t tint, uint8_t tint_alpha)
+{
+    if (!src || !g_draw || w <= 0 || h <= 0) return;
+    if (r * 2 > w) r = w / 2;
+    if (r * 2 > h) r = h / 2;
+    int W = (int)g_fb.width, H = (int)g_fb.height;
+    for (int j = 0; j < h; j++) {
+        int py = y + j;
+        if (py < g_clip.y0 || py >= g_clip.y1 || py < 0 || py >= H) continue;
+        int cj = j < r ? j : (j >= h - r ? h - 1 - j : -1);
+        const uint32_t *s = src + (size_t)py * W;
+        uint32_t *d = g_draw + (size_t)py * g_stride;
+        for (int i = 0; i < w; i++) {
+            int px = x + i;
+            if (px < g_clip.x0 || px >= g_clip.x1 || px < 0 || px >= W) continue;
+            uint32_t c = tint_alpha ? blend_px(tint, s[px], tint_alpha) : (s[px] & 0x00FFFFFF);
+            if (cj >= 0) {
+                int ci = i < r ? i : (i >= w - r ? w - 1 - i : -1);
+                if (ci >= 0) {
+                    int cov = corner_cov(ci, cj, r);
+                    if (!cov) continue;
+                    if (cov < 16) c = blend_px(c, d[px], (uint32_t)cov * 255 / 16);
+                }
+            }
+            d[px] = c;
+        }
+    }
+}
+
+/* Rounded outline in a left-to-right gradient, `thickness` px wide, with an
+ * optional soft glow of `glow` px on both sides. Only the border band is
+ * visited, so large panels stay cheap. */
+void fb_neon_rounded_rect(int x, int y, int w, int h, int r, int thickness, int glow,
+                          uint32_t left, uint32_t right, uint8_t alpha)
+{
+    if (w <= 0 || h <= 0 || !alpha) return;
+    if (r * 2 > w) r = w / 2;
+    if (r * 2 > h) r = h / 2;
+    if (thickness < 1) thickness = 1;
+    int t16 = thickness * 16, g16 = glow * 16;
+    int band = thickness + glow + 1;                /* inside reach of the effect */
+    int edge = r > band ? r : band;
+    for (int j = -glow; j < h + glow; j++) {
+        int py = y + j;
+        if (py < g_clip.y0 || py >= g_clip.y1) continue;
+        int middle = j >= edge && j < h - edge;     /* only the two side bands */
+        for (int i = -glow; i < w + glow; i++) {
+            if (middle && i == band) { i = w - band - 1; continue; }
+            int px = x + i;
+            if (px < g_clip.x0 || px >= g_clip.x1) continue;
+            int d = fx_rr_dist(i, j, w, h, r);
+            int a = 0;
+            if (d <= 8 && d >= -t16 - 8) {          /* the line, 1 px soft edges */
+                int in = d + t16 + 8, out = 8 - d;
+                int c = in < out ? in : out;
+                a = c >= 16 ? 255 : c <= 0 ? 0 : c * 255 / 16;
+            }
+            if (glow && a < 255) {
+                int gd = d > 0 ? d : (-d - t16);    /* distance from the line */
+                if (gd < 0) gd = 0;
+                if (gd < g16) {
+                    int k = (g16 - gd) * 255 / g16;
+                    int ga = k * k / 255 * (d > 0 ? 150 : 90) / 255;
+                    if (ga > a) a = ga;
+                }
+            }
+            if (a <= 0) continue;
+            fb_blend_pixel(px, py, fx_lerp(left, right, i, w - 1), (uint8_t)((uint32_t)a * alpha / 255));
+        }
+    }
+}
+
+/* Soft disc: solid up to radius r, fading out over `spread` px. */
+void fb_glow_circle(int cx, int cy, int r, int spread, uint32_t color, uint8_t alpha)
+{
+    int R = r + spread;
+    if (R <= 0 || !alpha) return;
+    for (int j = -R; j <= R; j++) {
+        if (cy + j < g_clip.y0 || cy + j >= g_clip.y1) continue;
+        for (int i = -R; i <= R; i++) {
+            int d16 = (int)fx_isqrt((uint32_t)((i * i + j * j) * 256));
+            int k;
+            if (d16 <= r * 16) k = 255;
+            else if (d16 >= R * 16 || !spread) continue;
+            else { k = (R * 16 - d16) * 255 / (spread * 16); k = k * k / 255; }
+            fb_blend_pixel(cx + i, cy + j, color, (uint8_t)((uint32_t)k * alpha / 255));
+        }
+    }
+}
+
+static const int16_t g_fx_sin[91] = {       /* sin(0..90 deg) * 1024 */
+    0,18,36,54,71,89,107,125,143,160,178,195,213,230,248,265,282,299,316,333,350,367,384,400,416,433,
+    449,465,481,496,512,527,543,558,573,587,602,616,630,644,658,672,685,698,711,724,737,749,761,773,
+    784,796,807,818,828,839,849,859,868,878,887,896,904,912,920,928,935,943,949,956,962,968,974,979,
+    984,989,994,998,1002,1005,1008,1011,1014,1016,1018,1020,1022,1023,1023,1024,1024
+};
+
+int fb_sin1024(int deg)
+{
+    deg %= 360;
+    if (deg < 0) deg += 360;
+    if (deg <= 90) return g_fx_sin[deg];
+    if (deg <= 180) return g_fx_sin[180 - deg];
+    if (deg <= 270) return -g_fx_sin[deg - 180];
+    return -g_fx_sin[360 - deg];
+}
+int fb_cos1024(int deg) { return fb_sin1024(deg + 90); }
+
+/* Arc of a circle: angles in degrees, clockwise from 3 o'clock (screen
+ * coordinates). sweep 360 draws the whole ring. */
+void fb_draw_arc(int cx, int cy, int r, int thickness, int start_deg, int sweep_deg,
+                 uint32_t color, uint8_t alpha)
+{
+    if (r <= 0 || !alpha || sweep_deg <= 0) return;
+    int full = sweep_deg >= 360;
+    int sx = fb_cos1024(start_deg), sy = fb_sin1024(start_deg);
+    int ex = fb_cos1024(start_deg + sweep_deg), ey = fb_sin1024(start_deg + sweep_deg);
+    int ro16 = r * 16, ri16 = (r - thickness) * 16;
+    for (int j = -r - 1; j <= r + 1; j++) {
+        if (cy + j < g_clip.y0 || cy + j >= g_clip.y1) continue;
+        for (int i = -r - 1; i <= r + 1; i++) {
+            int d16 = (int)fx_isqrt((uint32_t)((i * i + j * j) * 256));
+            int in = d16 - ri16 + 8, out = ro16 - d16 + 8;
+            int c = in < out ? in : out;
+            if (c <= 0) continue;
+            if (!full) {
+                int c1 = sx * j - sy * i;           /* at or past the start */
+                int c2 = i * ey - j * ex;           /* before the end */
+                int ok = sweep_deg <= 180 ? (c1 >= 0 && c2 >= 0) : (c1 >= 0 || c2 >= 0);
+                if (!ok) continue;
+            }
+            int a = c >= 16 ? 255 : c * 255 / 16;
+            fb_blend_pixel(cx + i, cy + j, color, (uint8_t)((uint32_t)a * alpha / 255));
+        }
+    }
+}
+
+/* Anti-aliased stroke with round ends. Coordinates and width in 1/16 px;
+ * the colour runs from `top` at gy0 to `bottom` at gy1 (pixels). */
+void fb_stroke16(int x0, int y0, int x1, int y1, int width16,
+                 uint32_t top, uint32_t bottom, int gy0, int gy1, uint8_t alpha)
+{
+    int half = width16 / 2;
+    int minx = ((x0 < x1 ? x0 : x1) - half) / 16 - 1, maxx = ((x0 > x1 ? x0 : x1) + half) / 16 + 1;
+    int miny = ((y0 < y1 ? y0 : y1) - half) / 16 - 1, maxy = ((y0 > y1 ? y0 : y1) + half) / 16 + 1;
+    int64_t dx = x1 - x0, dy = y1 - y0, len2 = dx * dx + dy * dy;
+    for (int py = miny; py <= maxy; py++) {
+        if (py < g_clip.y0 || py >= g_clip.y1) continue;
+        uint32_t col = gy1 > gy0 ? fx_lerp(top, bottom, py - gy0, gy1 - gy0) : top;
+        for (int px = minx; px <= maxx; px++) {
+            int64_t vx = px * 16 + 8 - x0, vy = py * 16 + 8 - y0;
+            int64_t t = len2 ? (vx * dx + vy * dy) : 0;
+            int64_t qx, qy;
+            if (t <= 0) { qx = vx; qy = vy; }
+            else if (t >= len2) { qx = vx - dx; qy = vy - dy; }
+            else { qx = vx - dx * t / len2; qy = vy - dy * t / len2; }
+            int d = (int)fx_isqrt((uint32_t)(qx * qx + qy * qy));
+            int c = half - d + 8;
+            if (c <= 0) continue;
+            int a = c >= 16 ? 255 : c * 255 / 16;
+            fb_blend_pixel(px, py, col, (uint8_t)((uint32_t)a * alpha / 255));
+        }
+    }
+}
+
+void fb_draw_line_aa(int x0, int y0, int x1, int y1, int width, uint32_t color, uint8_t alpha)
+{
+    fb_stroke16(x0 * 16 + 8, y0 * 16 + 8, x1 * 16 + 8, y1 * 16 + 8, width * 16, color, color, 0, 0, alpha);
+}
+
+/* Blurs a frame-sized picture into dst (same size): quarter-resolution box
+ * blur, three passes, scaled back up. Used once per wallpaper for glass. */
+void fb_blur_frame(const uint32_t *src, uint32_t *dst, int w, int h, int radius)
+{
+    int sw = (w + 3) / 4, sh = (h + 3) / 4;
+    size_t bytes = (size_t)sw * sh * 4;
+    uint32_t *a = (uint32_t *)kmalloc_large(bytes), *b = (uint32_t *)kmalloc_large(bytes);
+    if (!a || !b) {
+        if (a) kfree_large(a, bytes);
+        if (b) kfree_large(b, bytes);
+        for (size_t i = 0; i < (size_t)w * h; i++) dst[i] = src[i];
+        return;
+    }
+    for (int y = 0; y < sh; y++)                    /* 4x4 average */
+        for (int x = 0; x < sw; x++) {
+            uint32_t r = 0, g = 0, bl = 0, n = 0;
+            for (int j = 0; j < 4; j++) {
+                int yy = y * 4 + j;
+                if (yy >= h) break;
+                for (int i = 0; i < 4; i++) {
+                    int xx = x * 4 + i;
+                    if (xx >= w) break;
+                    uint32_t p = src[(size_t)yy * w + xx];
+                    r += (p >> 16) & 255; g += (p >> 8) & 255; bl += p & 255; n++;
+                }
+            }
+            a[(size_t)y * sw + x] = ((r / n) << 16) | ((g / n) << 8) | (bl / n);
+        }
+    int rad = radius / 4;
+    if (rad < 1) rad = 1;
+    for (int pass = 0; pass < 3; pass++) {
+        for (int y = 0; y < sh; y++)                /* horizontal: a -> b */
+            for (int x = 0; x < sw; x++) {
+                uint32_t r = 0, g = 0, bl = 0, n = 0;
+                for (int k = -rad; k <= rad; k++) {
+                    int xx = x + k;
+                    if (xx < 0) xx = 0;
+                    if (xx >= sw) xx = sw - 1;
+                    uint32_t p = a[(size_t)y * sw + xx];
+                    r += (p >> 16) & 255; g += (p >> 8) & 255; bl += p & 255; n++;
+                }
+                b[(size_t)y * sw + x] = ((r / n) << 16) | ((g / n) << 8) | (bl / n);
+            }
+        for (int y = 0; y < sh; y++)                /* vertical: b -> a */
+            for (int x = 0; x < sw; x++) {
+                uint32_t r = 0, g = 0, bl = 0, n = 0;
+                for (int k = -rad; k <= rad; k++) {
+                    int yy = y + k;
+                    if (yy < 0) yy = 0;
+                    if (yy >= sh) yy = sh - 1;
+                    uint32_t p = b[(size_t)yy * sw + x];
+                    r += (p >> 16) & 255; g += (p >> 8) & 255; bl += p & 255; n++;
+                }
+                a[(size_t)y * sw + x] = ((r / n) << 16) | ((g / n) << 8) | (bl / n);
+            }
+    }
+    for (int y = 0; y < h; y++) {                   /* bilinear back up */
+        int fy = y * 256 / 4 - 96;
+        if (fy < 0) fy = 0;
+        int y0 = fy >> 8, wy = fy & 255;
+        int y1 = y0 + 1 < sh ? y0 + 1 : sh - 1;
+        if (y0 >= sh) y0 = sh - 1;
+        for (int x = 0; x < w; x++) {
+            int fx = x * 256 / 4 - 96;
+            if (fx < 0) fx = 0;
+            int x0 = fx >> 8, wx = fx & 255;
+            int x1 = x0 + 1 < sw ? x0 + 1 : sw - 1;
+            if (x0 >= sw) x0 = sw - 1;
+            uint32_t top = blend_px(a[(size_t)y0 * sw + x1], a[(size_t)y0 * sw + x0], (uint32_t)wx);
+            uint32_t bot = blend_px(a[(size_t)y1 * sw + x1], a[(size_t)y1 * sw + x0], (uint32_t)wx);
+            dst[(size_t)y * w + x] = blend_px(bot, top, (uint32_t)wy);
+        }
+    }
+    kfree_large(a, bytes);
+    kfree_large(b, bytes);
+}

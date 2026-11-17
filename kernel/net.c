@@ -915,7 +915,7 @@ static void cmd_http(char *args)
     if (file && *file) {
         char path[160];
         if (file[0] == '/') snprintf(path, sizeof(path), "%s", file);
-        else                snprintf(path, sizeof(path), "/jarvis/data/%s", file);
+        else                snprintf(path, sizeof(path), "/kryzen/data/%s", file);
         int rc = vfs_write_file(path, body, blen);
         snprintf(line, sizeof(line), rc == 0 ? "Saved %u bytes to %s\n" : "Could not save %u bytes to %s\n",
                  (unsigned)blen, path);

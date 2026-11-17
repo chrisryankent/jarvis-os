@@ -5,7 +5,7 @@
  *
  * Provides a unified file interface over:
  *   - ext4 partitions (user data, /home)
- *   - JARVIS internal ramfs (/jarvis/models, /jarvis/logs, /jarvis/data)
+ *   - JARVIS internal ramfs (/kryzen/models, /kryzen/logs, /kryzen/data)
  *   - AHCI/NVMe block layer
  *
  * All file operations are intercepted by the AI filesystem service for:
@@ -280,9 +280,9 @@ void vfs_init(void)
 {
     terminal_puts("[VFS] Initialising virtual file system\n");
 
-    /* Mount ramfs at /jarvis */
+    /* Mount ramfs at /kryzen */
     mount_table[mount_count++] = (mount_t){
-        .mountpoint = "/jarvis",
+        .mountpoint = "/kryzen",
         .fs_type    = VFS_TYPE_RAMFS,
         .ops        = &ramfs_ops,
         .priv       = NULL,
@@ -290,22 +290,22 @@ void vfs_init(void)
 
     /* Create standard JARVIS directories in ramfs */
     const char *dirs[] = {
-        "/jarvis/models/brain",
-        "/jarvis/models/stt",
-        "/jarvis/models/tts",
-        "/jarvis/models/wake",
-        "/jarvis/models/security",
-        "/jarvis/models/filesystem",
-        "/jarvis/logs",
-        "/jarvis/data",
-        "/jarvis/bin",
-        "/jarvis/screenshots",
-        "/jarvis/fonts",
-        "/jarvis/desktop",
-        "/jarvis/apps",
-        "/jarvis/trash",
-        "/jarvis/data/Downloads",
-        "/jarvis/system",
+        "/kryzen/models/brain",
+        "/kryzen/models/stt",
+        "/kryzen/models/tts",
+        "/kryzen/models/wake",
+        "/kryzen/models/security",
+        "/kryzen/models/filesystem",
+        "/kryzen/logs",
+        "/kryzen/data",
+        "/kryzen/bin",
+        "/kryzen/screenshots",
+        "/kryzen/fonts",
+        "/kryzen/desktop",
+        "/kryzen/apps",
+        "/kryzen/trash",
+        "/kryzen/data/Downloads",
+        "/kryzen/system",
         NULL
     };
     for (int i = 0; dirs[i]; i++) {
@@ -323,11 +323,81 @@ void vfs_init(void)
 
 static int vfs_on_mount(const char *path);   /* defined with vfs_list() */
 
+/* ---- Per-user view ----------------------------------------------------------
+ * While a user is signed in, /kryzen/data, /kryzen/desktop and /kryzen/trash
+ * are that user's own folders: the paths are redirected to
+ * /kryzen/users/<name>/{data,desktop,trash}. Everything written for the
+ * single-owner system keeps working, and every user gets private files.
+ *
+ * Another user's home (/kryzen/users/<other>/...) is refused unless the
+ * signed-in user is an administrator. With nobody signed in (boot, lock
+ * screen, installer) paths are taken as they are.
+ */
+#define VFS_PATH_MAX 256
+static char g_vfs_home[64];             /* "/kryzen/users/<name>"; "" = no session */
+static int  g_vfs_admin = 1;
+static const char *const g_vfs_user_roots[] = { "/kryzen/data", "/kryzen/desktop", "/kryzen/trash" };
+
+void vfs_set_session(const char *home, int admin)
+{
+    if (home && home[0]) snprintf(g_vfs_home, sizeof(g_vfs_home), "%s", home);
+    else g_vfs_home[0] = 0;
+    g_vfs_admin = admin || !g_vfs_home[0];
+}
+
+/* Physical path for `in`. Returns 0, or -1 if this user may not go there.
+ * *mapped is set when a redirect was applied. */
+static int vfs_user_path(const char *in, char *out, size_t n, int *mapped)
+{
+    if (mapped) *mapped = 0;
+    if (!in) return -1;
+    if (g_vfs_home[0]) {
+        for (int i = 0; i < 3; i++) {
+            size_t rl = strlen(g_vfs_user_roots[i]);
+            if (!strncmp(in, g_vfs_user_roots[i], rl) && (in[rl] == 0 || in[rl] == '/')) {
+                if (snprintf(out, n, "%s%s%s", g_vfs_home, g_vfs_user_roots[i] + 7, in + rl) >= (int)n) return -1;
+                if (mapped) *mapped = 1;
+                return 0;
+            }
+        }
+        if (!g_vfs_admin && !strncmp(in, "/kryzen/users/", 14)) {
+            size_t hl = strlen(g_vfs_home);
+            if (strncmp(in, g_vfs_home, hl) || (in[hl] != 0 && in[hl] != '/')) return -1;
+        }
+    }
+    if (strlen(in) >= n) return -1;
+    memcpy(out, in, strlen(in) + 1);
+    return 0;
+}
+
+/* A listing made through a redirect names the user's folders the way the
+ * caller asked for them (/kryzen/data/...). */
+static void vfs_unmap_listing(char *buf)
+{
+    size_t hl = strlen(g_vfs_home);
+    if (!hl) return;
+    char *w = buf;
+    for (char *r = buf; *r;) {
+        if (!strncmp(r, g_vfs_home, hl) && r[hl] == '/' && (r == buf || r[-1] == ' ')) {
+            memcpy(w, "/kryzen", 7);
+            w += 7;
+            r += hl;
+            continue;
+        }
+        *w++ = *r++;
+    }
+    *w = 0;
+}
+
+
 /* ---- Public VFS API ------------------------------------------------------ */
 
 /* Open a file, returns fd or negative on error */
 int vfs_open(const char *path, uint32_t flags)
 {
+    char path_phys[VFS_PATH_MAX];
+    if (vfs_user_path(path, path_phys, sizeof(path_phys), NULL) != 0) return -1;
+    path = path_phys;
     if (vfs_on_mount(path)) return -1;      /* use vfs_read_file for USB drives */
     /* Find free fd slot */
     int fd = -1;
@@ -343,7 +413,7 @@ int vfs_open(const char *path, uint32_t flags)
         snprintf((char *)msg.payload, sizeof(msg.payload),
             "File write: %s", path);
         /* Only send for sensitive paths */
-        if (strncmp(path, "/jarvis/models", 14) == 0 ||
+        if (strncmp(path, "/kryzen/models", 14) == 0 ||
             strncmp(path, "/etc", 4) == 0) {
             ipc_send(&msg);
         }
@@ -416,23 +486,35 @@ void vfs_close(int fd)
 
 int vfs_stat(const char *path)
 {
+    char path_phys[VFS_PATH_MAX];
+    if (vfs_user_path(path, path_phys, sizeof(path_phys), NULL) != 0) return -1;
+    path = path_phys;
     return ramfs_find(path) ? 0 : -1;
 }
 
 int vfs_create_file(const char *path)
 {
+    char path_phys[VFS_PATH_MAX];
+    if (vfs_user_path(path, path_phys, sizeof(path_phys), NULL) != 0) return -1;
+    path = path_phys;
     if (vfs_on_mount(path)) return fatfs_write_file(path, "", 0);
     return ramfs_create_node(path, 4096, 0) ? 0 : -1;
 }
 
 int vfs_mkdir(const char *path)
 {
+    char path_phys[VFS_PATH_MAX];
+    if (vfs_user_path(path, path_phys, sizeof(path_phys), NULL) != 0) return -1;
+    path = path_phys;
     if (vfs_on_mount(path)) return fatfs_mkdir(path);
     return ramfs_create_node(path, 0, 1) ? 0 : -1;
 }
 
 int vfs_read_file(const char *path, char *buf, size_t max)
 {
+    char path_phys[VFS_PATH_MAX];
+    if (vfs_user_path(path, path_phys, sizeof(path_phys), NULL) != 0) return -1;
+    path = path_phys;
     if (vfs_on_mount(path)) {
         if (max == 0) return -1;
         int n = fatfs_read(path, 0, buf, max - 1);
@@ -459,7 +541,7 @@ static char vfs_mounts[4][16];
 /* The account and settings folder: only the kernel may touch it. */
 int vfs_is_private(const char *path)
 {
-    return path && !strncmp(path, "/jarvis/system", 14) && (path[14] == 0 || path[14] == '/');
+    return path && !strncmp(path, "/kryzen/system", 14) && (path[14] == 0 || path[14] == '/');
 }
 
 void vfs_mount_point(const char *path)
@@ -485,6 +567,9 @@ static int vfs_on_mount(const char *path)
  * the number of entries, or -1 if `dir` is on a USB drive (use vfs_list). */
 int vfs_dir_entries(const char *dir, void (*fn)(void *ctx, const char *name, size_t len, int is_dir), void *ctx)
 {
+    char dir_phys[VFS_PATH_MAX];
+    if (vfs_user_path(dir, dir_phys, sizeof(dir_phys), NULL) != 0) return -1;
+    dir = dir_phys;
     if (vfs_on_mount(dir)) return -1;
     static int32_t seen[8192];                  /* implied folders already reported: slot + 1 */
     static uint16_t seen_len[8192];
@@ -518,7 +603,7 @@ int vfs_dir_entries(const char *dir, void (*fn)(void *ctx, const char *name, siz
     return n;
 }
 
-int vfs_list(const char *prefix, char *buf, size_t max)
+static int vfs_list_phys(const char *prefix, char *buf, size_t max)
 {
     size_t out = 0;
     size_t plen = strlen(prefix);
@@ -561,9 +646,22 @@ int vfs_list(const char *prefix, char *buf, size_t max)
     return (int)out;
 }
 
+int vfs_list(const char *prefix, char *buf, size_t max)
+{
+    char phys[VFS_PATH_MAX];
+    int mapped = 0;
+    if (vfs_user_path(prefix, phys, sizeof(phys), &mapped) != 0) return -1;
+    int rc = vfs_list_phys(phys, buf, max);
+    if (rc >= 0 && mapped && max) vfs_unmap_listing(buf);
+    return rc;
+}
+
 /* Append to a file by path (used by security logger) */
 void vfs_append(const char *path, const char *data, size_t len)
 {
+    char path_phys[VFS_PATH_MAX];
+    if (vfs_user_path(path, path_phys, sizeof(path_phys), NULL) != 0) return;
+    path = path_phys;
     if (vfs_on_mount(path)) { fatfs_append(path, data, len); return; }
     int fd = vfs_open(path, VFS_FLAG_WRITE | VFS_FLAG_APPEND | VFS_FLAG_CREATE);
     if (fd < 0) return;
@@ -576,7 +674,7 @@ void vfs_append(const char *path, const char *data, size_t len)
  *
  * The ramfs is a flat table of full paths, so a directory "contains" every
  * entry whose path starts with "<dir>/". A directory may also exist only
- * implicitly, as the prefix of deeper entries (e.g. /jarvis/models).
+ * implicitly, as the prefix of deeper entries (e.g. /kryzen/models).
  * ========================================================================== */
 
 /* 1 if `path` is `dir` itself or lies anywhere beneath it. */
@@ -599,6 +697,9 @@ static void ramfs_free_node(ramfs_file_t *f)
 
 int vfs_exists(const char *path)
 {
+    char path_phys[VFS_PATH_MAX];
+    if (vfs_user_path(path, path_phys, sizeof(path_phys), NULL) != 0) return 0;
+    path = path_phys;
     if (vfs_on_mount(path)) return fatfs_stat(path, NULL, NULL) == 0;
     if (ramfs_find(path)) return 1;
     size_t plen = strlen(path);
@@ -610,6 +711,9 @@ int vfs_exists(const char *path)
 
 int vfs_is_dir(const char *path)
 {
+    char path_phys[VFS_PATH_MAX];
+    if (vfs_user_path(path, path_phys, sizeof(path_phys), NULL) != 0) return 0;
+    path = path_phys;
     if (vfs_on_mount(path)) {
         int d = 0;
         return fatfs_stat(path, &d, NULL) == 0 && d;
@@ -629,6 +733,9 @@ int vfs_is_dir(const char *path)
 /* Size in bytes of a file, or the total of everything under a directory. */
 long vfs_size(const char *path)
 {
+    char path_phys[VFS_PATH_MAX];
+    if (vfs_user_path(path, path_phys, sizeof(path_phys), NULL) != 0) return -1;
+    path = path_phys;
     if (vfs_on_mount(path)) {
         uint32_t sz;
         return fatfs_stat(path, NULL, &sz) == 0 ? (long)sz : -1;
@@ -649,6 +756,9 @@ long vfs_size(const char *path)
 /* Number of entries beneath a directory (all levels). */
 int vfs_count_children(const char *path)
 {
+    char path_phys[VFS_PATH_MAX];
+    if (vfs_user_path(path, path_phys, sizeof(path_phys), NULL) != 0) return 0;
+    path = path_phys;
     if (vfs_on_mount(path)) {
         static char listing[8192];
         int n = 0;
@@ -668,6 +778,9 @@ int vfs_count_children(const char *path)
 /* Delete a file, or a directory together with everything inside it. */
 int vfs_delete(const char *path)
 {
+    char path_phys[VFS_PATH_MAX];
+    if (vfs_user_path(path, path_phys, sizeof(path_phys), NULL) != 0) return -1;
+    path = path_phys;
     if (vfs_on_mount(path)) return fatfs_delete(path);
     size_t plen = strlen(path);
     int removed = 0;
@@ -686,6 +799,10 @@ int vfs_delete(const char *path)
 /* Rename / move a file or a whole directory tree. */
 int vfs_rename(const char *from, const char *to)
 {
+    char from_phys[VFS_PATH_MAX], to_phys[VFS_PATH_MAX];
+    if (vfs_user_path(from, from_phys, sizeof(from_phys), NULL) != 0 ||
+        vfs_user_path(to, to_phys, sizeof(to_phys), NULL) != 0) return -1;
+    from = from_phys; to = to_phys;
     if (vfs_on_mount(from) || vfs_on_mount(to)) {
         if (!vfs_exists(from) || vfs_exists(to) || !strcmp(from, to)) return -1;
         if (vfs_on_mount(from) && vfs_on_mount(to) && fatfs_rename(from, to) == 0) return 0;
@@ -800,6 +917,10 @@ static int copy_to_mount(const char *from, const char *to, int depth)
 
 int vfs_copy(const char *from, const char *to)
 {
+    char from_phys[VFS_PATH_MAX], to_phys[VFS_PATH_MAX];
+    if (vfs_user_path(from, from_phys, sizeof(from_phys), NULL) != 0 ||
+        vfs_user_path(to, to_phys, sizeof(to_phys), NULL) != 0) return -1;
+    from = from_phys; to = to_phys;
     if (vfs_on_mount(to)) {
         if (!vfs_exists(from) || vfs_exists(to)) return -1;
         size_t fl = strlen(from);
@@ -845,6 +966,9 @@ int vfs_copy(const char *from, const char *to)
 /* Replace the contents of a file (created if missing). */
 int vfs_write_file(const char *path, const void *data, size_t len)
 {
+    char path_phys[VFS_PATH_MAX];
+    if (vfs_user_path(path, path_phys, sizeof(path_phys), NULL) != 0) return -1;
+    path = path_phys;
     if (vfs_on_mount(path)) return fatfs_write_file(path, data, len);
     int fd = vfs_open(path, VFS_FLAG_WRITE | VFS_FLAG_CREATE | VFS_FLAG_TRUNC);
     if (fd < 0) return -1;

@@ -355,7 +355,7 @@ extern const uint8_t user_prog_counter_start[], user_prog_counter_end[];
 extern const uint8_t user_prog_ask_start[], user_prog_ask_end[];
 extern const uint8_t user_prog_launcher_start[], user_prog_launcher_end[];
 
-/* Copies the programs built from user/ into /jarvis/bin so they can be run,
+/* Copies the programs built from user/ into /kryzen/bin so they can be run,
  * copied and deleted like any other file. */
 void usermode_install_programs(void)
 {
@@ -369,8 +369,8 @@ void usermode_install_programs(void)
     };
     for (size_t i = 0; i < sizeof(progs) / sizeof(progs[0]); i++) {
         char path[64];
-        snprintf(path, sizeof(path), "/jarvis/bin/%s", progs[i].name);
+        snprintf(path, sizeof(path), "/kryzen/bin/%s", progs[i].name);
         vfs_write_file(path, progs[i].start, (size_t)(progs[i].end - progs[i].start));
     }
-    terminal_puts("[USER] Installed bundled programs in /jarvis/bin\n");
+    terminal_puts("[USER] Installed bundled programs in /kryzen/bin\n");
 }

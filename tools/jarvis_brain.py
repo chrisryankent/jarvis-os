@@ -47,62 +47,85 @@ def _tool(name: str, description: str, props: dict | None = None, required: list
 
 S = {"type": "string"}
 I = {"type": "integer"}
+B = {"type": "boolean"}
+def _enum(*v):
+    return {"type": "string", "enum": list(v)}
+
+APPS = ("Files, Terminal, Settings, Calculator, Tasks, Notepad, Apps, Security, Disks, Device Manager, Photos, "
+        "Clock, Run, Browser, Registry Editor, JARVIS")
 TOOLS = [
-    _tool("open_app", "Open an app (Files, Terminal, Settings, Calculator, Tasks, Notepad, Apps, Security, Disks, Device Manager, Photos, Clock, Run, Browser, Registry Editor). 'the computer' or 'my computer' means Files.", {"name": S}, ["name"]),
-    _tool("close_app", "Close an open app window.", {"name": S}, ["name"]),
-    _tool("list_apps", "List the apps on this PC and which are open."),
-    _tool("list_files", "List the files and folders in a folder.", {"path": S}, ["path"]),
+    # --- any app: the AI drives the desktop like a person would
+    _tool("open_app", f"Open an app ({APPS}) or bring it to the front. 'my computer' means Files.", {"name": S}, ["name"]),
+    _tool("window", "Manage windows: open, close, focus, minimize, maximize, restore, snap_left, snap_right, show_desktop, list.",
+          {"action": _enum("open", "close", "focus", "minimize", "maximize", "restore", "snap_left", "snap_right", "show_desktop", "list"),
+           "name": S}, ["action"]),
+    _tool("read_screen", "Read what an app's window shows right now (all its text: buttons, fields, lists, document, page). "
+          "No app = the focused window. Use it to see results or to find what to click.", {"app": S}),
+    _tool("click", "Click a button, menu, tab, link, list item or text shown in an app's window, by its visible text. "
+          "double for opening items in Files.", {"app": S, "text": S, "double": B, "right": B}, ["text"]),
+    _tool("type_text", "Type text into an app as if on the keyboard (into its focused field). \\n = Enter.", {"app": S, "text": S}, ["text"]),
+    _tool("press_keys", "Press keys or shortcuts in an app, e.g. 'ctrl+s', 'enter', 'tab', 'alt+f4', 'ctrl+a delete', 'down down enter'.",
+          {"app": S, "keys": S}, ["keys"]),
+    # --- apps with direct control
+    _tool("notepad", "Notepad: type (at the caret), append, write (replace all text), read, save, save_as (path = file name, "
+          "e.g. 'eddy' or 'Documents/notes.txt'), new, open (path), undo, redo, clear, close, status. "
+          "discard true only if the user agreed to lose unsaved changes.",
+          {"action": _enum("type", "append", "write", "read", "save", "save_as", "new", "open", "undo", "redo", "clear", "close", "status"),
+           "text": S, "path": S, "discard": B}, ["action"]),
+    _tool("browser", "The Browser: open (url), search (text), read (the page text), links, click (link or button text), "
+          "fill / submit (text into the page's search box), find (text on the page), scroll (down/up/top/bottom), back, forward, "
+          "reload, home, history, zoom (in/out/reset), favorite, download (url), status.",
+          {"action": _enum("open", "search", "read", "links", "click", "fill", "submit", "find", "scroll", "back", "forward",
+                           "reload", "home", "history", "zoom", "favorite", "download", "status"), "text": S}, ["action"]),
+    _tool("terminal", "Run a command in the visible Terminal window and get its output (ls, cd, cat, apt install, apt update, "
+          "dpkg, ping, ps, df, git ...). Software installs: 'apt install -y <package>'.", {"command": S}, ["command"]),
+    _tool("open_settings", "Open Settings at a page (system, display, bluetooth, network, personalization, apps, accounts, "
+          "time, privacy, update ...).", {"page": S}, ["page"]),
+    _tool("change_setting", "Change a system setting. Names: brightness (10-100, up, down), night_light (on/off), resolution "
+          "(e.g. 1920x1080), theme (dark/light/high_contrast), accent (blue/red/green/gold/purple/orange), wallpaper (bloom, aurora, "
+          "mountains, dunes, night, waves, solid, or a picture path), transparency, taskbar_align (center/left), desktop_icons, "
+          "clock_24h, clock_seconds, volume (0-100, up, down), mute, voice_volume, mouse_speed (slow/normal/fast/fastest), "
+          "scroll_lines, dnd, lock_after_min, screen_off_min, airplane, device_name, autoplay, search_engine.",
+          {"name": S, "value": S}, ["name", "value"]),
+    _tool("get_settings", "All system settings and their current values."),
+    # --- files
+    _tool("list_files", "List a folder.", {"path": S}, ["path"]),
     _tool("find_files", "Find files by part of their name.", {"name": S}, ["name"]),
-    _tool("read_file", "Read a text file (first 3000 characters).", {"path": S}, ["path"]),
-    _tool("write_file", "Create or replace a text file with the given text.", {"path": S, "text": S}, ["path", "text"]),
+    _tool("read_file", "Read a text file.", {"path": S}, ["path"]),
+    _tool("write_file", "Create or replace a text file without opening it.", {"path": S, "text": S}, ["path", "text"]),
+    _tool("open_file", "Open a file in its app (text in Notepad), or a folder in Files.", {"path": S}, ["path"]),
     _tool("create_folder", "Create a folder.", {"path": S}, ["path"]),
     _tool("delete", "Move a file or folder to the Recycle Bin.", {"path": S}, ["path"]),
     _tool("move", "Move or rename a file or folder.", {"from": S, "to": S}, ["from", "to"]),
     _tool("copy", "Copy a file or folder.", {"from": S, "to": S}, ["from", "to"]),
-    _tool("open_file", "Open a file in Notepad, or a folder in Files.", {"path": S}, ["path"]),
+    # --- system
     _tool("system_status", "Time, date, memory, disk, network."),
-    _tool("list_processes", "List running processes: PID, state, priority, parent, memory."),
+    _tool("list_processes", "Running processes with PID."),
     _tool("kill_process", "End a process by PID.", {"pid": I}, ["pid"]),
-    _tool("suspend_process", "Pause a process by PID.", {"pid": I}, ["pid"]),
-    _tool("resume_process", "Resume a paused process by PID.", {"pid": I}, ["pid"]),
-    _tool("set_priority", "Change a process's priority by PID.", {"pid": I, "level": {"type": "string", "enum": ["low", "normal", "high"]}}, ["pid", "level"]),
-    _tool("list_devices", "List the hardware devices, their drivers and status."),
-    _tool("device_details", "Details of one device: maker, hardware ID, driver, interrupts, status.", {"name": S}, ["name"]),
-    _tool("set_device_enabled", "Disable or enable a device (network adapter, sound card, USB device).", {"name": S, "enabled": {"type": "boolean"}}, ["name", "enabled"]),
-    _tool("list_drives", "List the drives with free space."),
-    _tool("list_disks", "Disk management: every disk, its file system, space, data read and written, errors."),
-    _tool("check_disk", "Check the JARVIS disk for errors in the background; repair fixes them; surface reads every block.", {"repair": {"type": "boolean"}, "surface": {"type": "boolean"}}),
-    _tool("disk_check_status", "Progress or result of the disk check."),
-    _tool("eject_drive", "Safely eject a USB drive so it can be unplugged.", {"name": S}),
+    _tool("run_command", "Run a shell command quietly (not shown in the Terminal) and get the output.", {"command": S}, ["command"]),
+    _tool("list_devices", "Hardware devices, drivers, status."),
+    _tool("device_action", "Device Manager: info, enable, disable, restart, uninstall, scan, events, driver.",
+          {"action": _enum("info", "enable", "disable", "restart", "uninstall", "scan", "events", "driver"), "name": S}, ["action"]),
+    _tool("list_disks", "Disks, volumes, free space, errors."),
+    _tool("disk_action", "Disk management: list, info, create, format, label, extend, shrink, delete, init. format/delete/init "
+          "erase data: confirm true only after the user agreed.",
+          {"action": _enum("list", "info", "create", "format", "label", "extend", "shrink", "delete", "init"),
+           "disk": S, "volume": S, "size_mb": I, "label": S, "fs": _enum("fat32", "fat16", "auto"), "confirm": B}, ["action"]),
+    _tool("check_disk", "Check the disk for errors in the background.", {"repair": B, "surface": B}),
+    _tool("eject_drive", "Safely eject a USB drive.", {"name": S}),
     _tool("network_info", "Network connection details."),
-    _tool("set_theme", "Change the look: dark, light or high_contrast.", {"mode": {"type": "string", "enum": ["dark", "light", "high_contrast"]}}, ["mode"]),
-    _tool("change_setting", "Change any system setting. Names: brightness (10-100, up, down), night_light (on/off), night_light_strength, "
-          "resolution (e.g. 1920x1080), screen_off_min, theme (dark/light/high_contrast), accent (blue/red/green/gold/purple/orange), "
-          "wallpaper (bloom, aurora, mountains, dunes, night, waves, solid, or a picture path), wallpaper_fit, wallpaper_color, "
-          "transparency, taskbar_align (center/left), desktop_icons, clock_24h, clock_seconds, volume (0-100, up, down), mute, "
-          "voice_volume, mouse_speed (slow/normal/fast/fastest), scroll_lines, dnd, lock_after_min, airplane, device_name, autoplay.",
-          {"name": S, "value": S}, ["name", "value"]),
-    _tool("get_settings", "All system settings and their current values."),
-    _tool("run_command", "Run a Terminal command and get its output (ls, cat, grep, find, cp, mv, mkdir, df, ps, ifconfig, ping, uname, free, dmesg, tree, sha256sum ...; also 'timer 5m', 'alarm 07:30 Wake up', 'alarm list', 'stopwatch start'). Use for anything the other tools cannot do.", {"command": S}, ["command"]),
-    _tool("disk_action", "Disk management: list, info, create a volume, format, label, extend, shrink, delete, init. "
-          "disk is a number from list (0 = system disk) or 'usb'. format, delete and init erase data: only with confirm true after the user agreed.",
-          {"action": {"type": "string", "enum": ["list", "info", "create", "format", "label", "extend", "shrink", "delete", "init"]},
-           "disk": S, "volume": S, "size_mb": I, "label": S, "fs": {"type": "string", "enum": ["fat32", "fat16", "auto"]},
-           "confirm": {"type": "boolean"}}, ["action"]),
-    _tool("device_action", "Device Manager: info, enable, disable, restart, uninstall (driver), scan (for hardware changes), events, driver.",
-          {"action": {"type": "string", "enum": ["info", "enable", "disable", "restart", "uninstall", "scan", "events", "driver"]}, "name": S}, ["action"]),
     _tool("screenshot", "Take a screenshot (saved in Pictures/Screenshots)."),
-    _tool("browse", "Open a web page, or search the web, in the JARVIS OS Browser.", {"url": S}, ["url"]),
-    _tool("download", "Download a file from the internet into Downloads (https works).", {"url": S}, ["url"]),
     _tool("notify", "Show a notification.", {"title": S, "text": S}, ["text"]),
     _tool("lock_screen", "Lock the computer."),
-    _tool("list_packages", "List apps installed from packages."),
-    _tool("install_package", "Install an app from a .jpk package file.", {"path": S}, ["path"]),
-    _tool("uninstall_app", "Uninstall an app that was installed from a package.", {"name": S}, ["name"]),
-    _tool("run_program", "Run an installed app by name, or a program file by path.", {"path": S}, ["path"]),
-    _tool("power", "Shut down or restart the computer.", {"action": {"type": "string", "enum": ["shutdown", "restart"]}}, ["action"]),
-    _tool("web_search", "Search the internet: news, facts, people, anything not on this PC.", {"query": S}, ["query"]),
-    _tool("read_webpage", "Read the text of a web page.", {"url": S}, ["url"]),
+    _tool("power", "Shut down or restart.", {"action": _enum("shutdown", "restart")}, ["action"]),
+    _tool("list_packages", "Apps installed from .jpk packages."),
+    _tool("install_package", "Install a .jpk app package file.", {"path": S}, ["path"]),
+    _tool("uninstall_app", "Uninstall a .jpk app.", {"name": S}, ["name"]),
+    # --- internet (runs on the host)
+    _tool("web_search", "Quick internet search: headlines and snippets.", {"query": S}, ["query"]),
+    _tool("research", "Research a question on the internet: searches, reads the best pages and returns the facts. Use for "
+          "explanations, news, prices, how-to, people, anything needing detail.", {"query": S}, ["query"]),
+    _tool("read_webpage", "Read the text of a web page by its address.", {"url": S}, ["url"]),
 ]
 
 
@@ -167,16 +190,92 @@ def read_webpage(url: str) -> str:
     return " ".join(text.split())[:2500] or "error: the page had no readable text"
 
 
+def _page_text(url: str, limit: int = 600000) -> str:
+    raw = urllib.request.urlopen(urllib.request.Request(url, headers=_UA), timeout=12).read(limit)
+    text = raw.decode("utf-8", "ignore")
+    text = _re.sub(r"(?is)<(script|style|noscript|svg|header|footer|nav|aside|form)[^>]*>.*?</\1>", " ", text)
+    text = _re.sub(r"(?i)</(p|div|li|h[1-6]|tr|br)>", "\n", text)
+    return _html.unescape(_re.sub(r"(?s)<[^>]+>", " ", text))
+
+
+def research(query: str) -> str:
+    """Search, then read the top pages in parallel and keep the sentences
+    that answer the question: real page text, with where it came from."""
+    url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
+    page = urllib.request.urlopen(urllib.request.Request(url, headers=_UA), timeout=15).read().decode("utf-8", "ignore")
+    p = _DDGParser()
+    p.feed(page)
+    found = [r for r in p.results if r["title"].strip() and "duckduckgo.com/y.js" not in r["url"]][:6]
+    if not found:
+        return "error: the search returned no results"
+    words = {w for w in _re.findall(r"[a-z0-9]{3,}", query.lower())} - {"the", "and", "for", "what", "how", "who", "with", "about", "does"}
+    pages: dict[int, str] = {}
+
+    def fetch(i: int, u: str) -> None:
+        try:
+            pages[i] = _page_text(u)
+        except Exception:
+            pass
+    threads = [threading.Thread(target=fetch, args=(i, r["url"]), daemon=True) for i, r in enumerate(found[:3])]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=12)
+    out = []
+    for i, r in enumerate(found):
+        site = urllib.parse.urlparse(r["url"]).netloc
+        snippet = " ".join(r["snippet"].split())
+        text = pages.get(i, "")
+        best = []
+        if text:
+            sentences = _re.split(r"(?<=[.!?])\s+|\n+", text)
+            scored = []
+            for k, sent in enumerate(sentences):
+                sent = " ".join(sent.split())
+                if not 40 <= len(sent) <= 400:
+                    continue
+                score = sum(1 for w in words if w in sent.lower())
+                if score:
+                    scored.append((score, -k, sent))
+            best = [x[2] for x in sorted(scored, reverse=True)[:4]]
+        body = " ".join(best) if best else snippet
+        if body:
+            out.append(f"[{site}] {r['title'].strip()}: {body}")
+    return "\n".join(out)[:3200] or "error: the pages had no readable text"
+
+
 HOST_TOOLS = {
     "web_search": lambda a: web_search(str(a.get("query", ""))),
+    "research": lambda a: research(str(a.get("query", ""))),
     "read_webpage": lambda a: read_webpage(str(a.get("url", ""))),
 }
+
+
+def physical_cores() -> int:
+    """Real cores (not hyper-threads); llama.cpp is slower with more threads than cores."""
+    try:
+        cores = set()
+        phys = core = None
+        for line in open("/proc/cpuinfo", encoding="utf-8"):
+            if line.startswith("physical id"):
+                phys = line.split(":")[1].strip()
+            elif line.startswith("core id"):
+                core = line.split(":")[1].strip()
+                cores.add((phys, core))
+        if cores:
+            return max(1, len(cores))
+    except OSError:
+        pass
+    return max(1, (os.cpu_count() or 4) // 2)
+
+
+BRAIN_SERVER: list = [None]                           # for shutdown by the bridge
 
 
 class LlamaServer:
     """llama.cpp's server, started once and kept running."""
 
-    def __init__(self, model: Path, threads: int, ctx: int = 4096):
+    def __init__(self, model: Path, threads: int, ctx: int = 6144):
         self.model = model
         self.proc = None
         if self.healthy():
@@ -188,7 +287,11 @@ class LlamaServer:
         log = open(Path(os.environ.get("TMPDIR", "/tmp")) / "jarvis-llama.log", "ab")
         self.proc = subprocess.Popen(
             [str(LLAMA_SERVER), "-m", str(model), "--host", "127.0.0.1", "--port", str(PORT),
-             "-c", str(ctx), "-t", str(threads), "-tb", str(os.cpu_count() or 4), "-np", "1", "--cache-reuse", "256"],
+             # Physical cores only: hyper-threads and other busy programs
+             # (QEMU, speech recognition) made generation 3x slower. The KV
+             # cache is 8-bit so a long plan plus web results fit in RAM.
+             "-c", str(ctx), "-t", str(threads), "-tb", str(threads), "-np", "1", "--cache-reuse", "256",
+             "-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0"],
             stdout=log, stderr=log, stdin=subprocess.DEVNULL)
 
     def healthy(self) -> bool:
@@ -231,9 +334,11 @@ class LlamaServer:
             self.proc.terminate()
 
 
+# Tools whose result the user wants to hear about (worded by the model).
 INFO_TOOLS = {"list_files", "find_files", "read_file", "system_status", "list_processes", "list_devices",
-              "list_drives", "network_info", "list_apps", "list_packages", "web_search", "read_webpage",
-              "device_details", "list_disks", "disk_check_status", "get_settings", "run_command"}
+              "network_info", "web_search", "research", "read_webpage", "list_disks", "get_settings", "run_command",
+              "read_screen", "terminal", "list_packages"}
+INFO_ACTIONS = {("browser", "read"), ("browser", "links"), ("notepad", "read"), ("window", "list")}
 
 
 def tool_catalogue() -> str:
@@ -246,80 +351,171 @@ def tool_catalogue() -> str:
     return "\n".join(lines)
 
 
-DECIDE_PROMPT = """You are JARVIS, the voice assistant of JARVIS OS. Decide how to handle the user's latest request.
-Answer only with JSON: {"tool": <tool name or "none">, "args": {...}, "say": <text>}.
-- If the request is about this PC (files, apps, settings, processes, devices, network, memory, time), pick the ONE tool that does it, fill its args, and set say to "".
-- For current events, facts about people, places, prices or anything you are not sure of, use web_search.
-- Otherwise use "tool": "none" and put your answer in say: one or two short spoken sentences, no markdown.
-- You have full control of this PC, but only delete, overwrite, end processes, uninstall or shut down when the user clearly asked for exactly that.
-- The words come from speech recognition and may be misheard: pick the app or command that sounds closest (e.g. "not bad" means Notepad).
-Folders: Documents, Downloads, Desktop, Pictures (write paths like "Documents/notes.txt"). USB drives: /jarvis/usb0 (read and write).
-Settings (brightness, wallpaper, night light, volume, resolution, theme ...) all go through change_setting.
+# One system prompt for every call: llama-server keeps it cached, so only
+# the new words of each request are read (a second prompt for wording the
+# answer used to evict it, and each request then re-read ~1500 tokens).
+SYSTEM_PROMPT = """You are JARVIS, the AI that drives JARVIS OS for its owner. You operate every app on this PC the way a person would: open apps, type, click, press keys, read the screen, save files, run Terminal commands, browse and research the internet.
+Answer each request with JSON only: {"intent": "act" | "answer" | "ignore", "steps": [{"tool": ..., "args": {...}}, ...], "say": ...}
+- act: list the steps that do EVERY part of the request, in order (at most 6); "and save it as X" needs its own save_as step. Example "open notepad, write a shopping list with milk and eggs and save it as shopping": [{"tool":"notepad","args":{"action":"write","text":"Shopping list\\n- milk\\n- eggs"}}, {"tool":"notepad","args":{"action":"save_as","path":"shopping"}}]. The notepad tool opens Notepad itself.
+- To work in an app with no special tool, use open_app, then read_screen to see it, click / type_text / press_keys.
+- "save it", "type ...", "write ..." right after Notepad was used mean the Notepad document. Writing a letter, story, list or notes: compose the full text yourself in the step's text.
+- Use "{result}" inside an argument to insert the previous step's result (e.g. research, then notepad write {"text":"{result}"}).
+- Questions about the internet, news, people, prices, how-to: research (or web_search for a quick fact). Installing Linux software: terminal "apt install -y <package>" (run "apt update" first if the user has never done it).
+- answer: no tool needed (greetings, opinions, things you know): steps [], say = one or two short spoken sentences.
+- ignore: ONLY for words that are not a sentence meant for you, e.g. "It as in.", "The", "As ending.", "Oh no no no", a TV line, or someone talking to another person. Never guess an action from such words. Greetings, questions and every clear request are never ignored ("install wifite" = act, "hello" = answer).
+- Only delete, overwrite, end processes, uninstall, format or shut down when the user clearly asked for exactly that.
+- Words come from speech recognition and may be misheard ("not bad" = Notepad).
+Folders: Documents, Downloads, Desktop, Pictures (paths like "Documents/notes.txt", or just a name like "eddy" for Documents). USB: /kryzen/usb0.
 Tools:
 """ + tool_catalogue()
 
-ANSWER_PROMPT = """You are JARVIS, the voice assistant of JARVIS OS. Answer the user's question in one or two short spoken sentences, using only the information given. No markdown, no lists, no file paths unless asked."""
+WORDING_NOTE = ("Results of the steps you took are below. Reply to the user now as JSON {\"say\": ...}: plain spoken "
+                "sentences, no markdown or lists, using only these results. Say what was actually done; if a step failed, "
+                "say so and why. For research, give the facts asked for in two to four sentences.")
 
+STEP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "tool": {"type": "string", "enum": [t["function"]["name"] for t in TOOLS]},
+        "args": {"type": "object"},
+    },
+    "required": ["tool", "args"],
+}
 DECISION_SCHEMA = {
     "type": "object",
     "properties": {
-        "tool": {"type": "string", "enum": [t["function"]["name"] for t in TOOLS] + ["none"]},
-        "args": {"type": "object"},
+        "intent": {"type": "string", "enum": ["act", "answer", "ignore"]},
+        "steps": {"type": "array", "items": STEP_SCHEMA, "maxItems": 6},
         "say": {"type": "string"},
     },
-    "required": ["tool", "args", "say"],
+    "required": ["intent", "steps", "say"],
 }
+SAY_SCHEMA = {"type": "object", "properties": {"say": {"type": "string"}}, "required": ["say"]}
+
+
+def _friendly(text: str) -> str:
+    """Paths and error prefixes as a person would say them."""
+    for path, name in (("/kryzen/data/Downloads", "Downloads"), ("/kryzen/data/Pictures", "Pictures"),
+                       ("/kryzen/data", "Documents"), ("/kryzen/desktop", "the Desktop"), ("/kryzen/trash", "the Recycle Bin")):
+        text = text.replace(path, name)
+    return text.replace("error: ", "Sorry, ")
+
+
+def _first_sentences(text: str, n: int = 2) -> str:
+    text = " ".join(text.split())
+    parts = _re.split(r"(?<=[.!?])\s+", text)
+    return " ".join(parts[:n])
 
 
 class Brain:
-    """One request = one decision. The model chooses a single tool (or none)
-    in constrained JSON, so it cannot loop or chain unasked actions; JARVIS OS
-    runs the tool; questions get a short second pass that words the result.
+    """One request = one plan. The model writes the whole plan in one
+    constrained JSON reply (a 3B model loops when it is asked to call tools
+    one at a time), JARVIS OS runs the steps in order, stopping at the
+    first failure, and the reply is built from what really happened.
     `run_tool(name, args) -> str` executes a tool in JARVIS OS."""
 
-    def __init__(self, server: "LlamaServer", run_tool, prefs: dict | None = None):
+    def __init__(self, server: "LlamaServer", run_tool, prefs: dict | None = None, log=None):
         self.server = server
         self.run_tool = run_tool
         self.prefs = prefs if prefs is not None else {"web": True}
         self.history: list[dict] = []                # recent exchanges, for follow-ups
+        self.log = log or _log
+
+    def _run_step(self, tool: str, args: dict) -> str:
+        if tool in HOST_TOOLS:
+            if not self.prefs.get("web", True):
+                return "error: internet search is switched off in Settings > Privacy & security"
+            try:
+                result = HOST_TOOLS[tool](args)
+            except Exception as exc:
+                result = f"error: the internet request failed ({exc})"
+            self.log(f"[brain] {tool} {json.dumps(args)[:100]} -> {len(result)} chars")
+            return result
+        result = self.run_tool(tool, args)
+        # a page or command still working: wait for it, as a person would
+        waited = 0.0
+        while result.startswith("LOADING:") and waited < 25:
+            time.sleep(1.5)
+            waited += 1.5
+            result = self.run_tool(tool, args if args.get("action") in ("read", "links", "status") else {"action": "status"})
+        if tool == "browser" and args.get("action") in ("open", "search", "back", "forward", "click", "submit", "reload") \
+                and not result.startswith("error"):
+            for _ in range(16):                      # report the page that actually opened
+                time.sleep(1.5)
+                status = self.run_tool("browser", {"action": "status"})
+                if not status.startswith("LOADING:"):
+                    result = status
+                    break
+        return result
 
     def ask(self, text: str) -> str:
         if self.prefs.pop("forget", False):         # Settings > Privacy: clear history
             self.history = []
-        context = self.history[-6:]
-        decision = self.server.complete(
-            [{"role": "system", "content": DECIDE_PROMPT}] + context + [{"role": "user", "content": text}],
-            schema=DECISION_SCHEMA, max_tokens=120)
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + self.history[-4:] + [{"role": "user", "content": text}]
+        decision = self.server.complete(messages, schema=DECISION_SCHEMA, max_tokens=700)
         try:
             d = json.loads(decision)
         except json.JSONDecodeError:
-            d = {"tool": "none", "args": {}, "say": decision}
-        tool, args, say = d.get("tool", "none"), d.get("args") or {}, (d.get("say") or "").strip()
+            d = {"intent": "answer", "steps": [], "say": ""}
+        intent = d.get("intent", "answer")
+        steps = [st for st in (d.get("steps") or []) if isinstance(st, dict) and st.get("tool")]
+        say = (d.get("say") or "").strip()
 
-        if tool == "none":
-            answer = say or "Sorry, I am not sure how to help with that."
+        if intent == "ignore" and not steps:
+            self.log(f"[brain] not a request for JARVIS, ignored: {text}")
+            return ""
+        if not steps:
+            answer = say or "Sorry, I didn't catch that. Could you say it again?"
+            self._remember(text, answer)
+            return answer
+
+        results: list[tuple[str, dict, str]] = []
+        previous = ""
+        for st in steps[:6]:
+            tool, args = st["tool"], dict(st.get("args") or {})
+            for k, v in list(args.items()):
+                if isinstance(v, str):
+                    # the model sometimes escapes twice: "\\n" meant a new line
+                    v = v.replace("\\n", "\n").replace("\\t", "\t")
+                    if "{result}" in v:                # the previous step's output
+                        v = v.replace("{result}", previous)
+                    args[k] = v
+            result = self._run_step(tool, args)
+            results.append((tool, args, result))
+            previous = result
+            if result.startswith("error") or result.startswith("The user denied"):
+                break
+
+        wants_words = any(t in INFO_TOOLS or (t, a.get("action")) in INFO_ACTIONS for t, a, _ in results) \
+            or any(r.startswith("error") for _, _, r in results)
+        if wants_words:
+            report = "\n".join(f"{i + 1}. {t} {json.dumps(a)[:160]} -> {r[:2400 if t in ('research', 'read_screen') else 1200]}"
+                               for i, (t, a, r) in enumerate(results))
+            worded = self.server.complete(
+                messages + [{"role": "assistant", "content": decision},
+                            {"role": "user", "content": WORDING_NOTE + "\n" + report}],
+                schema=SAY_SCHEMA, max_tokens=160)
+            try:
+                answer = json.loads(worded).get("say", "").strip()
+            except json.JSONDecodeError:
+                answer = worded.strip()
+            if not answer:
+                answer = _first_sentences(results[-1][2])
         else:
-            if tool in HOST_TOOLS and not self.prefs.get("web", True):
-                result = "error: internet search is switched off in Settings > Privacy & security"
-            elif tool in HOST_TOOLS:
-                try:
-                    result = HOST_TOOLS[tool](args)
-                except Exception as exc:
-                    result = f"error: the internet request failed ({exc})"
-                _log(f"[brain] {tool} {json.dumps(args)[:100]} -> {len(result)} chars", flush=True)
-            else:
-                result = self.run_tool(tool, args)
-            if tool in INFO_TOOLS and not result.startswith("error"):
-                answer = self.server.complete(
-                    [{"role": "system", "content": ANSWER_PROMPT},
-                     {"role": "user", "content": f"{text}\n\nInformation:\n{result[:1400]}"}],
-                    max_tokens=70).strip()
-            else:
-                answer = result.replace("/jarvis/data/Downloads", "Downloads").replace("/jarvis/data", "Documents") \
-                               .replace("/jarvis/desktop", "the Desktop").replace("error: ", "Sorry, ")
-        self.history += [{"role": "user", "content": text}, {"role": "assistant", "content": answer}]
-        self.history = self.history[-6:]
+            # Actions: the OS's own reports, so nothing is claimed that did not happen.
+            answer = " ".join(_first_sentences(r, 1) for _, _, r in results)
+        answer = _friendly(answer)
+        self._remember(text, answer, results)
         return answer
+
+    def _remember(self, text: str, answer: str, results=None) -> None:
+        done = ""
+        if results:
+            done = " [did: " + "; ".join(f"{t} {json.dumps(a)[:80]}" for t, a, _ in results) + "]"
+        self.history += [{"role": "user", "content": text},
+                         {"role": "assistant", "content": json.dumps({"intent": "act" if results else "answer",
+                                                                      "steps": [], "say": answer + done})}]
+        self.history = self.history[-4:]
 
 
 class GuestLink:
@@ -363,13 +559,14 @@ def start_for_bridge(sock: socket.socket, sock_lock: threading.Lock, model: str 
     """Start the model and the worker threads. Returns (link, ask_queue), or
     None if the model cannot run (JARVIS OS then uses its built-in replies)."""
     try:
-        server = LlamaServer(Path(model) if model else DEFAULT_MODEL, threads=max(1, (os.cpu_count() or 4) // 2))
+        server = LlamaServer(Path(model) if model else DEFAULT_MODEL, threads=physical_cores())
     except RuntimeError as exc:
         _log(f"[brain] not available: {exc}", flush=True)
         return None
     link = GuestLink(sock, sock_lock)
     prefs = {"web": True}
     brain = Brain(server, link.run_tool, prefs)
+    BRAIN_SERVER[0] = server
     asks: "queue.Queue[str]" = queue.Queue()
     name = "Llama 3.2 3B (local)"
 
@@ -382,7 +579,7 @@ def start_for_bridge(sock: socket.socket, sock_lock: threading.Lock, model: str 
         # user's first request is as fast as the rest.
         started = time.time()
         try:
-            server.complete([{"role": "system", "content": DECIDE_PROMPT}, {"role": "user", "content": "hello"}],
+            server.complete([{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": "hello"}],
                             schema=DECISION_SCHEMA, max_tokens=8)
         except Exception as exc:
             _log(f"[brain] warm-up failed: {exc}", flush=True)

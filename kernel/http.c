@@ -202,7 +202,7 @@ static int fetch_once(http_req_t *r)
 
     static char req[4096];
     int post = !strcmp(r->method, "POST");
-    int rl = snprintf(req, sizeof(req), "%s %s HTTP/1.1\r\nHost: %s%s\r\nUser-Agent: Mozilla/5.0 (JARVIS OS) JarvisBrowser/1.0\r\n"
+    int rl = snprintf(req, sizeof(req), "%s %s HTTP/1.1\r\nHost: %s%s\r\nUser-Agent: Mozilla/5.0 (Kryzen OS) JarvisBrowser/1.0\r\n"
                       "Accept: text/html,text/plain,image/png,image/jpeg,*/*;q=0.8\r\nAccept-Encoding: identity\r\nAccept-Language: en\r\n"
                       "Connection: close\r\n%s%s%s",
                       post ? "POST" : "GET", path, host, "", post ? "Content-Type: application/x-www-form-urlencoded\r\n" : "", "", "");

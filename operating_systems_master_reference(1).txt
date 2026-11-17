@@ -1,0 +1,649 @@
+================================================================================
+OPERATING SYSTEMS: COMPLETE ARCHITECTURE, INTERNALS, PIPELINES, SETTINGS & OPS
+================================================================================
+
+TABLE OF CONTENTS
+  1. Hardware Foundation, Boot Chain & Firmware
+  2. Kernel Architectures & Execution Modes
+  3. Process, Thread & CPU Scheduling Internals
+  4. Memory Management & Virtual Address Translation
+  5. Inter-Process Communication (IPC) & Synchronization
+  6. Storage Stack, Block Layer & File System Internals
+  7. Directory Hierarchies & Configuration Databases
+  8. Input / Output (I/O), Buses & Device Driver Stacks
+  9. End-to-End Keyboard & Input Translation Pipelines (Linux & Windows)
+ 10. Networking Stack, Packet Flow & Virtual Interfaces
+ 11. Graphics, Display Servers & Audio Subsystems
+ 12. Security, Identity, Access Control & Sandboxing
+ 13. Virtualization, Containers & Hypervisors
+ 14. Granular / Low-Level Micro-Settings & System Tweaks
+ 15. Complete Operations & Command Matrix (Debian Linux vs. Windows)
+
+================================================================================
+1. HARDWARE FOUNDATION, BOOT CHAIN & FIRMWARE
+================================================================================
+- CPU Execution & Privilege Levels (x86_64 / ARM64):
+  * Ring 0 (Kernel Mode / ARM EL1): Unrestricted access to physical RAM, MSRs
+    (Model-Specific Registers), control registers (CR0-CR4), GDT/IDT, and I/O.
+  * Ring 1 & 2: Legacy OS driver rings (unused by modern Windows/Linux).
+  * Ring 3 (User Mode / ARM EL0): Unprivileged execution; traps into Ring 0 via
+    SYSCALL / SYSENTER (x86_64) or SVC (ARM64) instructions.
+  * Ring -1 (Hypervisor Mode / VMX Root / ARM EL2): Hardware virtualization
+    extensions (Intel VT-x / AMD-V) managing guest OSes.
+  * Ring -2 (SMM - System Management Mode) & Ring -3 (Intel ME / AMD PSP):
+    Out-of-band firmware controllers below the OS.
+
+- Firmware & Partitioning:
+  * Legacy BIOS + MBR (Master Boot Record): 512-byte boot sector, 4 primary
+    partitions max, 2 TiB disk limit, 16-bit Real Mode start.
+  * UEFI + GPT (GUID Partition Table): 32/64-bit protected/long mode firmware,
+    EFI System Partition (ESP, FAT32), NVRAM boot variables (Boot0000..BootFFFF),
+    supports >2 TiB disks and up to 128 primary partitions.
+  * ACPI (Advanced Configuration and Power Interface): Firmware tables (RSDP,
+    XSDT, MADT for interrupt controllers, FADT for power, DSDT/SSDT bytecode)
+    parsed by the OS to discover hardware topology and manage power states
+    (S0 Working, S3 Suspend-to-RAM, S4 Hibernate, S5 Soft Off; C-states & P-states).
+
+- Complete Boot Sequence:
+  * Linux (Debian):
+    1. UEFI loads /EFI/debian/grubx64.efi (verified via shimx64.efi if Secure
+       Boot is active).
+    2. GRUB2 reads /boot/grub/grub.cfg, loads compressed kernel (vmlinuz) and
+       initial RAM filesystem (initrd.img) into RAM, passes kernel cmdline args.
+    3. Kernel decompresses, initializes MMU/paging, IDT, ACPI, and unpacks
+       initramfs into rootfs (tmpfs).
+    4. initramfs runs /init (udev + storage/LUKS/LVM/RAID modules), mounts real
+       root filesystem, and calls switch_root.
+    5. Kernel spawns PID 1 (/sbin/init -> /lib/systemd/systemd) and PID 2
+       (kthreadd). systemd activates default.target (graphical.target or
+       multi-user.target).
+  * Windows:
+    1. UEFI loads \EFI\Microsoft\Boot\bootmgfw.efi.
+    2. Boot Manager reads BCD (Boot Configuration Data store) and launches
+       winload.efi (or winresume.efi if waking from hibernation).
+    3. winload.efi loads ntoskrnl.exe, hal.dll, boot-start drivers (BOOT_START),
+       and the SYSTEM registry hive into memory, then calls ExitBootServices().
+    4. Kernel initializes Executive subsystems and launches smss.exe (Session
+       Manager).
+    5. smss.exe initializes paging files, Environment Variables, Session 0
+       (non-interactive services: wininit.exe -> services.exe, lsass.exe,
+       lsm.exe) and Session 1+ (interactive user desktop: csrss.exe,
+       winlogon.exe -> LogonUI.exe -> userinit.exe -> explorer.exe + dwm.exe).
+
+================================================================================
+2. KERNEL ARCHITECTURES & EXECUTION MODES
+================================================================================
+- Linux Kernel (Monolithic + Dynamically Modular):
+  * Single unified kernel address space (higher-half kernel mapping).
+  * Loadable Kernel Modules (.ko files in /lib/modules/$(uname -r)/) inserted
+    at runtime via init_module / finit_module syscalls (modprobe / insmod).
+  * Interrupt Handling:
+    - Hardware IRQ arrives at APIC -> CPU indexes IDT -> runs Top Half (ISR)
+      with local interrupts disabled -> schedules Bottom Half (Softirq,
+      Tasklet, Workqueue, or Threaded IRQ) for deferred processing.
+  * Preemption Models: PREEMPT_NONE (server throughput), PREEMPT_VOLUNTARY,
+    PREEMPT (desktop low-latency), PREEMPT_RT (hard real-time).
+
+- Windows NT Kernel (Hybrid Architecture):
+  * HAL (hal.dll): Abstracts APIC, timers, DMA controllers, PCI configuration.
+  * Kernel Layer (ntoskrnl.exe lower): Thread dispatching, trap/exception
+    handling, IRQL (Interrupt Request Level: PASSIVE_LEVEL 0, APC_LEVEL 1,
+    DISPATCH_LEVEL 2, DIRQL 3-26, HIGH_LEVEL 31), DPCs (Deferred Procedure
+    Calls), APCs (Asynchronous Procedure Calls).
+  * Executive Layer (ntoskrnl.exe upper):
+    - Object Manager (Ob): Reference-counted objects in \Device, \Driver,
+      \BaseNamedObjects, \Sessions, \Registry.
+    - Process/Thread Manager (Ps): EPROCESS, ETHREAD, Job Objects.
+    - Virtual Memory Manager (Mm): Demand paging, Working Sets, PFN database.
+    - I/O Manager (Io): IRP (I/O Request Packet) driven layered driver model.
+    - Cache Manager (Cc): Virtual block caching tied to Memory Manager.
+    - Configuration Manager (Cm): Registry hive engine.
+    - Security Reference Monitor (Se): Tokens, SIDs, ACL enforcement.
+    - ALPC: High-speed local RPC transport.
+  * Win32k Subsystem (win32k.sys / win32kbase.sys / win32kfull.sys):
+    Kernel-mode window manager (USER) and graphics device interface (GDI).
+
+================================================================================
+3. PROCESS, THREAD & CPU SCHEDULING INTERNALS
+================================================================================
+- Core Kernel Structures:
+  * Linux:
+    - task_struct: PID, TGID (Thread Group ID), state (RUNNING, INTERRUPTIBLE,
+      UNINTERRUPTIBLE 'D', ZOMBIE 'Z', STOPPED 'T'), scheduling policy, CPU
+      affinity mask, pointers to mm_struct, files_struct, fs_struct, cred.
+    - Threads vs. Processes: Created via clone3() syscall; threads share
+      mm_struct (address space) and files_struct (file descriptors) but have
+      unique PIDs (TIDs) and kernel stacks; their TGID equals the leader's PID.
+  * Windows:
+    - EPROCESS / KPROCESS: Process ID, Handle Table, VAD tree, Access Token,
+      PEB (Process Environment Block in user space: loaded DLL list, CLI args,
+      env vars).
+    - ETHREAD / KTHREAD: Thread ID, register context, kernel/user stack,
+      TEB (Thread Environment Block: TLS slots, LastError, SEH chain).
+
+- CPU Scheduling Algorithms:
+  * Linux:
+    - Normal tasks (SCHED_OTHER / SCHED_NORMAL): EEVDF (Earliest Eligible
+      Virtual Deadline First, Linux 6.6+) / CFS (Completely Fair Scheduler)
+      tracking virtual runtime (vruntime) weighted by nice value (-20 to +19).
+    - Batch / Idle: SCHED_BATCH, SCHED_IDLE.
+    - Real-Time: SCHED_FIFO (first-in-first-out until yield/block), SCHED_RR
+      (round-robin time slices), SCHED_DEADLINE (Earliest Deadline First).
+  * Windows:
+    - 32-level priority preemption (0 = zero-page thread, 1-15 = variable/dynamic
+      user levels, 16-31 = real-time fixed levels).
+    - Priority boosts applied dynamically upon I/O completion, GUI focus, or
+      starvation prevention (Balance Set Manager).
+
+- Context Switch Mechanics:
+  1. Timer interrupt (APIC timer / HPET / TSC) or blocking syscall triggers
+     scheduler.
+  2. Save current thread's general-purpose registers (RAX..R15), instruction
+     pointer (RIP), stack pointer (RSP), flags (RFLAGS), and FPU/SSE/AVX state
+     (XSAVE).
+  3. Switch kernel stack pointer; if switching processes, load new page table
+     root into CR3 (flushing non-global TLB entries unless PCID is enabled).
+  4. Restore next thread's registers and return to Ring 3 via SYSRET / IRETQ.
+
+================================================================================
+4. MEMORY MANAGEMENT & VIRTUAL ADDRESS TRANSLATION
+================================================================================
+- Virtual Address Space Layout (x86_64):
+  * Linux (48-bit / 57-bit VA):
+    - User space: 0x0000000000000000 to 0x00007FFFFFFFFFFF (128 TiB)
+      [Text/Code -> Data/BSS -> Heap (brk) -> Memory Mappings (mmap/libs) ->
+       Stack (grows down) + vDSO / vsyscall].
+    - Kernel space: 0xFFFF800000000000 to 0xFFFFFFFFFFFFFFFF (Direct physical
+      map, vmalloc, vmemmap, kernel text/modules).
+  * Windows (64-bit):
+    - User space: 0x0000000000000000 to 0x00007FFFFFFFFFFF (128 TiB).
+    - Kernel space: 0xFFFF800000000000 to 0xFFFFFFFFFFFFFFFF (Paged Pool,
+      Non-Paged Pool, System PTEs, PFN Database, Hyperspace, Kernel/HAL).
+
+- Hardware Translation (MMU & TLB):
+  * 4-Level Paging: CR3 -> PML4 (Page Map Level 4) -> PDPT (Page Directory
+    Pointer Table) -> PD (Page Directory) -> PT (Page Table) -> 4 KiB Physical
+    Page Frame (+ Huge Pages: 2 MiB and 1 GiB).
+  * Page Table Entry (PTE) Flags: Present (P), Read/Write (R/W), User/Supervisor
+    (U/S), Accessed (A), Dirty (D), No-Execute (NX / XD bit).
+  * TLB (Translation Lookaside Buffer): CPU hardware cache of recent VA->PA
+    translations; tagged with PCID (Process Context ID) to avoid full flushes.
+
+- Kernel Allocators & Paging Mechanics:
+  * Linux:
+    - Buddy Allocator: Manages contiguous physical page frames in powers of 2
+      (order 0 = 4 KiB up to order 10 = 4 MiB).
+    - Slab / Slub Allocator: Carves pages into fixed-size caches for frequent
+      kernel structs (task_struct, inode, dentry, sk_buff).
+    - vmalloc: Allocates virtually contiguous (physically non-contiguous) RAM.
+    - Demand Paging & Copy-on-Write (COW): fork() shares pages read-only; first
+      write triggers a Minor Page Fault (#PF) to copy the page.
+    - Page Cache & Swap: Unallocated RAM caches disk blocks; memory pressure
+      reclaims clean cache pages or swaps anonymous pages to swapfile/zram.
+  * Windows:
+    - Non-Paged Pool: Kernel memory guaranteed to stay in physical RAM (safe
+      at DISPATCH_LEVEL >= 2 where page faults crash with IRQL_NOT_LESS_OR_EQUAL).
+    - Paged Pool: Kernel memory that can be paged out to pagefile.sys.
+    - Working Set: Set of physical pages currently resident for a process.
+    - Standby / Modified / Free / Zero Page Lists managed by PFN database.
+
+================================================================================
+5. INTER-PROCESS COMMUNICATION (IPC) & SYNCHRONIZATION
+================================================================================
+- IPC Mechanisms:
+  * Pipes:
+    - Anonymous Pipes: Unidirectional byte stream between parent/child (pipe2).
+    - Named Pipes: Filesystem-backed FIFO (/tmp/my.fifo in Linux) or kernel
+      named pipe namespace (\\.\pipe\Name in Windows, supports duplex/messages).
+  * Shared Memory:
+    - Fastest IPC (zero kernel copy after setup): shm_open() + mmap() in Linux;
+      CreateFileMapping() + MapViewOfFile() in Windows.
+  * Sockets:
+    - Unix Domain Sockets (AF_UNIX / AF_LOCAL, supports passing open file
+      descriptors via SCM_RIGHTS) and Network Sockets (AF_INET / AF_INET6).
+  * Signals & Asynchronous Events:
+    - Linux Signals: SIGHUP (1), SIGINT (2), SIGQUIT (3), SIGKILL (9, uncatchable),
+      SIGSEGV (11), SIGPIPE (13), SIGTERM (15), SIGCHLD (17), SIGSTOP (19).
+    - Windows Objects: Event Objects (Manual-Reset vs. Auto-Reset), Waitable
+      Timers, Window Messages (PostMessage / SendMessage).
+  * High-Level Message Buses & RPC:
+    - Linux: D-Bus (System Bus & Session Bus for systemd, NetworkManager, GUI).
+    - Windows: ALPC, RPC, COM / DCOM, WMI (Windows Management Instrumentation).
+
+- Synchronization Primitives:
+  * Spinlocks: Busy-wait atomic loop (used in kernel when sleeping is illegal).
+  * Mutexes: Sleeping lock with ownership (and priority inheritance to prevent
+    priority inversion).
+  * Futex (Fast Userspace Mutex - Linux): Atomic integer check in user space;
+    only enters kernel via futex() syscall if contention occurs.
+  * Semaphores: Counter-based signaling for N concurrent resource slots.
+  * Read-Write Locks (rwlock / SRWLOCK): Multiple concurrent readers OR one
+    exclusive writer.
+  * RCU (Read-Copy-Update - Linux): Lock-free concurrent reads while writers
+    publish new pointer versions and defer freeing old data until grace period.
+
+================================================================================
+6. STORAGE STACK, BLOCK LAYER & FILE SYSTEM INTERNALS
+================================================================================
+- Storage Layering (Top to Bottom):
+  1. Application syscall (read / write / mmap / io_uring / ReadFile).
+  2. Virtual File System (VFS in Linux) / I/O Manager (Windows).
+  3. Page Cache (Linux) / Cache Manager (Windows).
+  4. Filesystem Driver (ext4.ko, btrfs.ko, ntfs.sys, refs.sys).
+  5. Volume Manager / Device Mapper (LVM, dm-crypt/LUKS, mdadm RAID, BitLocker
+     fvevol.sys, Storage Spaces spaceport.sys).
+  6. Block Layer (Linux blk-mq with schedulers: none, mq-deadline, bfq, kyber;
+     Windows classpnp.sys / partmgr.sys).
+  7. Storage Controller Driver (nvme.ko / stornvme.sys, ahci / storahci.sys).
+  8. Physical Bus (PCIe, NVMe queues, SATA, USB Mass Storage / UASP).
+
+- File System Metadata & Internals:
+  * Linux (ext4 / VFS):
+    - Superblock: Filesystem geometry, block size, mount count, state flags.
+    - Inode (Index Node): Stores file mode/permissions, UID/GID, size, timestamps
+      (atime, mtime, ctime, crtime), link count, and extent trees pointing to
+      data blocks. Does NOT store the filename.
+    - Dentry (Directory Entry): Maps filename -> inode number (cached in dcache).
+    - Hard Link: Another dentry pointing to the exact same inode number.
+    - Symbolic Link (Symlink): Separate inode storing a text target path.
+    - Journaling (jbd2): Writes metadata/data intents to a circular journal
+      before committing in-place to survive power loss.
+  * Windows (NTFS):
+    - Master File Table (MFT): Every file and directory (including metadata
+      files like $MFT, $LogFile, $Bitmap, $Boot) is a 1024-byte record in $MFT.
+    - Attributes inside MFT record: $STANDARD_INFORMATION, $FILE_NAME,
+      $SECURITY_DESCRIPTOR, $DATA (small files fit directly inside the MFT
+      record as "resident data"; larger files store extent "data runs").
+    - Alternate Data Streams (ADS): Multiple named $DATA attributes on one
+      file (e.g., file.txt:Zone.Identifier).
+    - Reparse Points: Foundation for Directory Junctions, Symbolic Links,
+      OneDrive placeholders, and volume mount points.
+
+================================================================================
+7. DIRECTORY HIERARCHIES & CONFIGURATION DATABASES
+================================================================================
+- Debian Linux Filesystem Hierarchy Standard (FHS):
+  * /              : Root directory.
+  * /bin -> /usr/bin   : Essential user command binaries.
+  * /sbin -> /usr/sbin : Essential system administration binaries.
+  * /boot          : Kernel (vmlinuz-*), initrd.img-*, config-*, /boot/grub.
+  * /dev           : Device nodes managed by udev (/dev/sda, /dev/nvme0n1,
+                     /dev/tty*, /dev/null, /dev/zero, /dev/urandom, /dev/shm).
+  * /etc           : Host-specific plain-text configuration files:
+                     - /etc/fstab (filesystem mount table)
+                     - /etc/passwd, /etc/shadow, /etc/group, /etc/gshadow
+                     - /etc/sudoers & /etc/sudoers.d/
+                     - /etc/hosts, /etc/resolv.conf, /etc/nsswitch.conf
+                     - /etc/network/interfaces, /etc/NetworkManager/
+                     - /etc/apt/sources.list & /etc/apt/sources.list.d/
+                     - /etc/systemd/system/ (local unit overrides)
+                     - /etc/sysctl.conf & /etc/sysctl.d/
+                     - /etc/default/keyboard, /etc/default/grub
+  * /home/<user>   : User home (~/.bashrc, ~/.profile, ~/.ssh/, ~/.config/).
+  * /lib -> /usr/lib : Shared libraries (.so) and /lib/modules/<ver>/ drivers.
+  * /media, /mnt   : Auto-mounted removable media and manual mount points.
+  * /opt           : Self-contained third-party applications.
+  * /proc          : Virtual procfs (PID dirs /proc/<pid>/maps, fd, status;
+                     /proc/cpuinfo, /proc/meminfo, /proc/cmdline, /proc/sys/).
+  * /root          : Root user home directory.
+  * /run           : Volatile runtime state (PID files, D-Bus/systemd sockets).
+  * /sys           : Virtual sysfs exposing kernel kobjects, buses, PCI/USB
+                     devices, power/battery controls, block queues.
+  * /tmp, /var/tmp : Temporary files (/tmp often tmpfs; /var/tmp persists).
+  * /usr           : Read-only shareable user hierarchy (/usr/local for admin).
+  * /var           : Variable runtime data (/var/log, /var/cache, /var/lib).
+
+- Windows Directory & Registry Structure:
+  * C:\Windows\System32\       : Core 64-bit OS binaries, DLLs, drivers (\drivers),
+                                 Registry hives (\config), Event logs (\winevt).
+  * C:\Windows\SysWOW64\       : 32-bit binaries for WOW64 compatibility layer.
+  * C:\Windows\WinSxS\         : Side-by-Side component store & updates.
+  * C:\Program Files\          : 64-bit applications (x86 for 32-bit apps).
+  * C:\ProgramData\            : Shared global app configuration & caches.
+  * C:\Users\<User>\           : User profile + AppData\{Local,LocalLow,Roaming}.
+  * Windows Registry Hives:
+    - HKLM (HKEY_LOCAL_MACHINE): Backed by files in System32\config\ (SAM,
+      SECURITY, SOFTWARE, SYSTEM) + HARDWARE (volatile, built at boot).
+    - HKCU (HKEY_CURRENT_USER) : Backed by C:\Users\<User>\NTUSER.DAT and
+      AppData\Local\Microsoft\Windows\UsrClass.dat.
+    - HKCR (HKEY_CLASSES_ROOT) : Merged view of HKLM\Software\Classes and
+      HKCU\Software\Classes (file associations, COM CLSIDs).
+    - HKU  (HKEY_USERS)        : All loaded user profile hives by SID.
+    - HKCC (HKEY_CURRENT_CONFIG): Hardware profile alias to HKLM\SYSTEM.
+
+================================================================================
+8. INPUT / OUTPUT (I/O), BUSES & DEVICE DRIVER STACKS
+================================================================================
+- Bus & Device Enumeration:
+  * PCIe (Peripheral Component Interconnect Express): Enumerated via ECAM
+    memory-mapped config space; identified by VendorID:DeviceID (e.g., 8086:1234).
+    Uses MSI / MSI-X (Message Signaled Interrupts) to target specific CPU cores.
+  * USB: Host controllers (xHCI for USB 3.x) -> Hubs -> Endpoints (Control,
+    Bulk, Interrupt, Isochronous). Bound to class drivers (usbhid, usb-storage).
+  * DMA (Direct Memory Access) & IOMMU: Devices read/write RAM directly without
+    CPU copy; IOMMU (Intel VT-d / AMD-Vi) translates device virtual addresses
+    and isolates device DMA to prevent rogue hardware memory corruption.
+
+- Asynchronous & Multiplexed I/O Models:
+  * Linux:
+    - Blocking I/O, Non-blocking I/O (O_NONBLOCK), I/O Multiplexing (select,
+      poll, epoll with O(1) readiness notification), POSIX AIO, and io_uring
+      (shared Submission Queue & Completion Queue ring buffers between user
+      and kernel space for near-zero-syscall I/O).
+  * Windows:
+    - Overlapped I/O (OVERLAPPED struct) + I/O Completion Ports (IOCP), the
+      scalable thread-pool completion model used by high-performance servers,
+      plus IoRing (Windows 11 equivalent to io_uring).
+
+================================================================================
+9. END-TO-END KEYBOARD & INPUT TRANSLATION PIPELINES
+================================================================================
+- LINUX KEYBOARD PIPELINE (Physical Keypress -> Application Character):
+  1. Hardware & Controller:
+     - USB keyboard sends HID Usage ID (e.g., 0x04 = physical 'A' key) over
+       USB interrupt endpoint; PS/2 i8042 sends AT Set 1 scancode (0x1E).
+  2. Kernel Input Driver & evdev:
+     - Driver maps raw scancode -> standardized Linux keycode defined in
+       /usr/include/linux/input-event-codes.h (e.g., KEY_A = 30).
+     - Low-level hardware remapping happens here via udev hwdb rules
+       (/etc/udev/hwdb.d/*.hwdb: KEYBOARD_KEY_<scancode>=<keycode>) or runtime
+       ioctl(EVIOCSKEYCODE_V2) / setkeycodes.
+     - Kernel emits struct input_event { time, type=EV_KEY, code=30, value=1 }
+       through character device /dev/input/eventX.
+  3. Path A — Virtual Console (TTY / Ctrl+Alt+F1..F6):
+     - Kernel keyboard handler (drivers/tty/vt/keyboard.c) looks up the keycode
+       + active shift state in the kernel keymap table (configured via loadkeys
+       and /etc/default/keyboard) -> injects UTF-8 bytes or ANSI escape codes
+       (e.g., Up Arrow -> \x1b[A) into the TTY line discipline (n_tty).
+  4. Path B — Graphical Desktop (X11 or Wayland):
+     - libinput reads /dev/input/eventX (handling debounce, acceleration, tap-to-click).
+     - On X11: xf86-input-libinput adds +8 to Linux keycodes (KEY_A 30 -> X11
+       keycode 38) and passes to X server.
+     - On Wayland: Compositor (Mutter, KWin, Sway) consumes libinput directly.
+     - XKB (X Keyboard Extension / libxkbcommon) compiles 5 rulesets:
+       (a) keycodes: numeric code -> symbolic hardware name (<AC01>)
+       (b) types: modifier shift-level definitions (ONE_LEVEL, TWO_LEVEL, ALPHABETIC)
+       (c) compat: modifier actions (Shift, Lock, Control, Mod1=Alt, Mod4=Super)
+       (d) symbols: layout map (us, de, fr, gb) + options (caps:escape, compose:ralt)
+       (e) geometry: physical key layout description.
+     - XKB translates (keycode + modifier_mask) -> Keysym (e.g., XK_a, XK_A) +
+       UTF-8 string.
+     - IME (Input Method Editor: IBus / Fcitx5) intercepts keysyms for CJK
+       composition, dead keys, or emoji/Unicode entry (Ctrl+Shift+U) before
+       delivering key events to GTK / Qt / XWayland clients.
+
+- WINDOWS KEYBOARD PIPELINE (Physical Keypress -> Application Character):
+  1. Hardware & Bus Driver:
+     - USB HID stack (hidusb.sys -> hidclass.sys -> hidparse.sys) or PS/2
+       (i8042prt.sys) reads raw hardware make/break codes.
+  2. Keyboard Class Driver (kbdclass.sys):
+     - Converts raw device data into KEYBOARD_INPUT_DATA packets containing
+       MakeCode and Flags (KEY_MAKE, KEY_BREAK, KEY_E0, KEY_E1).
+  3. Kernel Raw Input Thread (RIT inside win32k.sys):
+     - Checks HKLM\SYSTEM\CurrentControlSet\Control\Keyboard Layout\Scancode Map
+       (binary registry remap table applied globally before virtual keys).
+     - Translates (MakeCode + E0/E1) -> Virtual-Key Code (VK_*, e.g., VK_A=0x41,
+       VK_LCONTROL=0xA2) via the active Keyboard Layout DLL (e.g., kbdus.dll).
+     - Checks global hotkeys (Ctrl+Alt+Del -> Secure Attention Sequence handled
+       by winlogon.exe; Win+L -> lock screen; RegisterHotKey bindings).
+  4. Thread Message Queue & Character Translation:
+     - RIT posts WM_KEYDOWN / WM_KEYUP (or WM_SYSKEYDOWN for Alt) carrying wParam
+       (VK code) and lParam (repeat count, scan code, extended flag) to the
+       foreground window's thread message queue.
+     - The app's message loop calls TranslateMessage(&msg), which calls kernel
+       ToUnicodeEx() using the thread's active layout (HKCU\Keyboard Layout\Preload)
+       and dead-key state to post WM_CHAR with the UTF-16 code unit.
+     - Apps using RegisterRawInputDevices() receive WM_INPUT directly from
+       kbdclass.sys, bypassing layout mapping and acceleration.
+
+================================================================================
+10. NETWORKING STACK, PACKET FLOW & VIRTUAL INTERFACES
+================================================================================
+- Packet Journey (RX / Ingress):
+  1. NIC receives Ethernet frame -> verifies FCS checksum -> writes frame into
+     RX Ring Buffer in RAM via DMA -> triggers MSI-X interrupt.
+  2. Driver schedules softirq (Linux NAPI poll) / DPC (Windows NDIS) to drain
+     packets in batches (preventing interrupt storms).
+  3. Packet wrapped in sk_buff (Linux) or NET_BUFFER_LIST (Windows).
+  4. L2 Ethernet header stripped -> passes to L3 IPv4/IPv6 handler -> Netfilter
+     (PREROUTING) / WFP -> Routing Table lookup (local delivery vs. forward).
+  5. L4 TCP/UDP lookup finds matching socket -> places payload into Socket
+     Receive Buffer -> wakes blocked user thread via epoll / IOCP.
+
+- Virtual Networking & Tunneling Constructs:
+  * Loopback (lo): In-memory interface (127.0.0.0/8, ::1) bypassing NIC hardware.
+  * Linux Bridge (br0) / Open vSwitch: Virtual L2 Ethernet switch connecting VMs/Veths.
+  * veth (Virtual Ethernet Pair): Virtual patch cable connecting two Network
+    Namespaces (foundation of Docker/Podman container networking).
+  * TUN/TAP: Virtual L3 IP tunnel (TUN, used by WireGuard/OpenVPN) and virtual
+    L2 Ethernet device (TAP, used by QEMU/KVM).
+  * Bonding / NIC Teaming: Aggregates multiple physical NICs (LACP 802.3ad,
+    active-backup).
+  * Netfilter (nftables / iptables): Packet hooks at PREROUTING, INPUT, FORWARD,
+    OUTPUT, POSTROUTING for stateful firewalling (conntrack) and NAT/Masquerade.
+
+================================================================================
+11. GRAPHICS, DISPLAY SERVERS & AUDIO SUBSYSTEMS
+================================================================================
+- Graphics Pipeline:
+  * Linux:
+    - Hardware -> DRM (Direct Rendering Manager) & KMS (Kernel Mode Setting) ->
+      Mesa 3D (OpenGL / Vulkan user-space drivers) -> Wayland Compositor (Mutter,
+      KWin, wlroots) or X.Org Server -> Client Toolkits (GTK, Qt).
+    - DMA-BUF allows zero-copy sharing of GPU framebuffers between apps and
+      compositor.
+  * Windows:
+    - Hardware -> WDDM (Windows Display Driver Model) kernel/user drivers ->
+      Direct3D / DXGI / Vulkan -> DWM (Desktop Window Manager, dwm.exe)
+      composites every window's off-screen surface onto the primary swap chain.
+
+- Audio Pipeline:
+  * Linux:
+    - Hardware -> ALSA (Advanced Linux Sound Architecture kernel drivers in
+      /dev/snd/*) -> PipeWire (or PulseAudio) sound server -> Per-application
+      streams, Bluetooth (LDAC/AAC/SBC), and JACK pro-audio routing.
+  * Windows:
+    - Hardware -> HDAudio / USB Audio class drivers -> Windows Audio Engine
+      (audiodg.exe) -> WASAPI (Shared Mode mixing or Exclusive Mode bit-perfect
+      low-latency pass-through).
+
+================================================================================
+12. SECURITY, IDENTITY, ACCESS CONTROL & SANDBOXING
+================================================================================
+- Identity Representation:
+  * Linux: 32-bit UID (0 = root, 1-999 = system daemons, 1000+ = human users)
+    and GIDs stored in /etc/passwd and /etc/group; salted SHA-512/yescrypt
+    password hashes stored in root-only /etc/shadow.
+  * Windows: Variable-length SIDs (Security Identifiers, e.g., S-1-5-18 = Local
+    System, S-1-5-32-544 = Administrators, S-1-5-21-<domain>-1001 = User)
+    stored in SAM (local) or NTDS.dit (Active Directory).
+
+- Access Control Models:
+  * DAC (Discretionary Access Control):
+    - Linux POSIX: Owner/Group/Other rwx bits + Special Bits: SUID (4000, runs
+      with file owner's UID), SGID (2000, inherits group), Sticky Bit (1000,
+      prevents deleting others' files in /tmp) + Extended POSIX ACLs (getfacl).
+    - Windows NTFS ACLs: Security Descriptor containing Owner SID, DACL (list
+      of Allow/Deny ACEs inherited down folder trees), and SACL (auditing rules).
+  * MAC (Mandatory Access Control):
+    - Linux: AppArmor (path-based confinement profiles in /etc/apparmor.d/) and
+      SELinux (inode/process security context labels user:role:type:level).
+    - Windows: Mandatory Integrity Control (MIC) tagging processes and objects
+      with Untrusted, Low, Medium, High, or System integrity levels (No-Write-Up).
+  * Privilege Escalation & Capabilities:
+    - Linux Capabilities split root omnipotence into 40+ discrete flags
+      (CAP_NET_BIND_SERVICE, CAP_NET_RAW, CAP_SYS_ADMIN, CAP_SYS_PTRACE).
+    - Windows UAC (User Account Control) gives administrators a split token:
+      runs desktop as Medium integrity and prompts on Secure Desktop to elevate
+      to High integrity token.
+
+- Modern Sandboxing Primitives:
+  * Linux: Namespaces (pid, net, mnt, uts, ipc, user, cgroup, time) + cgroups v2
+    (CPU, memory, I/O bandwidth quotas) + seccomp-bpf (BPF syscall whitelist) +
+    Landlock LSM (unprivileged filesystem sandboxing).
+  * Windows: Job Objects, Restricted Tokens, AppContainer (UWP/Edge/Chrome
+    sandbox), and VBS (Virtualization-Based Security / Hypervisor-Protected
+    Code Integrity HVCI / Credential Guard).
+
+================================================================================
+13. VIRTUALIZATION, CONTAINERS & HYPERVISORS
+================================================================================
+- Type-1 vs. Type-2 Virtualization:
+  * Linux KVM (Kernel-based Virtual Machine): Turns Linux kernel into a Type-1
+    hypervisor using Intel VT-x / AMD-V; paired with QEMU for device emulation
+    and virtio paravirtualized drivers (virtio-net, virtio-blk, virtio-gpu).
+  * Windows Hyper-V: Type-1 hypervisor booting beneath the Windows root
+    partition; powers WSL2 (Windows Subsystem for Linux 2, running a real Linux
+    kernel inside a lightweight utility VM) and Windows Sandbox.
+- OS-Level Virtualization (Containers):
+  * Shares the host kernel; isolates user-space environments via Linux
+    Namespaces + cgroups + OverlayFS (Docker, Podman, LXC/LXD, systemd-nspawn)
+    or Windows Server/Process Containers.
+
+================================================================================
+14. GRANULAR / LOW-LEVEL MICRO-SETTINGS & SYSTEM TWEAKS
+================================================================================
+- DEBIAN / LINUX MICRO-SETTINGS:
+  1. Remap Caps Lock to Escape or Ctrl (TTY + X11 + Wayland):
+     Edit /etc/default/keyboard -> XKBOPTIONS="caps:escape" (or "ctrl:nocaps")
+     Apply: sudo dpkg-reconfigure -phigh console-setup && sudo udevadm trigger -s input
+  2. Hardware Scancode Remap via udev hwdb (works even before X/Wayland):
+     Create /etc/udev/hwdb.d/90-custom-keys.hwdb:
+       evdev:atkbd:dmi:*
+        KEYBOARD_KEY_3a=esc
+     Apply: sudo systemd-hwdb update && sudo udevadm trigger
+  3. Key Repeat Speed:
+     Console: sudo kbdrate -d 250 -r 30
+     GNOME:   gsettings set org.gnome.desktop.peripherals.keyboard delay 250
+              gsettings set org.gnome.desktop.peripherals.keyboard repeat-interval 25
+  4. Kernel Memory, Disk & Network Tuning (/etc/sysctl.d/99-tuning.conf):
+     vm.swappiness=10                        # Prefer RAM over swap
+     vm.vfs_cache_pressure=50                # Keep directory/inode caches longer
+     vm.dirty_background_ratio=5             # Start background disk flush early
+     vm.dirty_ratio=10                       # Prevent large I/O stall spikes
+     fs.inotify.max_user_watches=524288      # Increase file watcher limit for IDEs
+     net.core.default_qdisc=fq               # Fair Queue packet scheduler
+     net.ipv4.tcp_congestion_control=bbr     # Google BBR TCP congestion control
+     kernel.sysrq=1                          # Enable Alt+SysRq+REISUB recovery
+  5. Disable Hardware Beep Speaker:
+     echo "blacklist pcspkr" | sudo tee /etc/modprobe.d/nobeep.conf
+  6. Readline Shell Tweaks (~/.inputrc):
+     set bell-style none
+     set completion-ignore-case on
+     set show-all-if-ambiguous on
+  7. SSD Performance & Longevity:
+     Add "noatime,discard=async" to /etc/fstab and enable fstrim.timer.
+  8. Journald Log Size Cap (/etc/systemd/journald.conf):
+     SystemMaxUse=200M
+
+- WINDOWS MICRO-SETTINGS:
+  1. Hardware Scancode Remap (Registry Binary Value):
+     Path: HKLM\SYSTEM\CurrentControlSet\Control\Keyboard Layout
+     Name: Scancode Map (REG_BINARY)
+     Example (Caps Lock 0x3A -> Left Ctrl 0x1D):
+       00 00 00 00  00 00 00 00  02 00 00 00  1D 00 3A 00  00 00 00 00
+     (Requires reboot/re-logon; processed inside win32k.sys RIT).
+  2. Keyboard Repeat Delay & Speed:
+     HKCU\Control Panel\Keyboard -> KeyboardDelay="0" (shortest), KeyboardSpeed="31" (fastest).
+  3. Enable Long File Paths (>260 chars):
+     HKLM\SYSTEM\CurrentControlSet\Control\FileSystem -> LongPathsEnabled=1 (DWORD).
+  4. Disable NTFS 8.3 Legacy Short Names & Last-Access Stamps:
+     fsutil behavior set disable8dot3 1
+     fsutil behavior set disablelastaccess 1
+  5. Unprivileged Symlinks (Developer Mode):
+     HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock -> AllowDevelopmentWithoutDevLicense=1
+  6. Foreground CPU Quantum Boost Tuning:
+     HKLM\SYSTEM\CurrentControlSet\Control\PriorityControl -> Win32PrioritySeparation=0x26
+  7. Disable Hibernation File (reclaim GBs of C: space) or Shrink It:
+     powercfg /h off   (or: powercfg /h /type reduced)
+  8. Unhide Hidden Processor Power Settings (e.g., Boost Mode):
+     powercfg -attributes SUB_PROCESSOR PERFBOOSTMODE -ATTRIB_HIDE
+  9. Disable Nagle's Algorithm (Lower TCP Latency):
+     HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\<GUID>
+     Add DWORDs: TcpAckFrequency=1, TCPNoDelay=1
+ 10. Restore Classic Windows 10 Context Menu on Windows 11:
+     reg add "HKCU\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\InprocServer32" /f /ve
+
+================================================================================
+15. COMPLETE OPERATIONS & COMMAND MATRIX (DEBIAN LINUX VS. WINDOWS)
+================================================================================
+[15.1 System, Boot & Hardware Diagnostics]
+- OS & Kernel Info
+  * Linux  : uname -a; lsb_release -a; hostnamectl; cat /proc/cmdline
+  * Windows: systeminfo; winver; Get-ComputerInfo; bcdedit /enum
+- Boot & Kernel Logs
+  * Linux  : journalctl -b -p err; dmesg -T; systemd-analyze blame
+  * Windows: Get-WinEvent -LogName System -MaxEvents 50; eventvwr.msc
+- Hardware & Drivers
+  * Linux  : lscpu; lsmem; lspci -nnk; lsusb -v; dmidecode; lsmod; modprobe
+  * Windows: msinfo32; dxdiag; driverquery /v; Get-PnpDevice; pnputil /enum-devices
+- Power & Thermal
+  * Linux  : upower -d; sensors; cpupower frequency-info; systemctl suspend
+  * Windows: powercfg /batteryreport; powercfg /sleepstudy; powercfg /requests
+
+[15.2 Process, Memory & Service Management]
+- List & Inspect Processes
+  * Linux  : ps auxf; top; htop; pgrep -a <name>; pidof <name>
+  * Windows: tasklist /v; Get-Process; Get-CimInstance Win32_Process
+- Terminate Processes
+  * Linux  : kill -15 <pid> (graceful); kill -9 <pid> (force); pkill -f <pat>
+  * Windows: taskkill /PID <id> /F; Stop-Process -Id <id> -Force
+- Priority & CPU Core Pinning
+  * Linux  : nice -n 10 <cmd>; renice -n -5 -p <pid>; taskset -c 0-3 <cmd>; ionice
+  * Windows: start /high /affinity F <cmd>; (Get-Process -Id <id>).PriorityClass="High"
+- Open Files & Memory Maps
+  * Linux  : lsof -p <pid>; pmap -x <pid>; free -h; cat /proc/meminfo; vmstat 1
+  * Windows: handle.exe -p <pid>; vmmap.exe; resmon; Get-Counter '\Memory\Available MBytes'
+- Services & Scheduled Jobs
+  * Linux  : systemctl status/start/stop/restart/enable/disable/mask <unit>;
+             crontab -e; systemctl list-timers
+  * Windows: sc query/start/stop/config <svc>; Get-Service; services.msc;
+             schtasks /query; Get-ScheduledTask
+
+[15.3 Storage, Partitions & File Systems]
+- Disks, Partitions & UUIDs
+  * Linux  : lsblk -f; blkid; fdisk -l; parted -l; df -hT; du -sh *
+  * Windows: Get-Disk; Get-Partition; Get-Volume; diskpart; wmic logicaldisk
+- Format & Repair Filesystems
+  * Linux  : mkfs.ext4 /dev/sdX1; mkfs.vfat -F32 /dev/sdX1; fsck -y /dev/sdX1
+  * Windows: Format-Volume -DriveLetter E -FileSystem NTFS; chkdsk E: /f /r
+- Mount & Links
+  * Linux  : mount -o rw,noatime /dev/sdX1 /mnt; umount /mnt; ln -s <src> <dst>
+  * Windows: mountvol E: /d; mklink <link> <target>; mklink /D <dirlink> <target>
+- Encryption & System File Integrity
+  * Linux  : cryptsetup luksFormat /dev/sdX1; cryptsetup open; debsums -c
+  * Windows: manage-bde -status; Enable-BitLocker; sfc /scannow;
+             DISM /Online /Cleanup-Image /RestoreHealth
+
+[15.4 Networking, Sockets & Firewall]
+- Interfaces, IPs & Routing
+  * Linux  : ip -c a; ip -c r; ip neigh; nmcli device status; resolvectl status
+  * Windows: ipconfig /all; route print; arp -a; Get-NetIPConfiguration
+- Active Ports & Connections
+  * Linux  : ss -tulnp; lsof -i -P -n
+  * Windows: netstat -abno; Get-NetTCPConnection | Select LocalAddress,LocalPort,State,OwningProcess
+- Diagnostics & Packet Capture
+  * Linux  : ping -c 4 <host>; traceroute <host>; mtr <host>; dig <domain>;
+             curl -I <url>; tcpdump -i any -nn port 443 -w out.pcap
+  * Windows: ping <host>; tracert <host>; pathping <host>; Resolve-DnsName <domain>;
+             Invoke-WebRequest -Uri <url>; pktmon start --etw -f out.etl
+- Firewall Control
+  * Linux  : nft list ruleset; ufw status verbose; ufw allow 22/tcp
+  * Windows: Get-NetFirewallProfile; New-NetFirewallRule -DisplayName "SSH" -Direction Inbound -LocalPort 22 -Protocol TCP -Action Allow
+
+[15.5 Users, Permissions, Security & Packages]
+- User & Group Administration
+  * Linux  : useradd -m -s /bin/bash -G sudo <user>; passwd <user>; id <user>; who
+  * Windows: net user <user> <pass> /add; net localgroup Administrators <user> /add; whoami /all
+- File Ownership, Permissions & ACLs
+  * Linux  : chown -R user:group <path>; chmod 0750 <path>; setfacl -m u:bob:rx <path>
+  * Windows: takeown /f <path> /r; icacls <path> /grant "User:(OI)(CI)F" /t
+- Security Policy & Mandatory Access Control
+  * Linux  : aa-status; aa-enforce /etc/apparmor.d/*; getenforce; visudo
+  * Windows: gpresult /r; gpupdate /force; secpol.msc; secedit /export /cfg pol.inf
+- Package & Software Management
+  * Linux  : apt update && apt full-upgrade -y; apt install <pkg>; apt purge <pkg>;
+             apt-cache search <kw>; dpkg -L <pkg>; dpkg -S <file>; apt-mark hold <pkg>
+  * Windows: winget search <kw>; winget install <id>; winget upgrade --all;
+             winget uninstall <id>; Get-AppxPackage; dism /online /get-features
+================================================================================

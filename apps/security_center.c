@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Security centre (apps/security_center.c)
+ * Kryzen OS — Security centre (apps/security_center.c)
  * Language: C17
  *
  * Shows the real state of the security subsystem (nothing here is simulated:

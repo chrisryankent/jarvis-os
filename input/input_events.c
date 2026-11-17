@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Input Event System (input/input_events.c)
+ * Kryzen OS — Input Event System (input/input_events.c)
  * Language: C17
  *
  * Unified keyboard/mouse input handling for window manager.

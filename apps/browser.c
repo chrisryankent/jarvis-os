@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Browser (apps/browser.c)
+ * Kryzen OS — Browser (apps/browser.c)
  *
  * A web browser for HTTP and HTTPS (TLS 1.3, kernel/tls.c):
  *   - HTML: headings, paragraphs, lists, links, bold, code/pre, quotes,
@@ -9,9 +9,15 @@
  *   - forms with text fields and buttons (GET and POST), so searches work
  *   - address bar: a web address, or words to search for (DuckDuckGo)
  *   - back, forward, reload / stop, home, favorites (saved in the registry
- *     under HKCU\Software\JARVIS OS\Browser\Favorites)
+ *     under HKCU\Software\Kryzen OS\Browser\Favorites)
  *   - downloads go to Downloads; a .jpk app can be installed from the bar
  *   - file:// opens local pages and files
+ *   - find in page (Ctrl+F, Enter / F3 for the next match), text size
+ *     (Ctrl + / Ctrl - / Ctrl 0), history (Ctrl+H, about:history), an
+ *     editable address bar (arrows, Home/End, Ctrl+A/C/V), Tab between
+ *     form fields
+ *   - JARVIS can drive it (browser_ai: open, search, read, links, click,
+ *     fill, find, scroll, back/forward)
  * No JavaScript and no CSS layout: pages show as readable text and pictures.
  * =============================================================================
  */
@@ -104,6 +110,17 @@ static struct {
     br_dl_t dl[BR_MAX_DL];
     int show_dl;
     char msg[200];
+    /* text size: 0 normal, 1 large, 2 larger */
+    int zoom;
+    /* address bar caret */
+    int addr_cur;
+    /* find in page */
+    int find_open, find_len, find_hits, find_cur;
+    char find[64];
+    /* pages visited this session, newest last (about:history) */
+    char hist_url[48][256];
+    char hist_title[48][96];
+    int nhist;
 } br;
 
 void apps_store_show_install(const char *path);
@@ -149,15 +166,24 @@ static struct {
     const char *after;                      /* html just after the current tag */
 } L;
 
+/* Body text face for the chosen text size. */
+static int br_body_font(void)
+{
+    return br.zoom >= 2 ? FONT_SUBHEAD : br.zoom == 1 ? FONT_MEDIUM : FONT_UI;
+}
+
 static int br_font(void)
 {
     if (L.mono) return FONT_MONO;
-    return L.font == FONT_UI && L.bold ? FONT_UI_BOLD : L.font;
+    if (L.bold && L.font == FONT_UI) return FONT_UI_BOLD;
+    if (L.bold && L.font == FONT_MEDIUM) return FONT_MEDIUM_BOLD;
+    return L.font;
 }
 
 static int br_font_h(int f)
 {
-    return f == FONT_TITLE ? 34 : f == FONT_LARGE ? 48 : f == FONT_SMALL ? 18 : 20;
+    return f == FONT_TITLE ? 34 : f == FONT_LARGE ? 48 : f == FONT_SMALL ? 18 :
+           f == FONT_MEDIUM || f == FONT_MEDIUM_BOLD ? 24 : f == FONT_SUBHEAD ? 28 : 20;
 }
 
 static void br_flush_run(void)
@@ -559,8 +585,8 @@ static void br_tag(const char *tag, int tl)
     if (name[0] == 'h' && name[1] >= '1' && name[1] <= '6' && !name[2]) {
         int lvl = name[1] - '0';
         br_block(lvl <= 2 ? 20 : 14);
-        if (closing) { L.font = FONT_UI; L.bold = 0; L.color = BR_TEXT; br_block(4); }
-        else { L.font = lvl == 1 ? FONT_LARGE : lvl == 2 ? FONT_TITLE : FONT_UI; L.bold = 1; L.line_h = br_font_h(br_font()); }
+        if (closing) { L.font = br_body_font(); L.bold = 0; L.color = BR_TEXT; br_block(4); }
+        else { L.font = lvl == 1 ? FONT_LARGE : lvl == 2 ? FONT_TITLE : br_body_font(); L.bold = 1; L.line_h = br_font_h(br_font()); }
         if (lvl == 1 && !closing) L.font = FONT_TITLE;
         return;
     }
@@ -605,7 +631,7 @@ static void br_tag(const char *tag, int tl)
     if (tag_is(name, "pre")) { br_block(8); L.pre = !closing; L.mono = !closing; return; }
     if (tag_is(name, "code") || tag_is(name, "kbd") || tag_is(name, "samp") || tag_is(name, "tt")) { if (!L.pre) L.mono = !closing; return; }
     if (tag_is(name, "b") || tag_is(name, "strong")) { L.bold += closing ? -1 : 1; if (L.bold < 0) L.bold = 0; return; }
-    if (tag_is(name, "small")) { L.font = closing ? FONT_UI : FONT_SMALL; return; }
+    if (tag_is(name, "small")) { L.font = closing ? br_body_font() : (br.zoom ? FONT_UI : FONT_SMALL); return; }
     if (tag_is(name, "a")) {
         if (closing) { br_flush_run(); L.link = -1; return; }
         char href[512];
@@ -683,12 +709,12 @@ static void br_layout(int width)
     L.right = width - 24;
     L.x = L.left;
     L.y = 16;
-    L.font = FONT_UI;
+    L.font = br_body_font();
     L.color = BR_TEXT;
     L.link = -1;
     L.form = -1;
     L.line_empty = 1;
-    L.line_h = 20;
+    L.line_h = br_font_h(L.font);
     br.layout_w = width;
     const char *h = (const char *)br.html;
     size_t n = br.html_len;
@@ -835,7 +861,7 @@ static void br_home_page(void)
         setting_get_int("search_engine", 0) == 1 ? "<input type=\"hidden\" name=\"gbv\" value=\"1\">" : "",
         br_search_name(), br_search_name());
     /* favorites from the registry */
-    int k = reg_open_key("HKCU\\Software\\JARVIS OS\\Browser\\Favorites", 0);
+    int k = reg_open_key("HKCU\\Software\\Kryzen OS\\Browser\\Favorites", 0);
     char nm[64], val[512];
     int type, any = 0;
     for (int i = 0; k >= 0 && reg_value_at(k, i, nm, sizeof(nm), &type, val, sizeof(val), NULL) == 0 && n < (int)sizeof(page) - 700; i++) {
@@ -845,11 +871,39 @@ static void br_home_page(void)
     }
     if (any) n += snprintf(page + n, sizeof(page) - (size_t)n, "</ul>");
     n += snprintf(page + n, sizeof(page) - (size_t)n,
-        "<h3>About</h3><p>Secure pages use TLS 1.3, checked against the trusted root certificates built into JARVIS OS. "
-        "Pages show as text and pictures: there is no JavaScript. Downloads are saved in <a href=\"file:///jarvis/data/Downloads\">Downloads</a>; "
-        "JARVIS OS apps (.jpk) can be installed straight from the downloads bar.</p>");
+        "<h3>About</h3><p>Secure pages use TLS 1.3, checked against the trusted root certificates built into Kryzen OS. "
+        "Pages show as text and pictures: there is no JavaScript. Downloads are saved in <a href=\"file:///kryzen/data/Downloads\">Downloads</a>; "
+        "Kryzen OS apps (.jpk) can be installed straight from the downloads bar.</p>");
     br_set_html(page, (size_t)n, 0);
     br.secure = 0;
+}
+
+static void br_history_page(void)
+{
+    static char page[24576];
+    int n = snprintf(page, sizeof(page), "<title>History</title><h1>History</h1>");
+    if (!br.nhist) n += snprintf(page + n, sizeof(page) - (size_t)n, "<p>No pages visited since Kryzen OS started.</p>");
+    else n += snprintf(page + n, sizeof(page) - (size_t)n, "<p>Pages visited since Kryzen OS started, newest first.</p><ul>");
+    for (int i = br.nhist - 1; i >= 0 && n < (int)sizeof(page) - 500; i--)
+        n += snprintf(page + n, sizeof(page) - (size_t)n, "<li><a href=\"%s\">%s</a> <small>%s</small></li>", br.hist_url[i],
+                      br.hist_title[i][0] ? br.hist_title[i] : br.hist_url[i], br.hist_url[i]);
+    if (br.nhist) n += snprintf(page + n, sizeof(page) - (size_t)n, "</ul>");
+    br_set_html(page, (size_t)n, 0);
+    br.secure = 0;
+}
+
+static void br_history_record(const char *url)
+{
+    if (!url[0] || !strncmp(url, "about:", 6)) return;
+    if (br.nhist && !strcmp(br.hist_url[br.nhist - 1], url)) return;
+    if (br.nhist == 48) {
+        memmove(br.hist_url[0], br.hist_url[1], sizeof(br.hist_url[0]) * 47);
+        memmove(br.hist_title[0], br.hist_title[1], sizeof(br.hist_title[0]) * 47);
+        br.nhist--;
+    }
+    snprintf(br.hist_url[br.nhist], sizeof(br.hist_url[0]), "%s", url);
+    br.hist_title[br.nhist][0] = 0;
+    br.nhist++;
 }
 
 static int br_is_download_url(const char *u)
@@ -875,8 +929,8 @@ static void br_download(const char *url)
     memset(d, 0, sizeof(*d));
     snprintf(d->req.url, sizeof(d->req.url), "%s", url);
     http_suggest_name(&d->req, d->name, sizeof(d->name));
-    if (!vfs_is_dir("/jarvis/data/Downloads")) vfs_mkdir("/jarvis/data/Downloads");
-    snprintf(d->path, sizeof(d->path), "/jarvis/data/Downloads/%s", d->name);
+    if (!vfs_is_dir("/kryzen/data/Downloads")) vfs_mkdir("/kryzen/data/Downloads");
+    snprintf(d->path, sizeof(d->path), "/kryzen/data/Downloads/%s", d->name);
     snprintf(d->req.save_path, sizeof(d->req.save_path), "%s", d->path);
     d->active = 1;
     br.show_dl = 1;
@@ -948,7 +1002,10 @@ static void br_navigate(const char *target, int push)
     br.addr_focus = 0;
     br.msg[0] = 0;
     br.tls[0] = 0;
+    br.addr_cur = br.addr_len;
+    br.find_hits = 0;
     if (!strcmp(u, BR_HOME) || !strcmp(u, "about:blank")) { br_home_page(); snprintf(br.addr, sizeof(br.addr), "%s", u); return; }
+    if (!strcmp(u, "about:history")) { br_history_page(); return; }
     if (!strncmp(u, "file://", 7)) { br.secure = 0; br_load_file(u + 7); br.title[0] = 0; return; }
     if (strncmp(u, "http://", 7) && strncmp(u, "https://", 8)) { br_error_page(u, "Only http, https and file addresses can be opened."); return; }
     if (br.loading) { http_free(&br.nav); }
@@ -1040,12 +1097,13 @@ static void br_poll(void)
                 br.layout_w = 0;
             } else if (html || text) {
                 br_set_html(br.nav.data ? (char *)br.nav.data : "", br.nav.len, !html);
+                br_history_record(br.url);
             } else {
                 /* a file: save it in Downloads */
                 char name[96], path[256];
                 http_suggest_name(&br.nav, name, sizeof(name));
-                if (!vfs_is_dir("/jarvis/data/Downloads")) vfs_mkdir("/jarvis/data/Downloads");
-                snprintf(path, sizeof(path), "/jarvis/data/Downloads/%s", name);
+                if (!vfs_is_dir("/kryzen/data/Downloads")) vfs_mkdir("/kryzen/data/Downloads");
+                snprintf(path, sizeof(path), "/kryzen/data/Downloads/%s", name);
                 vfs_write_file(path, br.nav.data ? br.nav.data : (uint8_t *)"", br.nav.len);
                 snprintf(br.msg, sizeof(br.msg), "Saved %s (%u KB) in Downloads.", name, (unsigned)(br.nav.len >> 10));
                 notification_show("Download complete", name, NOTIF_INFO, 5000);
@@ -1139,14 +1197,14 @@ static void br_draw_toolbar(int x, int y, int w)
     if (shown[0]) ui_text_fit(ax + 36, y + 15, aw - 50, shown, br.addr_focus && br.addr_sel_all ? T(ACCENT_TEXT) : T(TEXT));
     else if (!br.addr_focus) fb_draw_text(ax + 36, y + 15, "Search or type a web address", T(TEXT_DIM));
     if (br.addr_focus && !br.addr_sel_all) {
-        int cx = ax + 36 + fb_text_width(br.addr);
+        int cx = ax + 36 + fb_text_width_n(br.addr, br.addr_cur);
         if (cx > ax + aw - 14) cx = ax + aw - 14;
         fb_fill_rect(cx + 1, y + 15, 1, 16, T(TEXT));
     }
     /* favorite star, downloads */
     int fav = 0;
     {
-        int k = reg_open_key("HKCU\\Software\\JARVIS OS\\Browser\\Favorites", 0);
+        int k = reg_open_key("HKCU\\Software\\Kryzen OS\\Browser\\Favorites", 0);
         char nm[64], val[512];
         int type;
         for (int i = 0; k >= 0 && reg_value_at(k, i, nm, sizeof(nm), &type, val, sizeof(val), NULL) == 0; i++) if (!strcmp(val, br.url)) fav = 1;
@@ -1160,6 +1218,59 @@ static void br_draw_toolbar(int x, int y, int w)
     fb_fill_rect(dx + 15, y + 11, 3, 13, dc);
     for (int k = 0; k < 6; k++) fb_fill_rect(dx + 16 - k, y + 24 - 6 + k, 2 * k + 1, 1, dc);
     fb_fill_rect(dx + 8, y + 30, 17, 2, dc);
+}
+
+/* ---- find in page ------------------------------------------------------------------------ */
+/* Number of the match at (item, offset), counting from the top of the page. */
+static int br_match_index(int item, int off)
+{
+    int n = 0;
+    for (int i = 0; i <= item && i < br.nitems; i++) {
+        br_item_t *it = &br.items[i];
+        if (it->kind != BI_TEXT) continue;
+        const char *t = br.pool + it->off;
+        for (int k = 0; k + br.find_len <= it->len; k++) {
+            if (strncasecmp_br(t + k, br.find, br.find_len)) continue;
+            if (i == item && k == off) return n;
+            n++;
+            k += br.find_len - 1;
+        }
+    }
+    return -1;
+}
+
+/* Counts the matches and scrolls to match number `which` (wraps). */
+static void br_find_go(int which, int view_h)
+{
+    br.find_hits = 0;
+    if (!br.find_len) return;
+    int hit_y = -1, n = 0;
+    for (int i = 0; i < br.nitems; i++) {
+        br_item_t *it = &br.items[i];
+        if (it->kind != BI_TEXT) continue;
+        const char *t = br.pool + it->off;
+        for (int k = 0; k + br.find_len <= it->len; k++) {
+            if (strncasecmp_br(t + k, br.find, br.find_len)) continue;
+            n++;
+            k += br.find_len - 1;
+        }
+    }
+    br.find_hits = n;
+    if (!n) return;
+    br.find_cur = ((which % n) + n) % n;
+    n = 0;
+    for (int i = 0; i < br.nitems && hit_y < 0; i++) {
+        br_item_t *it = &br.items[i];
+        if (it->kind != BI_TEXT) continue;
+        const char *t = br.pool + it->off;
+        for (int k = 0; k + br.find_len <= it->len; k++) {
+            if (strncasecmp_br(t + k, br.find, br.find_len)) continue;
+            if (n++ == br.find_cur) { hit_y = it->y; break; }
+            k += br.find_len - 1;
+        }
+    }
+    if (hit_y >= 0 && (hit_y < br.scroll || hit_y > br.scroll + view_h - 40)) br.scroll = hit_y - view_h / 3;
+    desktop_invalidate();
 }
 
 static void br_draw_page(int x, int y, int w, int h)
@@ -1190,6 +1301,16 @@ static void br_draw_page(int x, int y, int w, int h)
         case BI_TEXT: {
             uint32_t col = it->color;
             int hovered = it->link >= 0 && it->link == br.hover_link;
+            if (br.find_open && br.find_len) {                /* find in page: mark the matches */
+                const char *t = br.pool + it->off;
+                for (int k = 0; k + br.find_len <= it->len; k++) {
+                    if (strncasecmp_br(t + k, br.find, br.find_len)) continue;
+                    int mx0 = ix + fb_text_width_n_font(t, k, it->font);
+                    int mw = fb_text_width_n_font(t + k, br.find_len, it->font);
+                    fb_fill_rect(mx0, iy, mw, br_font_h(it->font) - 2, br_match_index(i, k) == br.find_cur ? 0x00FF9632 : 0x00FFE58F);
+                    k += br.find_len - 1;
+                }
+            }
             fb_text_n(ix, iy, br.pool + it->off, it->len, col, it->font);
             if (it->underline && hovered) fb_fill_rect(ix, iy + br_font_h(it->font) - 4, it->w, 1, col);
             break;
@@ -1309,13 +1430,23 @@ void browser_draw(wm_window_t *win, uint32_t *fbp)
     fb_fill_rect(x, sy, w, BR_STATUS_H, T(SURFACE));
     fb_fill_rect(x, sy, w, 1, T(BORDER));
     char st[300];
-    if (br.hover_link >= 0 && br.hover_link < br.nlinks) snprintf(st, sizeof(st), "%s", br.links[br.hover_link]);
+    if (br.find_open) {
+        char res[48];
+        if (!br.find_len) res[0] = 0;
+        else if (br.find_hits) snprintf(res, sizeof(res), "   %d of %d", br.find_cur + 1, br.find_hits);
+        else snprintf(res, sizeof(res), "   no matches");
+        snprintf(st, sizeof(st), "Find: %s|%s     (Enter: next, Shift+Enter: previous, Esc: close)", br.find, res);
+        ui_text_fit(x + 10, sy + 4, w - 20, st, T(TEXT));
+        st[0] = 0;
+    } else if (br.hover_link >= 0 && br.hover_link < br.nlinks) snprintf(st, sizeof(st), "%s", br.links[br.hover_link]);
     else if (br.loading) snprintf(st, sizeof(st), "%s%s", br.nav.phase[0] ? br.nav.phase : "Starting", SYM_ELLIPSIS);
     else if (br.msg[0]) snprintf(st, sizeof(st), "%s", br.msg);
     else if (br.secure == 1) snprintf(st, sizeof(st), "Secure connection (%s), certificate checked", br.tls);
     else if (!strncmp(br.url, "http://", 7)) snprintf(st, sizeof(st), "Not secure: this page is not encrypted (http)");
     else st[0] = 0;
-    ui_text_fit(x + 10, sy + 4, w - 20, st, T(TEXT_DIM));
+    if (st[0]) ui_text_fit(x + 10, sy + 4, w - 20, st, T(TEXT_DIM));
+    if (br.nhist && br.title[0] && !br.hist_title[br.nhist - 1][0] && !strcmp(br.hist_url[br.nhist - 1], br.url))
+        snprintf(br.hist_title[br.nhist - 1], sizeof(br.hist_title[0]), "%s", br.title);
     char t[200];
     snprintf(t, sizeof(t), "%s - Browser", br.title[0] ? br.title : br.url[0] ? br.url : "New tab");
     wm_set_title(win, t);
@@ -1334,7 +1465,7 @@ static int br_hit_item(int px, int py)
 
 static void br_toggle_favorite(void)
 {
-    const char *key = "HKCU\\Software\\JARVIS OS\\Browser\\Favorites";
+    const char *key = "HKCU\\Software\\Kryzen OS\\Browser\\Favorites";
     int k = reg_open_key(key, 1);
     char nm[64], val[512];
     int type;
@@ -1345,6 +1476,19 @@ static void br_toggle_favorite(void)
     for (char *c = name; *c; c++) if (*c == '\\') *c = '/';
     reg_set_sz(key, name, br.url);
     snprintf(br.msg, sizeof(br.msg), "Added to favorites (on the home page).");
+}
+
+/* Inserts typed or pasted text at the address bar caret. */
+static void br_addr_insert(const char *t, int n)
+{
+    if (br.addr_sel_all) { br.addr_len = 0; br.addr[0] = 0; br.addr_cur = 0; br.addr_sel_all = 0; }
+    if (br.addr_cur > br.addr_len) br.addr_cur = br.addr_len;
+    if (br.addr_len + n >= (int)sizeof(br.addr)) n = (int)sizeof(br.addr) - 1 - br.addr_len;
+    if (n <= 0) return;
+    memmove(br.addr + br.addr_cur + n, br.addr + br.addr_cur, (size_t)(br.addr_len - br.addr_cur + 1));
+    memcpy(br.addr + br.addr_cur, t, (size_t)n);
+    br.addr_cur += n;
+    br.addr_len += n;
 }
 
 void browser_event(wm_window_t *win, wm_input_event_t *e)
@@ -1367,9 +1511,11 @@ void browser_event(wm_window_t *win, wm_input_event_t *e)
     case IE_TEXT_INPUT: {
         char c = e->data.text.ch;
         if (c < 32 || c > 126) return;
-        if (br.addr_focus) {
-            if (br.addr_sel_all) { br.addr_len = 0; br.addr[0] = 0; br.addr_sel_all = 0; }
-            if (br.addr_len < (int)sizeof(br.addr) - 1) { br.addr[br.addr_len++] = c; br.addr[br.addr_len] = 0; }
+        if (br.find_open) {
+            if (br.find_len < (int)sizeof(br.find) - 1) { br.find[br.find_len++] = c; br.find[br.find_len] = 0; }
+            br_find_go(0, ph);
+        } else if (br.addr_focus) {
+            br_addr_insert(&c, 1);
         } else if (br.focus_input >= 0) {
             br_input_t *in = &br.inputs[br.focus_input];
             size_t l = strlen(in->value);
@@ -1381,17 +1527,64 @@ void browser_event(wm_window_t *win, wm_input_event_t *e)
         uint32_t k = e->data.keyboard.key;
         int mods = e->data.keyboard.mods;
         char lk = (char)(k | 32);
-        if ((mods & KMOD_CTRL) && lk == 'l') { br.addr_focus = 1; br.addr_sel_all = 1; br.focus_input = -1; return; }
-        if ((mods & KMOD_CTRL) && lk == 'd') { br_toggle_favorite(); return; }
-        if ((mods & KMOD_CTRL) && lk == 'j') { br.show_dl = !br.show_dl; return; }
-        if (k == WM_KEY_F1 + 4 || ((mods & KMOD_CTRL) && lk == 'r')) { br_navigate(br.url, 0); return; }
+        int ctrl = (mods & KMOD_CTRL) != 0;
+        if (ctrl && lk == 'l') { br.addr_focus = 1; br.addr_sel_all = 1; br.addr_cur = br.addr_len; br.focus_input = -1; br.find_open = 0; return; }
+        if (ctrl && lk == 'd') { br_toggle_favorite(); return; }
+        if (ctrl && lk == 'j') { br.show_dl = !br.show_dl; return; }
+        if (ctrl && lk == 'h') { br_navigate("about:history", 1); return; }
+        if (ctrl && lk == 'f') { br.find_open = 1; br.addr_focus = 0; br.focus_input = -1; br_find_go(0, ph); return; }
+        if (ctrl && (k == '=' || k == '+')) { if (br.zoom < 2) { br.zoom++; br.layout_w = 0; } return; }
+        if (ctrl && (k == '-' || k == '_')) { if (br.zoom > 0) { br.zoom--; br.layout_w = 0; } return; }
+        if (ctrl && k == '0') { br.zoom = 0; br.layout_w = 0; return; }
+        if (k == WM_KEY_F1 + 2) { if (!br.find_open) { br.find_open = 1; } br_find_go(br.find_cur + ((mods & KMOD_SHIFT) ? -1 : 1), ph); return; }
+        if (k == WM_KEY_F1 + 4 || (ctrl && lk == 'r')) { br_navigate(br.url, 0); return; }
         if ((mods & KMOD_ALT) && k == WM_KEY_LEFT && br.nback) { if (br.nfwd < 24) snprintf(br.fwd[br.nfwd++], sizeof(br.fwd[0]), "%s", br.url); br_navigate(br.back[--br.nback], 0); return; }
         if ((mods & KMOD_ALT) && k == WM_KEY_RIGHT && br.nfwd) { br_history_push(); br_navigate(br.fwd[--br.nfwd], 0); return; }
+        if (br.find_open) {
+            if (k == WM_KEY_ESC) { br.find_open = 0; desktop_invalidate(); }
+            else if (k == WM_KEY_ENTER) br_find_go(br.find_cur + ((mods & KMOD_SHIFT) ? -1 : 1), ph);
+            else if (k == WM_KEY_BACKSPACE && br.find_len) { br.find[--br.find_len] = 0; br_find_go(0, ph); }
+            else if (ctrl && lk == 'v') {
+                size_t cl; const char *cb = clipboard_get(&cl);
+                for (size_t i = 0; i < cl && br.find_len < (int)sizeof(br.find) - 1; i++)
+                    if (cb[i] >= 32 && cb[i] <= 126) br.find[br.find_len++] = cb[i];
+                br.find[br.find_len] = 0;
+                br_find_go(0, ph);
+            }
+            return;
+        }
         if (br.addr_focus) {
             if (k == WM_KEY_ENTER) { char t[1024]; snprintf(t, sizeof(t), "%s", br.addr); br_navigate(t, 1); }
-            else if (k == WM_KEY_ESC) { br.addr_focus = 0; snprintf(br.addr, sizeof(br.addr), "%s", br.url); br.addr_len = (int)strlen(br.addr); }
-            else if (k == WM_KEY_BACKSPACE) { if (br.addr_sel_all) { br.addr_len = 0; br.addr[0] = 0; br.addr_sel_all = 0; } else if (br.addr_len) br.addr[--br.addr_len] = 0; }
-            else if (k == WM_KEY_LEFT || k == WM_KEY_RIGHT || k == WM_KEY_END) br.addr_sel_all = 0;
+            else if (k == WM_KEY_ESC) { br.addr_focus = 0; snprintf(br.addr, sizeof(br.addr), "%s", br.url); br.addr_len = (int)strlen(br.addr); br.addr_cur = br.addr_len; }
+            else if (ctrl && lk == 'a') { br.addr_sel_all = 1; br.addr_cur = br.addr_len; }
+            else if (ctrl && lk == 'c') clipboard_set(br.addr, (size_t)br.addr_len);
+            else if (ctrl && lk == 'x') { clipboard_set(br.addr, (size_t)br.addr_len); br.addr_len = 0; br.addr[0] = 0; br.addr_cur = 0; br.addr_sel_all = 0; }
+            else if (ctrl && lk == 'v') {
+                size_t cl; const char *cb = clipboard_get(&cl);
+                char clean[1024]; int n = 0;
+                for (size_t i = 0; i < cl && n < (int)sizeof(clean) - 1; i++) if (cb[i] >= 32 && cb[i] <= 126) clean[n++] = cb[i];
+                br_addr_insert(clean, n);
+            }
+            else if (k == WM_KEY_BACKSPACE) {
+                if (br.addr_sel_all) { br.addr_len = 0; br.addr[0] = 0; br.addr_cur = 0; br.addr_sel_all = 0; }
+                else if (br.addr_cur > 0) { memmove(br.addr + br.addr_cur - 1, br.addr + br.addr_cur, (size_t)(br.addr_len - br.addr_cur + 1)); br.addr_cur--; br.addr_len--; }
+            }
+            else if (k == WM_KEY_DELETE) {
+                if (br.addr_sel_all) { br.addr_len = 0; br.addr[0] = 0; br.addr_cur = 0; br.addr_sel_all = 0; }
+                else if (br.addr_cur < br.addr_len) { memmove(br.addr + br.addr_cur, br.addr + br.addr_cur + 1, (size_t)(br.addr_len - br.addr_cur)); br.addr_len--; }
+            }
+            else if (k == WM_KEY_LEFT)  { if (br.addr_sel_all) br.addr_cur = 0; else if (br.addr_cur > 0) br.addr_cur--; br.addr_sel_all = 0; }
+            else if (k == WM_KEY_RIGHT) { if (!br.addr_sel_all && br.addr_cur < br.addr_len) br.addr_cur++; br.addr_sel_all = 0; }
+            else if (k == WM_KEY_HOME)  { br.addr_cur = 0; br.addr_sel_all = 0; }
+            else if (k == WM_KEY_END)   { br.addr_cur = br.addr_len; br.addr_sel_all = 0; }
+            return;
+        }
+        if (k == WM_KEY_TAB) {                            /* next (Shift: previous) text field */
+            int n = br.ninputs, from = br.focus_input;
+            for (int step = 1; step <= n; step++) {
+                int i = (mods & KMOD_SHIFT) ? ((from < 0 ? 0 : from) - step + n * 2) % n : ((from < 0 ? -1 : from) + step) % n;
+                if (br.inputs[i].type == 0) { br.focus_input = i; break; }
+            }
             return;
         }
         if (br.focus_input >= 0) {
@@ -1399,6 +1592,12 @@ void browser_event(wm_window_t *win, wm_input_event_t *e)
             if (k == WM_KEY_ENTER) br_submit(in->form, -1);
             else if (k == WM_KEY_BACKSPACE && in->value[0]) in->value[strlen(in->value) - 1] = 0;
             else if (k == WM_KEY_ESC) br.focus_input = -1;
+            else if (ctrl && lk == 'v') {
+                size_t cl; const char *cb = clipboard_get(&cl);
+                size_t l = strlen(in->value);
+                for (size_t i = 0; i < cl && l < sizeof(in->value) - 1; i++) if (cb[i] >= 32 && cb[i] <= 126) in->value[l++] = cb[i];
+                in->value[l] = 0;
+            }
             return;
         }
         if (k == WM_KEY_DOWN) br.scroll += 40;
@@ -1423,6 +1622,7 @@ void browser_event(wm_window_t *win, wm_input_event_t *e)
         return;
     }
     if (e->data.mouse.button != 1) return;
+    int was_addr = br.addr_focus;
     br.addr_focus = 0;
     if (my < BR_TOOL_H) {
         int b = (mx - 8) / 36;
@@ -1433,7 +1633,14 @@ void browser_event(wm_window_t *win, wm_input_event_t *e)
             else if (b == 3) br_navigate(BR_HOME, 1);
             return;
         }
-        if (mx >= 156 && mx < w - 96) { br.addr_focus = 1; br.addr_sel_all = 1; br.addr_len = (int)strlen(br.addr); br.focus_input = -1; return; }
+        if (mx >= 156 && mx < w - 96) {
+            if (was_addr) {                                      /* already editing: caret where clicked */
+                br.addr_cur = fb_text_index_at(br.addr, mx - 156 - 36, FONT_UI);
+                br.addr_sel_all = 0;
+            } else { br.addr_sel_all = 1; br.addr_len = (int)strlen(br.addr); br.addr_cur = br.addr_len; }
+            br.addr_focus = 1; br.focus_input = -1; br.find_open = 0;
+            return;
+        }
         if (mx >= w - 88 && mx < w - 52) { br_toggle_favorite(); return; }
         if (mx >= w - 48) { br.show_dl = !br.show_dl; return; }
         return;
@@ -1506,3 +1713,188 @@ int browser_start_download(const char *url)
     br_download(url);
     return 0;
 }
+
+/* ==========================================================================
+ * JARVIS control (kernel/ai_tools.c, tool "browser"). Uses the same
+ * navigation, links and forms as the mouse and keyboard; replies describe
+ * what the Browser really shows. A page still loading answers "LOADING:"
+ * so the caller can ask again.
+ * ========================================================================== */
+static int br_ci_has(const char *hay, int hn, const char *needle)
+{
+    int nl = (int)strlen(needle);
+    for (int i = 0; i + nl <= hn; i++) if (!strncasecmp_br(hay + i, needle, nl)) return 1;
+    return 0;
+}
+
+/* The Browser window, or NULL when it is closed (br.win outlives it). */
+static wm_window_t *br_live_win(void)
+{
+    desktop_app_t *app = desktop_app_get(desktop_app_find("Browser"));
+    return app && app->window ? app->window : NULL;
+}
+
+static void br_ensure_layout(void)
+{
+    br_poll();
+    if (br.layout_w) return;
+    int x, y, w, h;
+    if (br_live_win()) { wm_get_client(br.win, &x, &y, &w, &h); br_layout(w); }
+    else br_layout(900);
+}
+
+static void br_ai_status(char *out, size_t n)
+{
+    if (br.loading) snprintf(out, n, "LOADING: %s (%s)", br.nav.url, br.nav.phase[0] ? br.nav.phase : "starting");
+    else snprintf(out, n, "Browser shows \"%s\" (%s)%s.", br.title[0] ? br.title : "untitled page", br.url,
+                  br.secure == -1 ? ": the page could not be opened" : "");
+}
+
+int browser_ai(const char *action, const char *arg, char *out, size_t n)
+{
+    out[0] = 0;
+    if (!br_live_win()) desktop_app_launch(desktop_app_find("Browser"));
+    wm_window_t *win = br_live_win();
+    if (win) wm_set_focused(win);
+    const char *a = arg ? arg : "";
+    int x = 0, y = 0, w = 900, h = 600;
+    if (win) wm_get_client(win, &x, &y, &w, &h);
+    int ph = h - BR_TOOL_H - BR_STATUS_H;
+
+    if (!strcmp(action, "open") || !strcmp(action, "search")) {
+        if (!a[0]) { snprintf(out, n, "error: give a web address or the words to search for"); return -1; }
+        if (!strcmp(action, "search")) {
+            char q[600];
+            size_t o = (size_t)snprintf(q, sizeof(q), "%s", BR_SEARCH);
+            for (const char *c = a; *c && o < sizeof(q) - 4; c++) {
+                if (*c == ' ') q[o++] = '+';
+                else if ((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || strchr("-_.~", *c)) q[o++] = *c;
+                else o += (size_t)snprintf(q + o, sizeof(q) - o, "%%%02X", (unsigned char)*c);
+            }
+            q[o] = 0;
+            br_navigate(q, 1);
+        } else br_navigate(a, 1);
+    } else if (!strcmp(action, "back")) {
+        if (!br.nback) { snprintf(out, n, "error: there is no earlier page"); return -1; }
+        if (br.nfwd < 24) snprintf(br.fwd[br.nfwd++], sizeof(br.fwd[0]), "%s", br.url);
+        br_navigate(br.back[--br.nback], 0);
+    } else if (!strcmp(action, "forward")) {
+        if (!br.nfwd) { snprintf(out, n, "error: there is no next page"); return -1; }
+        br_history_push();
+        br_navigate(br.fwd[--br.nfwd], 0);
+    } else if (!strcmp(action, "reload")) {
+        br_navigate(br.url, 0);
+    } else if (!strcmp(action, "home")) {
+        br_navigate(BR_HOME, 1);
+    } else if (!strcmp(action, "history")) {
+        br_navigate("about:history", 1);
+    } else if (!strcmp(action, "read")) {
+        br_ensure_layout();
+        if (br.loading) { br_ai_status(out, n); return 0; }
+        size_t k = (size_t)snprintf(out, n, "%s (%s)\n", br.title[0] ? br.title : "Page", br.url);
+        int last_y = -1;
+        for (int i = 0; i < br.nitems && k + 4 < n; i++) {
+            br_item_t *it = &br.items[i];
+            if (it->kind != BI_TEXT && it->kind != BI_BUTTON && it->kind != BI_INPUT) continue;
+            if (last_y >= 0 && it->y != last_y && out[k - 1] != '\n') out[k++] = '\n';
+            else if (last_y >= 0 && out[k - 1] != '\n') out[k++] = ' ';
+            last_y = it->y;
+            const char *t = it->kind == BI_TEXT ? br.pool + it->off : br.inputs[it->ref].value;
+            int tl = it->kind == BI_TEXT ? it->len : (int)strlen(t);
+            if (it->kind == BI_INPUT) { k += (size_t)snprintf(out + k, n - k, "[text field%s%s]", t[0] ? ": " : "", t); continue; }
+            if (it->kind == BI_BUTTON) { k += (size_t)snprintf(out + k, n - k, "[button %s]", t[0] ? t : "Go"); continue; }
+            if ((size_t)tl > n - k - 2) tl = (int)(n - k - 2);
+            memcpy(out + k, t, (size_t)tl);
+            k += (size_t)tl;
+        }
+        out[k < n ? k : n - 1] = 0;
+        return 0;
+    } else if (!strcmp(action, "links")) {
+        br_ensure_layout();
+        if (br.loading) { br_ai_status(out, n); return 0; }
+        size_t k = (size_t)snprintf(out, n, "Links on %s:\n", br.url);
+        int last = -1, shown = 0;
+        for (int i = 0; i < br.nitems && k + 120 < n && shown < 60; i++) {
+            br_item_t *it = &br.items[i];
+            if (it->kind != BI_TEXT || it->link < 0 || it->link == last) continue;
+            last = it->link;
+            if (it->len < 2) continue;
+            k += (size_t)snprintf(out + k, n - k, "- %.*s\n", it->len > 80 ? 80 : it->len, br.pool + it->off);
+            shown++;
+        }
+        if (!shown) snprintf(out + k, n - k, "(none)");
+        return 0;
+    } else if (!strcmp(action, "click")) {
+        br_ensure_layout();
+        if (br.loading) { br_ai_status(out, n); return -1; }
+        if (!a[0]) { snprintf(out, n, "error: say which link or button to click (its text)"); return -1; }
+        int best = -1;
+        for (int i = 0; i < br.nitems; i++) {                  /* exact text first, then contains */
+            br_item_t *it = &br.items[i];
+            if (it->kind == BI_TEXT && it->link >= 0 && (int)strlen(a) == it->len && !strncasecmp_br(br.pool + it->off, a, it->len)) { best = i; break; }
+        }
+        for (int i = 0; i < br.nitems && best < 0; i++) {
+            br_item_t *it = &br.items[i];
+            if (it->kind == BI_TEXT && it->link >= 0 && br_ci_has(br.pool + it->off, it->len, a)) best = i;
+            else if (it->kind == BI_BUTTON && br_ci_has(br.inputs[it->ref].value, (int)strlen(br.inputs[it->ref].value), a)) best = i;
+        }
+        if (best < 0) { snprintf(out, n, "error: no link or button on this page says \"%s\" (use links to list them)", a); return -1; }
+        br_item_t *it = &br.items[best];
+        if (it->kind == BI_BUTTON) { br_submit(br.inputs[it->ref].form, it->ref); snprintf(out, n, "Pressed the button \"%s\".", br.inputs[it->ref].value); desktop_invalidate(); return 0; }
+        char u[512];
+        snprintf(u, sizeof(u), "%s", br.links[it->link]);
+        if (!strncmp(u, "javascript:", 11) || !strncmp(u, "mailto:", 7)) { snprintf(out, n, "error: that link needs JavaScript or e-mail, which the Browser does not run"); return -1; }
+        br_navigate(u, 1);
+        snprintf(out, n, "Clicked \"%.*s\": opening %s.", it->len > 60 ? 60 : it->len, br.pool + it->off, u);
+        desktop_invalidate();
+        return 0;
+    } else if (!strcmp(action, "fill") || !strcmp(action, "submit")) {
+        br_ensure_layout();
+        if (br.loading) { br_ai_status(out, n); return -1; }
+        int target = -1;
+        for (int i = 0; i < br.ninputs; i++) if (br.inputs[i].type == 0) { target = i; break; }
+        if (target < 0) { snprintf(out, n, "error: this page has no text field"); return -1; }
+        if (a[0]) snprintf(br.inputs[target].value, sizeof(br.inputs[0].value), "%s", a);
+        br.focus_input = target;
+        if (!strcmp(action, "submit")) { br_submit(br.inputs[target].form, -1); snprintf(out, n, "Typed \"%s\" and submitted the form.", br.inputs[target].value); }
+        else snprintf(out, n, "Typed \"%s\" into the page's text field.", br.inputs[target].value);
+        desktop_invalidate();
+        return 0;
+    } else if (!strcmp(action, "find")) {
+        br_ensure_layout();
+        snprintf(br.find, sizeof(br.find), "%s", a);
+        br.find_len = (int)strlen(br.find);
+        br.find_open = br.find_len > 0;
+        br_find_go(0, ph);
+        if (!br.find_len) snprintf(out, n, "error: give the words to find");
+        else snprintf(out, n, br.find_hits ? "Found \"%s\" %d time(s) on the page; showing the first." : "\"%s\" is not on this page.", br.find, br.find_hits);
+        return 0;
+    } else if (!strcmp(action, "scroll")) {
+        if (!strcmp(a, "up")) br.scroll -= ph - 40;
+        else if (!strcmp(a, "top")) br.scroll = 0;
+        else if (!strcmp(a, "bottom")) br.scroll = br.page_h;
+        else br.scroll += ph - 40;
+    } else if (!strcmp(action, "zoom")) {
+        br.zoom = !strcmp(a, "out") ? (br.zoom ? br.zoom - 1 : 0) : !strcmp(a, "reset") ? 0 : (br.zoom < 2 ? br.zoom + 1 : 2);
+        br.layout_w = 0;
+        snprintf(out, n, "Text size is now %s.", br.zoom == 0 ? "normal" : br.zoom == 1 ? "large" : "larger");
+        desktop_invalidate();
+        return 0;
+    } else if (!strcmp(action, "favorite")) {
+        br_toggle_favorite();
+    } else if (!strcmp(action, "download")) {
+        if (strncmp(a, "http", 4)) { snprintf(out, n, "error: give a full http or https address"); return -1; }
+        br_download(a);
+        snprintf(out, n, "Downloading %s into Downloads.", a);
+        return 0;
+    } else if (strcmp(action, "status")) {
+        snprintf(out, n, "error: unknown Browser action %s (open, search, read, links, click, fill, submit, find, scroll, back, forward, reload, home, history, zoom, favorite, download, status)", action);
+        return -1;
+    }
+    desktop_invalidate();
+    br_ai_status(out, n);
+    return 0;
+}
+
+/* Text for read_window (kernel/ai_tools.c). */
+int browser_is_loading(void) { return br.loading; }

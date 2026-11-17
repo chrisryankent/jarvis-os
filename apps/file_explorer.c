@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Files (apps/file_explorer.c)
+ * Kryzen OS — Files (apps/file_explorer.c)
  * Language: C17
  *
  * The file manager.
@@ -40,7 +40,7 @@ void shell_open_path(const char *p);            /* apps/shell.c */
 #define FX_PATH_LEN    200
 #define FX_NAME_LEN    96
 #define FX_HISTORY     16
-#define FX_TRASH       "/jarvis/trash"
+#define FX_TRASH       "/kryzen/trash"
 #define FX_TRASH_MAX   64
 #define LOC_THISPC     "::thispc"
 
@@ -164,13 +164,13 @@ static int fx_ext_is(const char *name, const char *ext)
 static int fx_is_protected(const char *path)
 {
     static const char *const fixed[] = {
-        "/jarvis", "/jarvis/models", "/jarvis/bin", "/jarvis/logs", "/jarvis/data",
-        "/jarvis/fonts", "/jarvis/screenshots", "/jarvis/desktop", "/jarvis/apps",
-        "/jarvis/data/Downloads", FX_TRASH,
+        "/kryzen", "/kryzen/models", "/kryzen/bin", "/kryzen/logs", "/kryzen/data",
+        "/kryzen/fonts", "/kryzen/screenshots", "/kryzen/desktop", "/kryzen/apps",
+        "/kryzen/data/Downloads", FX_TRASH,
     };
     for (size_t i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++)
         if (strcmp(path, fixed[i]) == 0) return 1;
-    return fx_under(path, "/jarvis/models") || fx_under(path, "/jarvis/apps") || fatfs_owns(path);
+    return fx_under(path, "/kryzen/models") || fx_under(path, "/kryzen/apps") || fatfs_owns(path);
 }
 
 static void fx_toast(const char *title, const char *body)
@@ -265,8 +265,8 @@ static void fx_location_name(const char *path, char *out, size_t n)
 {
     if (!strcmp(path, LOC_THISPC)) { snprintf(out, n, "This PC"); return; }
     if (!strcmp(path, FX_TRASH))   { snprintf(out, n, "Recycle Bin"); return; }
-    if (!strcmp(path, "/jarvis/data")) { snprintf(out, n, "Documents"); return; }
-    if (!strcmp(path, "/jarvis/desktop")) { snprintf(out, n, "Desktop"); return; }
+    if (!strcmp(path, "/kryzen/data")) { snprintf(out, n, "Documents"); return; }
+    if (!strcmp(path, "/kryzen/desktop")) { snprintf(out, n, "Desktop"); return; }
     for (int i = 0; i < fx.drive_count; i++) {
         if (fx.drives[i].mount[0] && !strcmp(fx.drives[i].mount, path)) {
             snprintf(out, n, "%s", fx.drives[i].name);
@@ -341,7 +341,7 @@ static void fx_load_folder(void)
             }
             /* the Recycle Bin has its own sidebar entry; not listed in Local Disk */
             int known = flen == strlen(FX_TRASH) && !strncmp(full, FX_TRASH, flen);
-            if (flen >= 14 && !strncmp(full, "/jarvis/system", 14)) known = 1;   /* hidden system folder */
+            if (flen >= 14 && !strncmp(full, "/kryzen/system", 14)) known = 1;   /* hidden system folder */
             for (int d = 0; d < fx.drive_count && !known; d++)       /* other drives: in This PC */
                 if (fx.drives[d].removable && fx.drives[d].mount[0] &&
                     strlen(fx.drives[d].mount) == flen && !strncmp(fx.drives[d].mount, full, flen))
@@ -844,7 +844,7 @@ static void fx_draw_toolbar(int x, int y, int w)
         int np = 0;
         snprintf(parts[np++], FX_PATH_LEN, "%s", LOC_THISPC);
         if (!fx_at_thispc()) {
-            const char *root = "/jarvis";
+            const char *root = "/kryzen";
             for (int i = 0; i < fx.drive_count; i++)                /* deepest matching drive root */
                 if (fx.drives[i].mount[0] && fx_under(fx.path, fx.drives[i].mount) &&
                     strlen(fx.drives[i].mount) > strlen(root)) root = fx.drives[i].mount;
@@ -915,11 +915,11 @@ static void fx_draw_cmdbar(int x, int y, int w)
 static void fx_draw_sidebar(int x, int y, int h)
 {
     static const struct { const char *label; const char *path; icon_id_t icon; } quick[] = {
-        { "Desktop",   "/jarvis/desktop",        ICON_PC },
-        { "Documents", "/jarvis/data",           ICON_FOLDER },
-        { "Downloads", "/jarvis/data/Downloads", ICON_FOLDER },
-        { "Programs",  "/jarvis/bin",            ICON_PROGRAM },
-        { "Apps",      "/jarvis/apps",           ICON_STORE },
+        { "Desktop",   "/kryzen/desktop",        ICON_PC },
+        { "Documents", "/kryzen/data",           ICON_FOLDER },
+        { "Downloads", "/kryzen/data/Downloads", ICON_FOLDER },
+        { "Programs",  "/kryzen/bin",            ICON_PROGRAM },
+        { "Apps",      "/kryzen/apps",           ICON_STORE },
     };
     int top = TOOLBAR_H + CMDBAR_H;           /* sidebar origin in client coordinates */
 
@@ -983,9 +983,9 @@ static void fx_draw_drive_tile(int x, int y, int w, drive_info_t *d, int selecte
 static void fx_draw_thispc(fx_rect_t c, int ox, int oy)
 {
     static const struct { const char *label; const char *path; icon_id_t icon; } folders[] = {
-        { "Desktop", "/jarvis/desktop", ICON_PC }, { "Documents", "/jarvis/data", ICON_FOLDER },
-        { "Downloads", "/jarvis/data/Downloads", ICON_FOLDER }, { "Programs", "/jarvis/bin", ICON_PROGRAM },
-        { "Apps", "/jarvis/apps", ICON_STORE }, { "Recycle Bin", FX_TRASH, ICON_TRASH },
+        { "Desktop", "/kryzen/desktop", ICON_PC }, { "Documents", "/kryzen/data", ICON_FOLDER },
+        { "Downloads", "/kryzen/data/Downloads", ICON_FOLDER }, { "Programs", "/kryzen/bin", ICON_PROGRAM },
+        { "Apps", "/kryzen/apps", ICON_STORE }, { "Recycle Bin", FX_TRASH, ICON_TRASH },
     };
     int x = ox + c.x + 20, y = oy + c.y + 14, w = c.w - 40;
     int cols = w >= 600 ? 2 : 1, tw = (w - (cols - 1) * 12) / cols;
@@ -1344,7 +1344,7 @@ void explorer_event_callback(wm_window_t *win, wm_input_event_t *event)
             fx.addr_focus = 0;
             if (!*p || !fx_icmp(p, "This PC")) fx_navigate(LOC_THISPC, 1);
             else if (p[0] == '/') fx_navigate(p, 1);
-            else { char q[FX_PATH_LEN]; snprintf(q, sizeof(q), "/jarvis/%s", p); fx_navigate(q, 1); }
+            else { char q[FX_PATH_LEN]; snprintf(q, sizeof(q), "/kryzen/%s", p); fx_navigate(q, 1); }
         } else if (k == WM_KEY_ESC) {
             fx.addr_focus = 0;
         } else {

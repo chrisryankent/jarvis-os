@@ -1,5 +1,5 @@
 /*
- * JARVIS OS user-mode programming interface (user/jarvis.h)
+ * Kryzen OS user-mode programming interface (user/kryzen.h)
  *
  * Programs built against this run in user mode (ring 3) in their own address
  * space and reach the kernel only through system calls.

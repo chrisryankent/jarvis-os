@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Desktop surface (desktop/desktop.c)
+ * Kryzen OS — Desktop surface (desktop/desktop.c)
  * Language: C17
  *
  * Wallpaper, desktop icons and the right-click context menu.
@@ -19,14 +19,14 @@ int  file_explorer_trash_path(const char *path);
 
 /* ---- Desktop icons -------------------------------------------------------
  * The fixed system icons come first, followed by one icon for every file and
- * folder in /jarvis/desktop. Creating something on the desktop creates it in
+ * folder in /kryzen/desktop. Creating something on the desktop creates it in
  * that folder; it shows up here and in Files > Desktop.
  */
-#define DICON_W      84
-#define DICON_H      84
-#define DICON_GAP    6
+#define DICON_W      92
+#define DICON_H      80
+#define DICON_GAP    4
 #define DICON_MAX    40
-#define DESKTOP_DIR  "/jarvis/desktop"
+#define DESKTOP_DIR  "/kryzen/desktop"
 
 typedef struct {
     char label[64];
@@ -71,11 +71,18 @@ void desktop_init(void)
     g_dicon_last_click = -1;
     g_drename.idx = -1;
 
-    desktop_add_icon("This PC",     "::thispc",      ICON_PC);
-    desktop_add_icon("Files",       "/jarvis",       ICON_FOLDER);
-    desktop_add_icon("JARVIS",      "JARVIS",        ICON_JARVIS);
-    desktop_add_icon("Terminal",    "Terminal",      ICON_TERMINAL);
-    desktop_add_icon("Recycle Bin", "/jarvis/trash", ICON_TRASH);
+    /* Each icon opens something real: a folder, a Settings page or an app. */
+    desktop_add_icon("This PC",        "::thispc",                ICON_PC);
+    desktop_add_icon("Recycle Bin",    "/kryzen/trash",           ICON_TRASH);
+    desktop_add_icon("Network",        "@network",                ICON_BROWSER);
+    desktop_add_icon("Documents",      "/kryzen/data/Documents",  ICON_FOLDER);
+    desktop_add_icon("Control Panel",  "Settings",                ICON_GEAR);
+    desktop_add_icon("External Drives", "Disks",                  ICON_DISKS);
+    desktop_add_icon("Task Manager",   "Tasks",                   ICON_CHART);
+    desktop_add_icon("Media Library",  "Photos",                  ICON_PHOTOS);
+    desktop_add_icon("AI Studio",      "JARVIS",                  ICON_NEURAL);
+    desktop_add_icon("Code Workspace", "Notepad",                 ICON_CODE);
+    desktop_add_icon("Games & Apps",   "Apps",                    ICON_STORE);
     g_dicon_sys_count = g_dicon_count;
     g_dfiles_dirty = 1;
 }
@@ -130,12 +137,310 @@ static void desktop_reload_files(void)
     }
 }
 
+/* ---- App panel (left) -------------------------------------------------------
+ * A glass column with the assistant's state and the apps: pinned first, then
+ * Settings and the Task Manager, then the app store. The chevron folds it
+ * into a strip of icons (setting "panel_collapsed").
+ */
+#define PANEL_X        8
+#define PANEL_W_OPEN   176
+#define PANEL_W_SHUT   48
+#define PANEL_ROW_H    34
+#define PANEL_MAX_ROWS 14
+
+static struct { int app[PANEL_MAX_ROWS]; int sep_before[PANEL_MAX_ROWS]; int count; int hover; } g_panel = { .hover = -1 };
+
+static int panel_collapsed(void) { return setting_get_int("panel_collapsed", 0); }
+static int panel_w(void) { return panel_collapsed() ? PANEL_W_SHUT : PANEL_W_OPEN; }
+
+static void panel_rect(int *x, int *y, int *w, int *h)
+{
+    *x = PANEL_X;
+    *y = TOPBAR_H + 6;
+    *w = panel_w();
+    *h = (int)fb_get_height() - TASKBAR_H - *y - 4;
+}
+
+/* Where the desktop icons start, to the right of the panel. */
+int desktop_panel_right(void)
+{
+    return PANEL_X + panel_w();
+}
+
+static void panel_build(void)
+{
+    int n = 0;
+    for (int i = 0; i < desktop_app_builtin_count() && n < PANEL_MAX_ROWS - 3; i++) {
+        const char *nm = desktop_app_get(i)->name;
+        if (!taskbar_is_pinned(i) || !strcmp(nm, "Settings") || !strcmp(nm, "Tasks") || !strcmp(nm, "Apps")) continue;
+        g_panel.app[n] = i; g_panel.sep_before[n] = 0; n++;
+    }
+    static const char *const tail[3] = { "Settings", "Tasks", "Apps" };
+    for (int k = 0; k < 3; k++) {
+        int idx = desktop_app_find(tail[k]);
+        if (idx < 0) continue;
+        g_panel.app[n] = idx;
+        g_panel.sep_before[n] = k == 0 || k == 2;
+        n++;
+    }
+    g_panel.count = n;
+}
+
+static int panel_list_top(void)
+{
+    int x, y, w, h;
+    panel_rect(&x, &y, &w, &h);
+    return panel_collapsed() ? y + 46 : y + 138;
+}
+
+static int panel_row_y(int row)
+{
+    int y = panel_list_top();
+    for (int i = 0; i <= row && i < g_panel.count; i++) {
+        if (g_panel.sep_before[i]) y += 13;
+        if (i < row) y += PANEL_ROW_H;
+    }
+    return y;
+}
+
+/* 0..count-1: an app row, -2: the fold button, -3: the assistant card, -1: none */
+static int panel_hit(int px, int py)
+{
+    int x, y, w, h;
+    panel_rect(&x, &y, &w, &h);
+    if (!ui_hit(px, py, x, y, w, h)) return -1;
+    if (py < y + 40) return (panel_collapsed() || px >= x + w - 44) ? -2 : -4;
+    if (!panel_collapsed() && py >= y + 44 && py < y + 96) return -3;
+    for (int i = 0; i < g_panel.count; i++) {
+        int ry = panel_row_y(i);
+        if (py >= ry && py < ry + PANEL_ROW_H && ry + PANEL_ROW_H <= y + h - 4) return i;
+    }
+    return -4;                                  /* on the panel, nothing to press */
+}
+
+int desktop_panel_hover(int px, int py)
+{
+    int h = panel_hit(px, py);
+    if (h == g_panel.hover) return 0;
+    g_panel.hover = h;
+    return 1;
+}
+
+static void panel_draw(void)
+{
+    int x, y, w, h;
+    int shut = panel_collapsed();
+    panel_rect(&x, &y, &w, &h);
+    panel_build();
+    ui_glass(x, y, w, h, 12);
+
+    /* header: menu mark and the fold chevron */
+    if (g_panel.hover == -2) fb_blend_rounded_rect(shut ? x + 6 : x + w - 40, y + 6, shut ? w - 12 : 34, 30, 8, 0x00FFFFFF, 30);
+    if (!shut) glyph_draw(GLYPH_MENU, x + 14, y + 10, 22, T(TEXT_DIM), 0);
+    glyph_draw(shut ? GLYPH_MENU : GLYPH_CHEVRON_LEFT, shut ? x + (w - 22) / 2 : x + w - 34, y + 10, 22, T(TEXT_DIM), 0);
+
+    if (!shut) {
+        /* the assistant: its real state */
+        const char *st = ui_shell_get_status();
+        fb_blend_rounded_rect(x + 10, y + 46, w - 20, 48, 8, g_panel.hover == -3 ? 0x00FFFFFF : 0x00080C1E, g_panel.hover == -3 ? 34 : 110);
+        ui_orb(x + 30, y + 70, 12, ui_shell_get_mic_level());
+        fb_text(x + 50, y + 52, "JARVIS", T(TEXT), FONT_UI_BOLD);
+        char line[40];
+        snprintf(line, sizeof(line), "%s", ai_host_online() ? "Brain online" : kernel_safe_mode() ? "Off (Safe Mode)" : "Built-in commands");
+        fb_text(x + 50, y + 68, line, T(TEXT_DIM), FONT_SMALL);
+        int sw = fb_text_width_font(st, FONT_SMALL);
+        if (sw < w - 110) fb_text(x + w - 18 - sw, y + 54, st, UI_NEON_CYAN, FONT_SMALL);
+        fb_blend_rect(x + 14, y + 104, w - 28, 1, 0x00FFFFFF, 30);
+        fb_text(x + 16, y + 112, "Apps", T(TEXT), FONT_MEDIUM);
+    }
+
+    for (int i = 0; i < g_panel.count; i++) {
+        int ry = panel_row_y(i);
+        if (ry + PANEL_ROW_H > y + h - 4) break;
+        desktop_app_t *app = desktop_app_get(g_panel.app[i]);
+        int running = app->window != NULL;
+        int focused = running && app->window == g_wm_ctx.focused;
+        if (g_panel.sep_before[i]) fb_blend_rect(x + 14, ry - 7, w - 28, 1, 0x00FFFFFF, 30);
+        if (focused || g_panel.hover == i)
+            fb_blend_rounded_rect(x + 6, ry + 1, w - 12, PANEL_ROW_H - 2, 8, 0x00FFFFFF, focused ? 40 : 26);
+        if (focused) fb_fill_rounded_rect(x + 2, ry + 9, 3, PANEL_ROW_H - 18, 1, UI_NEON_CYAN);
+        icon_draw(app->icon, shut ? x + (w - 24) / 2 : x + 14, ry + 5, 24);
+        if (!shut) {
+            ui_text_fit(x + 50, ry + 9, w - 70, app->name, T(TEXT));
+            if (running) fb_fill_circle(x + w - 14, ry + PANEL_ROW_H / 2, 2, focused ? UI_NEON_CYAN : T(TEXT_DIM));
+        } else if (running) {
+            fb_fill_circle(x + w - 7, ry + PANEL_ROW_H / 2, 2, focused ? UI_NEON_CYAN : T(TEXT_DIM));
+        }
+    }
+}
+
+/* Returns 1 if the click was on the panel. */
+static int panel_click(int px, int py)
+{
+    int hit = panel_hit(px, py);
+    if (hit == -1) return 0;
+    if (hit == -2) { setting_set_int("panel_collapsed", !panel_collapsed()); g_panel.hover = -1; }
+    else if (hit == -3) desktop_app_launch(desktop_app_find("JARVIS"));
+    else if (hit >= 0 && hit < g_panel.count) desktop_app_activate(g_panel.app[hit]);
+    desktop_invalidate();
+    return 1;
+}
+
+/* ---- Widgets (right) --------------------------------------------------------
+ * Status strip (network, notifications, sound, processor load), this
+ * month's calendar, and the assistant's activity: all read from the running
+ * system each frame.
+ */
+#define WIDGET_W 196
+#define CPU_SAMPLES 28
+static struct {
+    uint8_t cpu[CPU_SAMPLES]; int cpu_n, cpu_now;
+    uint8_t mic[CPU_SAMPLES]; int mic_n;
+    uint64_t last_tick, last_idle;
+} g_wd;
+
+static void widgets_sample(void)
+{
+    uint64_t now = g_kstate.uptime_ticks, idle;
+    if (now - g_wd.last_tick < 45 && g_wd.cpu_n) return;
+    scheduler_stats(&idle, NULL);
+    uint64_t dt = now - g_wd.last_tick, di = idle - g_wd.last_idle;
+    int busy = (g_wd.last_tick && dt) ? (int)(100 - (di > dt ? dt : di) * 100 / dt) : 0;
+    g_wd.last_tick = now; g_wd.last_idle = idle;
+    g_wd.cpu_now = busy;
+    if (g_wd.cpu_n == CPU_SAMPLES) { memmove(g_wd.cpu, g_wd.cpu + 1, CPU_SAMPLES - 1); g_wd.cpu_n--; }
+    g_wd.cpu[g_wd.cpu_n++] = (uint8_t)busy;
+    if (g_wd.mic_n == CPU_SAMPLES) { memmove(g_wd.mic, g_wd.mic + 1, CPU_SAMPLES - 1); g_wd.mic_n--; }
+    g_wd.mic[g_wd.mic_n++] = (uint8_t)ui_shell_get_mic_level();
+}
+
+int desktop_cpu_percent(void) { return g_wd.cpu_now; }
+
+static void widget_rects(int *x, int *ys, int *yc, int *ya)
+{
+    *x = (int)fb_get_width() - WIDGET_W - 10;
+    *ys = TOPBAR_H + 8;                 /* status strip, 40 high */
+    *yc = *ys + 48;                     /* calendar, 176 high */
+    *ya = *yc + 184;                    /* assistant activity, 70 high */
+}
+
+static int wd_days_in(int year, int month)
+{
+    static const int d[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (month == 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)) return 29;
+    return d[(month + 11) % 12];
+}
+
+static void widgets_draw(void)
+{
+    int x, ys, yc, ya;
+    int W = (int)fb_get_width(), H = (int)fb_get_height();
+    if (W < 900) return;
+    widgets_sample();
+    widget_rects(&x, &ys, &yc, &ya);
+
+    /* status strip */
+    net_info_t ni;
+    net_get_info(&ni);
+    ui_glass(x, ys, WIDGET_W, 40, 10);
+    glyph_draw(GLYPH_DISPLAY, x + 10, ys + 11, 18, T(TEXT), 0);
+    glyph_draw(GLYPH_NET, x + 38, ys + 11, 18, ni.configured ? T(TEXT) : T(TEXT_DIM), 0);
+    glyph_draw(GLYPH_BELL, x + 66, ys + 11, 18, T(TEXT), 0);
+    if (notifications_get_unread_count() > 0) fb_fill_circle(x + 81, ys + 12, 3, UI_NEON_CYAN);
+    glyph_draw(GLYPH_VOLUME, x + 94, ys + 11, 18, g_kstate.audio_ready && !setting_get_int("mute", 0) ? T(TEXT) : T(TEXT_DIM), 0);
+    {   /* processor load, last half minute */
+        int gx = x + 122, gw = WIDGET_W - 132, gy = ys + 8, gh = 24;
+        fb_blend_rounded_rect(gx, gy, gw, gh, 5, 0x00080C1E, 120);
+        int px = -1, py = 0;
+        for (int i = 0; i < g_wd.cpu_n; i++) {
+            int sx = gx + 3 + i * (gw - 6) / (CPU_SAMPLES - 1);
+            int sy = gy + gh - 4 - g_wd.cpu[i] * (gh - 8) / 100;
+            if (px >= 0) fb_draw_line_aa(px, py, sx, sy, 1, UI_NEON_VIOLET, 255);
+            px = sx; py = sy;
+        }
+    }
+
+    /* calendar */
+    if (yc + 176 < H - TASKBAR_H) {
+        static const char *const dn[7] = { "Su", "Mo", "Tu", "We", "Th", "Fr", "Sa" };
+        sys_time_t t;
+        sys_get_time(&t);
+        ui_glass(x, yc, WIDGET_W, 176, 10);
+        int cw = (WIDGET_W - 16) / 7;
+        for (int d = 0; d < 7; d++)
+            fb_text(x + 8 + d * cw + (cw - fb_text_width_font(dn[d], FONT_SMALL)) / 2, yc + 8, dn[d], T(TEXT_DIM), FONT_SMALL);
+        int first = ((t.weekday - (t.day - 1)) % 7 + 7) % 7;       /* weekday of the 1st */
+        int dim = wd_days_in(t.year, t.month);
+        int prev = wd_days_in(t.month == 1 ? t.year - 1 : t.year, t.month == 1 ? 12 : t.month - 1);
+        for (int cell = 0; cell < 42; cell++) {
+            int day = cell - first + 1, other = 0;
+            if (day < 1) { day += prev; other = 1; }
+            else if (day > dim) { day -= dim; other = 1; }
+            char num[4];
+            snprintf(num, sizeof(num), "%d", day);
+            int cx = x + 8 + (cell % 7) * cw, cy = yc + 30 + (cell / 7) * 23;
+            int today = !other && day == t.day;
+            if (today) fb_blend_rounded_rect(cx + 2, cy - 2, cw - 4, 20, 6, UI_NEON_CYAN, 70);
+            fb_text(cx + (cw - fb_text_width_font(num, FONT_SMALL)) / 2, cy + 1, num,
+                    other ? T(TEXT_DIM) : today ? 0x00FFFFFF : T(TEXT), FONT_SMALL);
+        }
+    }
+
+    /* the assistant's activity: microphone level over the last half minute */
+    if (ya + 70 < H - TASKBAR_H) {
+        char title[64];
+        ui_glass(x, ya, WIDGET_W, 70, 10);
+        snprintf(title, sizeof(title), "AI Activity  \x80  %s", ui_shell_get_status());
+        ui_text_fit(x + 12, ya + 8, WIDGET_W - 24, title, T(TEXT));
+        int bw = (WIDGET_W - 24) / CPU_SAMPLES;
+        for (int i = 0; i < g_wd.mic_n; i++) {
+            int bh = 2 + g_wd.mic[i] * 26 / 100;
+            fb_fill_rect(x + 12 + i * bw, ya + 60 - bh, bw > 2 ? bw - 2 : 1, bh,
+                         i > CPU_SAMPLES * 2 / 3 ? UI_NEON_VIOLET : 0x00E8C060);
+        }
+    }
+}
+
+/* 1 status strip, 2 calendar, 3 assistant activity, 0 none */
+static int widgets_hit(int px, int py)
+{
+    int x, ys, yc, ya;
+    if ((int)fb_get_width() < 900) return 0;
+    widget_rects(&x, &ys, &yc, &ya);
+    if (ui_hit(px, py, x, ys, WIDGET_W, 40)) return 1;
+    if (ui_hit(px, py, x, yc, WIDGET_W, 176)) return 2;
+    if (ui_hit(px, py, x, ya, WIDGET_W, 70)) return 3;
+    return 0;
+}
+
+/* "Listening" pill at the top while speech is coming in through the bridge. */
+static void listening_draw(void)
+{
+    const char *st = ui_shell_get_status();
+    if (strcmp(st, "LISTENING") && strcmp(st, "THINKING") && strcmp(st, "SPEAKING")) return;
+    int W = (int)fb_get_width();
+    int w = 300, h = 58, x = (W - w) / 2, y = TOPBAR_H + 10;
+    int level = ui_shell_get_mic_level();
+    ui_glass_tinted(x, y, w, h, h / 2, 0x00101428, 170);
+    ui_neon_frame(x, y, w, h, h / 2, 2, 6);
+    static const uint8_t shape[20] = { 15, 30, 55, 90, 60, 35, 20, 45, 80, 100, 70, 40, 25, 50, 85, 60, 30, 45, 20, 12 };
+    for (int side = -1; side <= 1; side += 2)
+        for (int i = 0; i < 20; i++) {
+            int amp = 1 + (13 * shape[i] / 100) * (15 + level) / 115;
+            int bx = W / 2 + side * (4 + i * 6);
+            fb_draw_line_aa(bx, y + 22 - amp, bx, y + 22 + amp, 2, side < 0 ? UI_NEON_CYAN : UI_NEON_VIOLET, 255);
+        }
+    const char *label = !strcmp(st, "LISTENING") ? "Listening..." : !strcmp(st, "THINKING") ? "Thinking..." : "Speaking...";
+    fb_text(x + (w - fb_text_width_font(label, FONT_UI)) / 2, y + 38, label, 0x00DDE6FF, FONT_UI);
+}
+
 static void dicon_rect(int i, int *x, int *y)
 {
-    int rows = ((int)fb_get_height() - 48 - 16) / (DICON_H + DICON_GAP);
+    int top = TOPBAR_H + 10;
+    int rows = ((int)fb_get_height() - TASKBAR_H - top - 4) / (DICON_H + DICON_GAP);
     if (rows < 1) rows = 1;
-    *x = 12 + (i / rows) * (DICON_W + DICON_GAP);
-    *y = 12 + (i % rows) * (DICON_H + DICON_GAP);
+    *x = desktop_panel_right() + 10 + (i / rows) * (DICON_W + DICON_GAP);
+    *y = top + (i % rows) * (DICON_H + DICON_GAP);
 }
 
 void desktop_draw(void)
@@ -144,48 +449,58 @@ void desktop_draw(void)
         desktop_reload_files();
 
     wallpaper_draw();
-    if (!setting_get_int("desktop_icons", 1)) return;
 
-    for (int i = 0; i < g_dicon_count; i++) {
-        int x, y;
-        dicon_rect(i, &x, &y);
-
-        if (i == g_dicon_selected) {
-            fb_blend_rounded_rect(x, y, DICON_W, DICON_H, 6, T(ACCENT), 60);
-            fb_draw_rounded_rect(x, y, DICON_W, DICON_H, 6, T(ACCENT));
-        }
-        icon_draw(g_dicons[i].icon, x + (DICON_W - 40) / 2, y + 8, 40);
-
-        if (i == g_drename.idx) {
-            /* edit box, wide enough for the name being typed */
-            int bw = fb_text_width_n(g_drename.buf, g_drename.len) + 14;
-            if (bw < DICON_W + 20) bw = DICON_W + 20;
-            int bx = x + (DICON_W - bw) / 2;
-            if (bx < 2) bx = 2;
-            fb_fill_rect(bx, y + 53, bw, 22, T(INPUT));
-            fb_draw_rect(bx, y + 53, bw, 22, T(ACCENT));
-            if (g_drename.fresh)
-                fb_fill_rect(bx + 5, y + 56, fb_text_width_n(g_drename.buf, g_drename.len) + 2, 16, T(ACCENT));
-            fb_draw_text(bx + 6, y + 56, g_drename.buf,
-                         g_drename.fresh ? T(ACCENT_TEXT) : T(TEXT));
-            if (!g_drename.fresh)
-                fb_fill_rect(bx + 7 + fb_text_width_n(g_drename.buf, g_drename.len), y + 56, 1, 16, T(TEXT));
-            continue;
-        }
-
-        /* Label (shortened to fit) with a 1px shadow so it stays readable
-         * on any wallpaper */
-        char label[48];
-        snprintf(label, sizeof(label), "%s", g_dicons[i].label);
-        int n = (int)strlen(label);
-        if (fb_text_width(label) > DICON_W + 4) {
-            while (n > 1 && fb_text_width_n(label, n) + fb_text_width(SYM_ELLIPSIS) > DICON_W + 4) n--;
-            memcpy(label + n, SYM_ELLIPSIS, 2);
-        }
-        int tx = x + (DICON_W - fb_text_width(label)) / 2;
-        fb_draw_text(tx + 1, y + 57, label, 0x00000000);
-        fb_draw_text(tx, y + 56, label, 0x00FFFFFF);
+    if (kernel_safe_mode()) {
+        int W = (int)fb_get_width(), H = (int)fb_get_height();
+        fb_text(W / 2 - fb_text_width_font("Safe Mode", FONT_UI_BOLD) / 2, TOPBAR_H + 6, "Safe Mode", 0x00FFFFFF, FONT_UI_BOLD);
+        fb_text(W - 90, H - TASKBAR_H - 20, "Safe Mode", 0x00FFFFFF, FONT_UI_BOLD);
     }
+
+    if (setting_get_int("desktop_icons", 1)) {
+        for (int i = 0; i < g_dicon_count; i++) {
+            int x, y;
+            dicon_rect(i, &x, &y);
+
+            if (i == g_dicon_selected) {
+                fb_blend_rounded_rect(x, y, DICON_W, DICON_H, 10, T(ACCENT), 44);
+                fb_neon_rounded_rect(x, y, DICON_W, DICON_H, 10, 1, 0, T(ACCENT), T(ACCENT), 200);
+            }
+            icon_draw(g_dicons[i].icon, x + (DICON_W - 40) / 2, y + 6, 40);
+
+            if (i == g_drename.idx) {
+                /* edit box, wide enough for the name being typed */
+                int bw = fb_text_width_n(g_drename.buf, g_drename.len) + 14;
+                if (bw < DICON_W + 20) bw = DICON_W + 20;
+                int bx = x + (DICON_W - bw) / 2;
+                if (bx < 2) bx = 2;
+                fb_fill_rect(bx, y + 53, bw, 22, T(INPUT));
+                fb_draw_rect(bx, y + 53, bw, 22, T(ACCENT));
+                if (g_drename.fresh)
+                    fb_fill_rect(bx + 5, y + 56, fb_text_width_n(g_drename.buf, g_drename.len) + 2, 16, T(ACCENT));
+                fb_draw_text(bx + 6, y + 56, g_drename.buf,
+                             g_drename.fresh ? T(ACCENT_TEXT) : T(TEXT));
+                if (!g_drename.fresh)
+                    fb_fill_rect(bx + 7 + fb_text_width_n(g_drename.buf, g_drename.len), y + 56, 1, 16, T(TEXT));
+                continue;
+            }
+
+            /* Label with drop shadow so it stays crisp on any background */
+            char label[48];
+            snprintf(label, sizeof(label), "%s", g_dicons[i].label);
+            int n = (int)strlen(label);
+            if (fb_text_width(label) > DICON_W + 2) {
+                while (n > 1 && fb_text_width_n(label, n) + fb_text_width(SYM_ELLIPSIS) > DICON_W + 2) n--;
+                memcpy(label + n, SYM_ELLIPSIS, 2);
+            }
+            int tx = x + (DICON_W - fb_text_width(label)) / 2;
+            fb_draw_text(tx + 1, y + 55, label, 0x00000000);
+            fb_draw_text(tx, y + 54, label, 0x00F2F5FF);
+        }
+    }
+
+    panel_draw();
+    widgets_draw();
+    listening_draw();
 }
 
 /* ---- Inline rename ------------------------------------------------------- */
@@ -261,6 +576,14 @@ void desktop_rename_input(uint32_t key, char ch)
  */
 int desktop_handle_click(int x, int y)
 {
+    if (panel_click(x, y)) return -2;
+    switch (widgets_hit(x, y)) {
+    case 1: shell_flyout_toggle(FLY_QUICK); return -2;
+    case 2: shell_flyout_toggle(FLY_CALENDAR); return -2;
+    case 3: desktop_app_launch(desktop_app_find("JARVIS")); return -2;
+    default: break;
+    }
+
     if (!setting_get_int("desktop_icons", 1)) return -1;
     for (int i = 0; i < g_dicon_count; i++) {
         int ix, iy;
@@ -502,7 +825,7 @@ void desktop_context_open(int x, int y)
             items[n++] = (ui_menu_item_t){ "Rename", CTX_ICON_RENAME, 0, 1 };
             items[n++] = (ui_menu_item_t){ "Delete", CTX_ICON_DELETE, 0, 0 };
         }
-        if (strcmp(g_dicons[icon].target, "/jarvis/trash") == 0)
+        if (strcmp(g_dicons[icon].target, "/kryzen/trash") == 0)
             items[n++] = (ui_menu_item_t){ "Empty Recycle Bin", CTX_EMPTY_TRASH, 0, 1 };
         ui_menu_open(x, y, items, n, desktop_menu_action, NULL);
         return;

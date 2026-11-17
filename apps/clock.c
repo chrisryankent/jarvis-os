@@ -1,6 +1,6 @@
 /*
  * =============================================================================
- * JARVIS OS — Clock (apps/clock.c) and Run (Win+R)
+ * Kryzen OS — Clock (apps/clock.c) and Run (Win+R)
  *
  * Clock: alarms (kept across restarts), a countdown timer and a stopwatch
  * with laps. Alarms and the timer keep running with the app closed: when
@@ -426,7 +426,7 @@ static void rn_draw(wm_window_t *win, uint32_t *fb)
     fb_fill_rect(x, y, w, h, T(WINDOW));
     icon_draw(ICON_TERMINAL, x + 18, y + 18, 32);
     fb_draw_text(x + 64, y + 16, "Type the name of an app, program, folder or file,", T(TEXT));
-    fb_draw_text(x + 64, y + 34, "or any Terminal command, and JARVIS OS will open it.", T(TEXT));
+    fb_draw_text(x + 64, y + 34, "or any Terminal command, and Kryzen OS will open it.", T(TEXT));
     fb_draw_text(x + 18, y + 72, "Open:", T(TEXT));
     fb_fill_rounded_rect(x + 64, y + 66, w - 82, 30, 4, T(INPUT));
     fb_draw_rounded_rect(x + 64, y + 66, w - 82, 30, 4, T(ACCENT));

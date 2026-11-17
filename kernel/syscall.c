@@ -246,7 +246,7 @@ uint64_t syscall_handler(uint64_t nr,
             if (!eol) eol = q + strlen(q);
             const char *full = strchr(q, '/');
             if (full && full < eol && (size_t)(eol - full) > dl + 1 && !strncmp(full, path, dl) && full[dl] == '/' &&
-                !memchr(full + dl + 1, '/', (size_t)(eol - full) - dl - 1) && strncmp(full, "/jarvis/system", 14)) {
+                !memchr(full + dl + 1, '/', (size_t)(eol - full) - dl - 1) && strncmp(full, "/kryzen/system", 14)) {
                 char line[200], fp[160];
                 size_t fl = (size_t)(eol - full) < 159 ? (size_t)(eol - full) : 159;
                 memcpy(fp, full, fl); fp[fl] = 0;
